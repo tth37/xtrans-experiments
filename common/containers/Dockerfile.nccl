@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1
+# Dockerfile.nccl — Container image for NCCL cross-container experiments
+#
+# Based on NVIDIA PyTorch container with nccl-tests pre-built.
+# Build:
+#   docker build -f Dockerfile.nccl -t xtrans-nccl .
+
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:24.07-py3
+FROM ${BASE_IMAGE}
+
+# Install nccl-tests
+RUN cd /opt && \
+    git clone https://github.com/NVIDIA/nccl-tests.git && \
+    cd nccl-tests && \
+    make MPI=0 CUDA_HOME=/usr/local/cuda NCCL_HOME=/usr
+
+# Install strace for syscall tracing (Exp A1)
+RUN apt-get update && apt-get install -y --no-install-recommends strace && \
+    rm -rf /var/lib/apt/lists/*
+
+# Add workspace mount point
+WORKDIR /workspace
+
+ENV PATH="/opt/nccl-tests/build:${PATH}"
+
+# Default: keep container alive for exec
+CMD ["sleep", "infinity"]

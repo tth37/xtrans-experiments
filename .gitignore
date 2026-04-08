@@ -1,0 +1,29 @@
+# Build artifacts
+build/
+*.o
+*.so
+*.a
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Experiment outputs
+**/results/
+**/logs/
+**/traces/
+*.csv
+*.json.gz
+
+# OS
+.DS_Store
+Thumbs.db
