@@ -88,9 +88,34 @@ DMA-BUF file descriptors may be a universal cross-container GPU IPC primitive
 - Results: JSON for structured data, CSV for time series
 - All paths in scripts should be relative to project root
 
+## Experiment Reports
+
+Each experiment produces an `analysis_report.html` following a standardized format.
+
+- **Template**: `docs/report_template.html` — copy into experiment dir to start a report
+- **Guide**: `docs/report_guide.md` — section structure, style rules, checklist
+- **Examples**: exp1 and exp2 reports in vllm-source (the template is derived from these)
+
+Report structure (required sections):
+1. **Objective** — hypothesis + green highlight-box with one-sentence result
+2. **Background** — (optional) context for the experiment
+3. **Experimental Setup** — hardware table + software table with exact versions
+4. **Configurations Under Test** — table of all configs being compared
+5. **Results** — data tables with "vs Baseline" column, figures in `analysis_assets/`
+6. **Analysis** — (optional) deeper interpretation, limitations
+7. **Conclusions** — numbered findings, each one sentence; blue info-box with next steps
+8. **Appendices** — full data tables, separated by `<hr class="appendix">`
+
+Three callout box types:
+- `highlight-box` (green): key results
+- `warning-box` (orange): limitations, risks
+- `info-box` (blue): context, next steps
+
 ## File Locations
 
 - Research plan: `docs/research_plan.html`
+- Report template: `docs/report_template.html`
+- Report guide: `docs/report_guide.md`
 - Shim source: `common/shim/`
 - Container helpers: `common/containers/`
 - Benchmark harness: `common/benchmarks/`

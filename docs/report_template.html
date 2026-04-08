@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Experiment X: [Title]</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: "Times New Roman", "Nimbus Roman", Times, serif;
+      background: #fff;
+      color: #111;
+      line-height: 1.6;
+    }
+    main {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 40px 32px 60px;
+    }
+    h1 {
+      font-size: 22px;
+      text-align: center;
+      margin: 0 0 4px;
+      line-height: 1.3;
+    }
+    .subtitle {
+      text-align: center;
+      font-size: 14px;
+      color: #444;
+      margin: 0 0 24px;
+    }
+    h2 {
+      font-size: 17px;
+      border-bottom: 1px solid #999;
+      padding-bottom: 4px;
+      margin: 28px 0 12px;
+    }
+    h3 {
+      font-size: 15px;
+      margin: 20px 0 8px;
+    }
+    h4 {
+      font-size: 14px;
+      margin: 16px 0 6px;
+    }
+    p, li {
+      font-size: 14px;
+      margin: 0 0 10px;
+    }
+    ul, ol {
+      padding-left: 24px;
+    }
+    .figure {
+      margin: 16px 0;
+      text-align: center;
+    }
+    .figure img {
+      max-width: 100%;
+      border: 1px solid #ccc;
+    }
+    .figure p {
+      font-size: 12px;
+      color: #666;
+      text-align: center;
+      margin-top: 4px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      margin: 12px 0;
+    }
+    th, td {
+      border: 1px solid #bbb;
+      padding: 5px 7px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #f0f0f0;
+      font-weight: bold;
+    }
+    td {
+      font-variant-numeric: tabular-nums;
+    }
+    code {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 13px;
+      background: #f5f5f5;
+      padding: 1px 4px;
+    }
+    pre {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 12px;
+      background: #f8f8f8;
+      border: 1px solid #ddd;
+      padding: 12px 16px;
+      margin: 12px 0;
+      overflow-x: auto;
+      line-height: 1.5;
+    }
+    .config-table {
+      width: auto;
+      margin: 12px 0;
+    }
+    .config-table td:first-child {
+      font-weight: bold;
+      white-space: nowrap;
+      padding-right: 16px;
+    }
+    /* Callout boxes */
+    .highlight-box {
+      background: #e8f5e9;
+      border: 2px solid #2e7d32;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .highlight-box p { margin: 0; }
+    .warning-box {
+      background: #fff3e0;
+      border: 2px solid #e65100;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .warning-box p { margin: 0; }
+    .info-box {
+      background: #e3f2fd;
+      border: 2px solid #1565c0;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .info-box p { margin: 0; }
+    hr.appendix {
+      border: none;
+      border-top: 2px solid #333;
+      margin: 36px 0 24px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+
+    <!-- ============================================================
+         TITLE
+         ============================================================ -->
+
+    <h1>Experiment X: [Descriptive Title]</h1>
+    <p class="subtitle">
+      [hardware] &middot; [GPU config summary]<br>
+      Generated [date] &middot; commit [short hash]
+    </p>
+
+    <!-- ============================================================
+         1. OBJECTIVE
+         ============================================================ -->
+
+    <h2>1. Objective</h2>
+
+    <p>[One paragraph: what this experiment aims to demonstrate or measure.
+       State the hypothesis or question being tested.]</p>
+
+    <div class="highlight-box">
+      <p><b>Result:</b> [One-sentence summary of the key finding, with numbers.
+         This lets readers get the punchline immediately.]</p>
+    </div>
+
+    <!-- ============================================================
+         2. BACKGROUND
+         (Optional — include when the reader needs context to
+         understand why this experiment matters. Skip for simple
+         follow-up experiments where prior reports cover the background.)
+         ============================================================ -->
+
+    <h2>2. Background</h2>
+
+    <p>[Explain the problem or mechanism being investigated. Reference prior
+       experiments if this builds on them.]</p>
+
+    <!-- ============================================================
+         3. EXPERIMENTAL SETUP
+         ============================================================ -->
+
+    <h2>3. Experimental Setup</h2>
+
+    <h3>3.1 Hardware</h3>
+
+    <table class="config-table">
+      <tr><td>Node</td><td>[hostname]</td></tr>
+      <tr><td>GPU</td><td>[count]&times; [model] ([memory])</td></tr>
+      <tr><td>Interconnect</td><td>[NVLink version / bandwidth]</td></tr>
+      <tr><td>CPU</td><td>[model]</td></tr>
+      <tr><td>Kernel</td><td>[uname -r]</td></tr>
+    </table>
+
+    <h3>3.2 Software</h3>
+
+    <table class="config-table">
+      <tr><td>Container image</td><td>[image:tag]</td></tr>
+      <tr><td>CUDA</td><td>[version]</td></tr>
+      <tr><td>NCCL / RCCL</td><td>[version]</td></tr>
+      <tr><td>Docker</td><td>[version]</td></tr>
+      <tr><td>Benchmark tool</td><td>[nccl-tests / rccl-tests / custom]</td></tr>
+    </table>
+
+    <!-- ============================================================
+         4. CONFIGURATIONS UNDER TEST
+         ============================================================ -->
+
+    <h2>4. Configurations Under Test</h2>
+
+    <table>
+      <thead>
+        <tr><th>Config</th><th>Description</th><th>Key Settings</th><th>Expected Outcome</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>A: Baseline</b></td>
+          <td>[Description of control configuration]</td>
+          <td><code>[key env vars / flags]</code></td>
+          <td>[What we expect to see]</td>
+        </tr>
+        <tr>
+          <td><b>B: [Treatment]</b></td>
+          <td>[Description of experimental configuration]</td>
+          <td><code>[key env vars / flags]</code></td>
+          <td>[What we expect to see]</td>
+        </tr>
+        <!-- Add more rows as needed -->
+      </tbody>
+    </table>
+
+    <!-- ============================================================
+         5. RESULTS
+         ============================================================ -->
+
+    <h2>5. Results</h2>
+
+    <h3>5.1 [First result group, e.g., "Bandwidth Recovery"]</h3>
+
+    <!--
+    <div class="figure">
+      <img src="analysis_assets/[figure_name].png" alt="[description]">
+      <p>Figure 1: [Caption describing what the figure shows.]</p>
+    </div>
+    -->
+
+    <table>
+      <thead>
+        <tr><th>Config</th><th>Metric 1</th><th>Metric 2</th><th>vs Baseline</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><b>A: Baseline</b></td><td>[value]</td><td>[value]</td><td>100%</td></tr>
+        <tr><td><b>B: [Treatment]</b></td><td>[value]</td><td>[value]</td><td>[X%]</td></tr>
+      </tbody>
+    </table>
+
+    <h3>5.2 [Second result group, if any]</h3>
+
+    <p>[Results and analysis for the second group.]</p>
+
+    <!-- ============================================================
+         6. ANALYSIS
+         (Deeper interpretation — what the results mean, why they
+         happened, what mechanisms are at play. Can be merged into
+         Results if the experiment is simple.)
+         ============================================================ -->
+
+    <h2>6. Analysis</h2>
+
+    <p>[Interpretation of results. Explain surprising findings.
+       Discuss what the results tell us about the underlying mechanism.]</p>
+
+    <div class="warning-box">
+      <p><b>Limitation:</b> [Any caveats, confounding factors, or scope
+         limitations that affect interpretation.]</p>
+    </div>
+
+    <!-- ============================================================
+         7. CONCLUSIONS
+         ============================================================ -->
+
+    <h2>7. Conclusions</h2>
+
+    <ol>
+      <li><b>[Finding 1]:</b> [One sentence with key numbers.]</li>
+      <li><b>[Finding 2]:</b> [One sentence.]</li>
+      <li><b>[Finding 3]:</b> [One sentence.]</li>
+    </ol>
+
+    <div class="info-box">
+      <p><b>Next steps:</b> [What this experiment enables or what should be
+         investigated next.]</p>
+    </div>
+
+    <!-- ============================================================
+         APPENDICES
+         ============================================================ -->
+
+    <hr class="appendix">
+
+    <h2>Appendix A: [Raw Data / Full Tables]</h2>
+
+    <p>[Complete data tables, configuration dumps, or other reference
+       material that supports the main text but would clutter it.]</p>
+
+    <!-- Appendix B, C, etc. as needed -->
+
+  </main>
+</body>
+</html>
