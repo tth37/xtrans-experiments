@@ -1,0 +1,112 @@
+# Exp A — XTrans Shim Phase 2: Full isolation with bridge networking
+#
+# THE FINAL TARGET. Per-GPU isolation with LD_PRELOAD shim and NO shared
+# network namespace. The shim handles all three NCCL gates:
+#   1. hostHash — gethostname() interception
+#   2. shmDev — stat("/dev/shm") interception
+#   3. IPC socket — bind()/sendmsg() redirection from abstract UDS to
+#      filesystem UDS in shared volume (/shared_uds)
+#
+# What's different from compose.shim.yml (Phase 1):
+#   - Bridge network (NOT host) — separate network namespace per container
+#   - Shared /shared_uds volume for NCCL proxy socket redirection
+#   - XTRANS_UDS_DIR=/shared_uds enables bind/sendmsg interception
+#
+# Success criteria: ≥99% NVLink bandwidth with:
+#   - No --network=host
+#   - No shared /dev/shm
+#   - No NCCL-specific env vars
+#   - Only requirements: shim library + shared UDS directory
+
+services:
+  rank0:
+    image: tth37/xtrans-experiments:expa-benchmark
+    container_name: expa-shimfull-rank0
+    runtime: nvidia
+    networks:
+      - expa-shimfull-net
+    shm_size: 1g
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=0
+      # XTrans shim configuration
+      - LD_PRELOAD=/workspace/shim/libxtrans_shim.so
+      - XTRANS_HOSTNAME=node192
+      - XTRANS_SHMDEV=0x1
+      - XTRANS_UDS_DIR=/shared_uds
+      - XTRANS_VERBOSE=1
+      # NO NCCL_CUMEM_ENABLE, NO network=host, NO shared /dev/shm
+      - NCCL_DEBUG=INFO
+      - NCCL_DEBUG_SUBSYS=INIT,P2P,SHM,NET
+      - WORLD_SIZE=2
+      - RANK=0
+      - MASTER_ADDR=expa-shimfull-rank0
+      - MASTER_PORT=29500
+      - OUTPUT_FILE=/results/shim_full.json
+      - DEPLOYMENT=shim_full
+      - SMOKE_TEST=${SMOKE_TEST:-false}
+      - STRACE_WRAP=${STRACE_WRAP:-0}
+    volumes:
+      - ./benchmark.py:/workspace/benchmark.py
+      - ./benchmark_docker.py:/workspace/benchmark_docker.py
+      - ./results:/results
+      - shared-uds:/shared_uds
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0', '1']
+              capabilities: [gpu]
+
+  rank1:
+    image: tth37/xtrans-experiments:expa-benchmark
+    container_name: expa-shimfull-rank1
+    runtime: nvidia
+    networks:
+      - expa-shimfull-net
+    shm_size: 1g
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=1
+      # XTrans shim configuration
+      - LD_PRELOAD=/workspace/shim/libxtrans_shim.so
+      - XTRANS_HOSTNAME=node192
+      - XTRANS_SHMDEV=0x1
+      - XTRANS_UDS_DIR=/shared_uds
+      - XTRANS_VERBOSE=1
+      # NO NCCL_CUMEM_ENABLE
+      - NCCL_DEBUG=INFO
+      - NCCL_DEBUG_SUBSYS=INIT,P2P,SHM,NET
+      - WORLD_SIZE=2
+      - RANK=1
+      - MASTER_ADDR=expa-shimfull-rank0
+      - MASTER_PORT=29500
+      - DEPLOYMENT=shim_full
+      - SMOKE_TEST=${SMOKE_TEST:-false}
+      - STRACE_WRAP=${STRACE_WRAP:-0}
+    volumes:
+      - ./benchmark.py:/workspace/benchmark.py
+      - ./benchmark_docker.py:/workspace/benchmark_docker.py
+      - shared-uds:/shared_uds
+    depends_on:
+      - rank0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0', '1']
+              capabilities: [gpu]
+
+networks:
+  expa-shimfull-net:
+    driver: bridge
+
+volumes:
+  shared-uds:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=100m

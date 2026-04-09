@@ -1,0 +1,73 @@
+# Exp A — Isolated: Per-GPU containers with NO workarounds
+# Expected to break — NCCL falls back to NET transport.
+# Separate network NS (bridge), separate /dev/shm, separate IPC.
+# One GPU per container via NVIDIA_VISIBLE_DEVICES.
+
+services:
+  rank0:
+    image: tth37/xtrans-experiments:expa-benchmark
+    container_name: expa-isolated-rank0
+    runtime: nvidia
+    networks:
+      - expa-net
+    shm_size: 1g
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - CUDA_VISIBLE_DEVICES=0
+      - NCCL_DEBUG=INFO
+      - NCCL_DEBUG_SUBSYS=INIT,P2P,SHM,NET
+      - WORLD_SIZE=2
+      - RANK=0
+      - MASTER_ADDR=expa-isolated-rank0
+      - MASTER_PORT=29500
+      - OUTPUT_FILE=/results/isolated.json
+      - DEPLOYMENT=isolated
+      - SMOKE_TEST=${SMOKE_TEST:-false}
+      - STRACE_WRAP=${STRACE_WRAP:-0}
+    volumes:
+      - ./benchmark.py:/workspace/benchmark.py
+      - ./benchmark_docker.py:/workspace/benchmark_docker.py
+      - ./results:/results
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+
+  rank1:
+    image: tth37/xtrans-experiments:expa-benchmark
+    container_name: expa-isolated-rank1
+    runtime: nvidia
+    networks:
+      - expa-net
+    shm_size: 1g
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=1
+      - CUDA_VISIBLE_DEVICES=0
+      - NCCL_DEBUG=INFO
+      - NCCL_DEBUG_SUBSYS=INIT,P2P,SHM,NET
+      - WORLD_SIZE=2
+      - RANK=1
+      - MASTER_ADDR=expa-isolated-rank0
+      - MASTER_PORT=29500
+      - DEPLOYMENT=isolated
+      - SMOKE_TEST=${SMOKE_TEST:-false}
+      - STRACE_WRAP=${STRACE_WRAP:-0}
+    volumes:
+      - ./benchmark.py:/workspace/benchmark.py
+      - ./benchmark_docker.py:/workspace/benchmark_docker.py
+    depends_on:
+      - rank0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['1']
+              capabilities: [gpu]
+
+networks:
+  expa-net:
+    driver: bridge

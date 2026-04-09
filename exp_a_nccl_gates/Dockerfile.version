@@ -1,0 +1,38 @@
+# Dockerfile.version — Parametric Exp A image for NCCL version testing
+#
+# Accepts PYTORCH_VERSION build arg to vary the bundled NCCL version.
+# PyTorch 2.4.0 → NCCL 2.20, PyTorch 2.5.1 → NCCL 2.21.5
+#
+# Build (from project root):
+#   docker build -t tth37/xtrans-experiments:expa-nccl2.20 \
+#     --build-arg PYTORCH_VERSION=2.4.0 \
+#     -f exp_a_nccl_gates/Dockerfile.version .
+
+ARG CUDA_VERSION=12.4.0
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu22.04
+
+ARG PYTORCH_VERSION=2.5.1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-pip python3-dev strace gcc make && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir \
+    torch==${PYTORCH_VERSION} numpy \
+    --index-url https://download.pytorch.org/whl/cu124
+
+WORKDIR /workspace
+
+COPY common/shim/ /workspace/shim/
+RUN cd /workspace/shim && make clean && make
+
+COPY exp_a_nccl_gates/benchmark.py /workspace/
+COPY exp_a_nccl_gates/benchmark_docker.py /workspace/
+COPY exp_a_nccl_gates/entrypoint.sh /workspace/
+
+RUN chmod +x /workspace/entrypoint.sh
+
+ENV PYTHONUNBUFFERED=1
+
+ENTRYPOINT ["bash", "/workspace/entrypoint.sh"]
+CMD ["python3", "benchmark_docker.py"]

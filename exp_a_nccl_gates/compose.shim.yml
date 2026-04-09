@@ -1,0 +1,94 @@
+# Exp A — XTrans Shim: LD_PRELOAD interception of NCCL gates
+#
+# THE EXPERIMENT. Per-GPU isolation with LD_PRELOAD shim.
+# The shim intercepts gethostname() and stat() to satisfy NCCL's
+# hostHash and shmDev gates without NCCL-specific env vars.
+#
+# Phase 1 (current): host network for IPC socket gate.
+# A1 strace will inform Phase 2 with bridge network + UDS redirect.
+#
+# What's different from exp2:
+#   - NO NCCL_CUMEM_ENABLE (shim doesn't need it)
+#   - NO shared /dev/shm volume (shim fakes st_dev)
+#   - LD_PRELOAD=libxtrans_shim.so replaces all workarounds
+#
+# What's still shared (Phase 1):
+#   - Host network (for abstract UDS — to be removed in Phase 2)
+#
+# NVIDIA_VISIBLE_DEVICES=all for NVML topology discovery.
+# Per-GPU compute isolation via CUDA_VISIBLE_DEVICES.
+
+services:
+  rank0:
+    image: tth37/xtrans-experiments:expa-benchmark
+    container_name: expa-shim-rank0
+    runtime: nvidia
+    network_mode: host
+    shm_size: 1g
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=0
+      # XTrans shim configuration
+      - LD_PRELOAD=/workspace/shim/libxtrans_shim.so
+      - XTRANS_HOSTNAME=node192
+      - XTRANS_SHMDEV=0x1
+      - XTRANS_VERBOSE=1
+      # NO NCCL_CUMEM_ENABLE — the shim must work without it
+      - NCCL_DEBUG=INFO
+      - NCCL_DEBUG_SUBSYS=INIT,P2P,SHM,NET
+      - WORLD_SIZE=2
+      - RANK=0
+      - MASTER_ADDR=127.0.0.1
+      - MASTER_PORT=29500
+      - OUTPUT_FILE=/results/shim.json
+      - DEPLOYMENT=shim
+      - SMOKE_TEST=${SMOKE_TEST:-false}
+      - STRACE_WRAP=${STRACE_WRAP:-0}
+    volumes:
+      - ./benchmark.py:/workspace/benchmark.py
+      - ./benchmark_docker.py:/workspace/benchmark_docker.py
+      - ./results:/results
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0', '1']
+              capabilities: [gpu]
+
+  rank1:
+    image: tth37/xtrans-experiments:expa-benchmark
+    container_name: expa-shim-rank1
+    runtime: nvidia
+    network_mode: host
+    shm_size: 1g
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=1
+      # XTrans shim configuration
+      - LD_PRELOAD=/workspace/shim/libxtrans_shim.so
+      - XTRANS_HOSTNAME=node192
+      - XTRANS_SHMDEV=0x1
+      - XTRANS_VERBOSE=1
+      # NO NCCL_CUMEM_ENABLE
+      - NCCL_DEBUG=INFO
+      - NCCL_DEBUG_SUBSYS=INIT,P2P,SHM,NET
+      - WORLD_SIZE=2
+      - RANK=1
+      - MASTER_ADDR=127.0.0.1
+      - MASTER_PORT=29500
+      - DEPLOYMENT=shim
+      - SMOKE_TEST=${SMOKE_TEST:-false}
+      - STRACE_WRAP=${STRACE_WRAP:-0}
+    volumes:
+      - ./benchmark.py:/workspace/benchmark.py
+      - ./benchmark_docker.py:/workspace/benchmark_docker.py
+    depends_on:
+      - rank0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0', '1']
+              capabilities: [gpu]

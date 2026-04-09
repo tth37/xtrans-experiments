@@ -1,0 +1,98 @@
+# Exp A — Version sweep: parameterized compose for A3 testing
+#
+# Uses ${EXPA_IMAGE} for the container image and ${NCCL_LABEL} for the
+# output filename. Same as compose.shim_full.yml but parameterized.
+#
+# Usage:
+#   EXPA_IMAGE=tth37/xtrans-experiments:expa-nccl2.18 \
+#   NCCL_LABEL=2.18 \
+#   docker compose -f compose.version.yml up --abort-on-container-exit
+
+services:
+  rank0:
+    image: ${EXPA_IMAGE:-tth37/xtrans-experiments:expa-benchmark}
+    container_name: expa-ver-rank0
+    runtime: nvidia
+    networks:
+      - expa-ver-net
+    shm_size: 1g
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=0
+      - LD_PRELOAD=/workspace/shim/libxtrans_shim.so
+      - XTRANS_HOSTNAME=node192
+      - XTRANS_SHMDEV=0x1
+      - XTRANS_UDS_DIR=/shared_uds
+      - XTRANS_VERBOSE=1
+      - NCCL_DEBUG=INFO
+      - NCCL_DEBUG_SUBSYS=INIT,P2P
+      - WORLD_SIZE=2
+      - RANK=0
+      - MASTER_ADDR=expa-ver-rank0
+      - MASTER_PORT=29500
+      - OUTPUT_FILE=/results/version_${NCCL_LABEL:-unknown}.json
+      - DEPLOYMENT=version_${NCCL_LABEL:-unknown}
+      - SMOKE_TEST=${SMOKE_TEST:-false}
+      - STRACE_WRAP=${STRACE_WRAP:-0}
+    volumes:
+      - ./benchmark.py:/workspace/benchmark.py
+      - ./benchmark_docker.py:/workspace/benchmark_docker.py
+      - ./results:/results
+      - shared-uds:/shared_uds
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0', '1']
+              capabilities: [gpu]
+
+  rank1:
+    image: ${EXPA_IMAGE:-tth37/xtrans-experiments:expa-benchmark}
+    container_name: expa-ver-rank1
+    runtime: nvidia
+    networks:
+      - expa-ver-net
+    shm_size: 1g
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=1
+      - LD_PRELOAD=/workspace/shim/libxtrans_shim.so
+      - XTRANS_HOSTNAME=node192
+      - XTRANS_SHMDEV=0x1
+      - XTRANS_UDS_DIR=/shared_uds
+      - XTRANS_VERBOSE=1
+      - NCCL_DEBUG=INFO
+      - NCCL_DEBUG_SUBSYS=INIT,P2P
+      - WORLD_SIZE=2
+      - RANK=1
+      - MASTER_ADDR=expa-ver-rank0
+      - MASTER_PORT=29500
+      - DEPLOYMENT=version_${NCCL_LABEL:-unknown}
+      - SMOKE_TEST=${SMOKE_TEST:-false}
+      - STRACE_WRAP=${STRACE_WRAP:-0}
+    volumes:
+      - ./benchmark.py:/workspace/benchmark.py
+      - ./benchmark_docker.py:/workspace/benchmark_docker.py
+      - shared-uds:/shared_uds
+    depends_on:
+      - rank0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0', '1']
+              capabilities: [gpu]
+
+networks:
+  expa-ver-net:
+    driver: bridge
+
+volumes:
+  shared-uds:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=100m

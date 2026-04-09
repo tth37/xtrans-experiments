@@ -1,0 +1,465 @@
+#!/usr/bin/env python3
+"""
+GPU Communication Benchmark — Exp A adaptation
+Profiles performance of distributed communication operations.
+
+Adapted from reference/exp2/benchmark.py with:
+- DEPLOYMENT env var support (replaces hardcoded 'host')
+- NCCL-related environment variable capture in output JSON
+"""
+
+import os
+import time
+import json
+import torch
+import torch.distributed as dist
+from typing import Dict, List, Tuple
+from datetime import datetime
+
+
+def _compute_stats(times: List[float], trim_pct: float = 0.05) -> Tuple[float, float]:
+    """Compute trimmed mean and std, dropping top/bottom trim_pct of samples."""
+    sorted_times = sorted(times)
+    n = len(sorted_times)
+    trim_count = int(n * trim_pct)
+    if trim_count > 0 and n > 2 * trim_count + 2:
+        trimmed = sorted_times[trim_count:-trim_count]
+    else:
+        trimmed = sorted_times
+    avg = sum(trimmed) / len(trimmed)
+    std = torch.tensor(trimmed).std().item()
+    return avg, std
+
+
+def capture_nccl_env() -> Dict[str, str]:
+    """Capture NCCL-related environment variables for result metadata."""
+    prefixes = ("NCCL_", "XTRANS_", "LD_PRELOAD", "CUDA_VISIBLE_DEVICES",
+                "NVIDIA_VISIBLE_DEVICES")
+    env = {}
+    for key, value in os.environ.items():
+        if any(key.startswith(p) or key == p for p in prefixes):
+            env[key] = value
+    return env
+
+
+class CommBenchmark:
+    """Benchmark for distributed communication operations."""
+
+    def __init__(self, rank: int, world_size: int, device: torch.device):
+        self.rank = rank
+        self.world_size = world_size
+        self.device = device
+        self.results = {}
+
+    def warmup(self, iterations: int = 10):
+        """Warmup to stabilize GPU clocks."""
+        tensor = torch.randn(1024, device=self.device)
+        for _ in range(iterations):
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        torch.cuda.synchronize()
+
+    def benchmark_all_reduce(self, sizes: List[int], iterations: int = 100) -> Dict:
+        """Benchmark all-reduce operation with different tensor sizes."""
+        results = {}
+
+        for size in sizes:
+            tensor = torch.randn(size, device=self.device, dtype=torch.float32)
+            buf = torch.empty_like(tensor)
+            size_mb = tensor.numel() * tensor.element_size() / (1024 * 1024)
+
+            # Warmup with same-sized tensor
+            for _ in range(10):
+                buf.copy_(tensor)
+                dist.all_reduce(buf, op=dist.ReduceOp.SUM)
+            torch.cuda.synchronize()
+
+            # Benchmark — pre-copy then time only the collective
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+
+            times = []
+            for _ in range(iterations):
+                buf.copy_(tensor)
+                torch.cuda.synchronize()
+                start.record()
+                dist.all_reduce(buf, op=dist.ReduceOp.SUM)
+                end.record()
+                torch.cuda.synchronize()
+                times.append(start.elapsed_time(end))
+
+            avg_time_ms, std_time_ms = _compute_stats(times)
+            bandwidth_gbps = (size_mb / 1024) / (avg_time_ms / 1000)
+
+            results[f"{size_mb:.2f}MB"] = {
+                "avg_time_ms": avg_time_ms,
+                "std_time_ms": std_time_ms,
+                "bandwidth_gbps": bandwidth_gbps,
+                "size_elements": size,
+            }
+
+            if self.rank == 0:
+                print(f"  All-Reduce {size_mb:8.2f} MB: {avg_time_ms:7.3f} +/- {std_time_ms:6.3f} ms, "
+                      f"{bandwidth_gbps:6.2f} GB/s")
+
+        return results
+
+    def benchmark_all_gather(self, sizes: List[int], iterations: int = 100) -> Dict:
+        """Benchmark all-gather operation."""
+        results = {}
+
+        for size in sizes:
+            tensor = torch.randn(size, device=self.device, dtype=torch.float32)
+            # Pre-allocate output list once
+            tensor_list = [torch.empty_like(tensor) for _ in range(self.world_size)]
+
+            size_mb = tensor.numel() * tensor.element_size() / (1024 * 1024)
+            total_size_mb = size_mb * self.world_size
+
+            # Warmup
+            for _ in range(10):
+                dist.all_gather(tensor_list, tensor)
+            torch.cuda.synchronize()
+
+            # Benchmark — reuse pre-allocated output list
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+
+            times = []
+            for _ in range(iterations):
+                start.record()
+                dist.all_gather(tensor_list, tensor)
+                end.record()
+                torch.cuda.synchronize()
+                times.append(start.elapsed_time(end))
+
+            avg_time_ms, std_time_ms = _compute_stats(times)
+            bandwidth_gbps = (total_size_mb / 1024) / (avg_time_ms / 1000)
+
+            results[f"{size_mb:.2f}MB"] = {
+                "avg_time_ms": avg_time_ms,
+                "std_time_ms": std_time_ms,
+                "bandwidth_gbps": bandwidth_gbps,
+                "size_elements": size,
+                "total_size_mb": total_size_mb,
+            }
+
+            if self.rank == 0:
+                print(f"  All-Gather {size_mb:8.2f} MB: {avg_time_ms:7.3f} +/- {std_time_ms:6.3f} ms, "
+                      f"{bandwidth_gbps:6.2f} GB/s")
+
+        return results
+
+    def benchmark_reduce_scatter(self, sizes: List[int], iterations: int = 100) -> Dict:
+        """Benchmark reduce-scatter operation using reduce_scatter_tensor."""
+        results = {}
+
+        for size in sizes:
+            # Input must be divisible by world_size
+            total_size = (size // self.world_size) * self.world_size
+            per_rank_size = total_size // self.world_size
+
+            tensor = torch.randn(total_size, device=self.device, dtype=torch.float32)
+            output = torch.empty(per_rank_size, device=self.device, dtype=torch.float32)
+
+            size_mb = tensor.numel() * tensor.element_size() / (1024 * 1024)
+
+            # Warmup
+            for _ in range(10):
+                dist.reduce_scatter_tensor(output, tensor, op=dist.ReduceOp.SUM)
+            torch.cuda.synchronize()
+
+            # Benchmark — no per-iteration allocation
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+
+            times = []
+            for _ in range(iterations):
+                start.record()
+                dist.reduce_scatter_tensor(output, tensor, op=dist.ReduceOp.SUM)
+                end.record()
+                torch.cuda.synchronize()
+                times.append(start.elapsed_time(end))
+
+            avg_time_ms, std_time_ms = _compute_stats(times)
+            bandwidth_gbps = (size_mb / 1024) / (avg_time_ms / 1000)
+
+            results[f"{size_mb:.2f}MB"] = {
+                "avg_time_ms": avg_time_ms,
+                "std_time_ms": std_time_ms,
+                "bandwidth_gbps": bandwidth_gbps,
+                "size_elements": total_size,
+            }
+
+            if self.rank == 0:
+                print(f"  Reduce-Scatter {size_mb:8.2f} MB: {avg_time_ms:7.3f} +/- {std_time_ms:6.3f} ms, "
+                      f"{bandwidth_gbps:6.2f} GB/s")
+
+        return results
+
+    def benchmark_broadcast(self, sizes: List[int], iterations: int = 100) -> Dict:
+        """Benchmark broadcast operation."""
+        results = {}
+
+        for size in sizes:
+            tensor = torch.randn(size, device=self.device, dtype=torch.float32)
+            size_mb = tensor.numel() * tensor.element_size() / (1024 * 1024)
+
+            # Warmup — broadcast is in-place, no clone needed
+            for _ in range(10):
+                dist.broadcast(tensor, src=0)
+            torch.cuda.synchronize()
+
+            # Benchmark — broadcast overwrites tensor in-place, no allocation needed
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+
+            times = []
+            for _ in range(iterations):
+                start.record()
+                dist.broadcast(tensor, src=0)
+                end.record()
+                torch.cuda.synchronize()
+                times.append(start.elapsed_time(end))
+
+            avg_time_ms, std_time_ms = _compute_stats(times)
+            bandwidth_gbps = (size_mb / 1024) / (avg_time_ms / 1000)
+
+            results[f"{size_mb:.2f}MB"] = {
+                "avg_time_ms": avg_time_ms,
+                "std_time_ms": std_time_ms,
+                "bandwidth_gbps": bandwidth_gbps,
+                "size_elements": size,
+            }
+
+            if self.rank == 0:
+                print(f"  Broadcast {size_mb:8.2f} MB: {avg_time_ms:7.3f} +/- {std_time_ms:6.3f} ms, "
+                      f"{bandwidth_gbps:6.2f} GB/s")
+
+        return results
+
+    def benchmark_p2p(self, sizes: List[int], iterations: int = 100) -> Dict:
+        """Benchmark point-to-point send/recv."""
+        results = {}
+
+        # Only rank 0 and 1 participate
+        if self.rank >= 2:
+            dist.barrier()
+            return results
+
+        for size in sizes:
+            tensor = torch.randn(size, device=self.device, dtype=torch.float32)
+            size_mb = tensor.numel() * tensor.element_size() / (1024 * 1024)
+
+            # Warmup
+            for _ in range(10):
+                if self.rank == 0:
+                    dist.send(tensor, dst=1)
+                elif self.rank == 1:
+                    dist.recv(tensor, src=0)
+            torch.cuda.synchronize()
+
+            # Benchmark
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+
+            times = []
+            for _ in range(iterations):
+                start.record()
+                if self.rank == 0:
+                    dist.send(tensor, dst=1)
+                elif self.rank == 1:
+                    dist.recv(tensor, src=0)
+                end.record()
+                torch.cuda.synchronize()
+                times.append(start.elapsed_time(end))
+
+            avg_time_ms, std_time_ms = _compute_stats(times)
+            bandwidth_gbps = (size_mb / 1024) / (avg_time_ms / 1000)
+
+            results[f"{size_mb:.2f}MB"] = {
+                "avg_time_ms": avg_time_ms,
+                "std_time_ms": std_time_ms,
+                "bandwidth_gbps": bandwidth_gbps,
+                "size_elements": size,
+            }
+
+            if self.rank == 0:
+                print(f"  P2P Send/Recv {size_mb:8.2f} MB: {avg_time_ms:7.3f} +/- {std_time_ms:6.3f} ms, "
+                      f"{bandwidth_gbps:6.2f} GB/s")
+
+        dist.barrier()
+        return results
+
+    def run_all_benchmarks(self) -> Dict:
+        """Run all benchmarks and collect results."""
+        # Test sizes: 1KB to 100MB
+        sizes = [
+            256,           # 1 KB
+            2560,          # 10 KB
+            25600,         # 100 KB
+            256000,        # 1 MB
+            2560000,       # 10 MB
+            25600000,      # 100 MB
+        ]
+
+        if self.rank == 0:
+            print("\n" + "="*80)
+            print("Running Communication Benchmarks")
+            print("="*80)
+            print(f"World Size: {self.world_size}")
+            print(f"Device: {self.device}")
+            print(f"Backend: {dist.get_backend()}")
+            print("="*80 + "\n")
+
+        # Warmup
+        if self.rank == 0:
+            print("Warming up...")
+        self.warmup()
+        dist.barrier()
+
+        # All-Reduce
+        if self.rank == 0:
+            print("\nBenchmarking All-Reduce:")
+        self.results['all_reduce'] = self.benchmark_all_reduce(sizes)
+        dist.barrier()
+
+        # All-Gather
+        if self.rank == 0:
+            print("\nBenchmarking All-Gather:")
+        self.results['all_gather'] = self.benchmark_all_gather(sizes)
+        dist.barrier()
+
+        # Reduce-Scatter
+        if self.rank == 0:
+            print("\nBenchmarking Reduce-Scatter:")
+        self.results['reduce_scatter'] = self.benchmark_reduce_scatter(sizes)
+        dist.barrier()
+
+        # Broadcast
+        if self.rank == 0:
+            print("\nBenchmarking Broadcast:")
+        self.results['broadcast'] = self.benchmark_broadcast(sizes)
+        dist.barrier()
+
+        # P2P
+        if self.rank == 0:
+            print("\nBenchmarking Point-to-Point (Rank 0 <-> Rank 1):")
+        self.results['p2p'] = self.benchmark_p2p(sizes)
+        dist.barrier()
+
+        return self.results
+
+
+def worker(rank: int, world_size: int, output_file: str):
+    """Worker process that runs benchmarks (for multiprocessing.spawn)."""
+    # Initialize process group
+    dist.init_process_group(
+        backend='nccl',
+        init_method='env://',
+        world_size=world_size,
+        rank=rank,
+    )
+
+    # Set device
+    device = torch.device(f'cuda:{rank}')
+    torch.cuda.set_device(device)
+
+    # Get system info
+    if rank == 0:
+        print(f"\nSystem Information:")
+        print(f"  CUDA Version: {torch.version.cuda}")
+        print(f"  PyTorch Version: {torch.__version__}")
+        print(f"  GPU: {torch.cuda.get_device_name(device)}")
+        print(f"  NCCL Version: {torch.cuda.nccl.version()}")
+
+    # Run benchmarks
+    benchmark = CommBenchmark(rank, world_size, device)
+    results = benchmark.run_all_benchmarks()
+
+    # Save results from rank 0
+    if rank == 0:
+        deployment = os.environ.get('DEPLOYMENT', 'host')
+        output_data = {
+            'timestamp': datetime.now().isoformat(),
+            'world_size': world_size,
+            'backend': dist.get_backend(),
+            'cuda_version': torch.version.cuda,
+            'pytorch_version': torch.__version__,
+            'gpu_name': torch.cuda.get_device_name(device),
+            'nccl_version': str(torch.cuda.nccl.version()),
+            'deployment': deployment,
+            'nccl_env': capture_nccl_env(),
+            'results': results,
+        }
+
+        with open(output_file, 'w') as f:
+            json.dump(output_data, f, indent=2)
+
+        print(f"\n{'='*80}")
+        print(f"Results saved to: {output_file}")
+        print(f"{'='*80}\n")
+
+    # Cleanup
+    dist.destroy_process_group()
+
+
+def smoke_test_worker(rank: int, world_size: int):
+    """Quick smoke test worker - minimal NCCL operation for verification."""
+    dist.init_process_group(
+        backend='nccl',
+        init_method='env://',
+        world_size=world_size,
+        rank=rank,
+    )
+
+    device = torch.device(f'cuda:{rank}')
+    torch.cuda.set_device(device)
+
+    if rank == 0:
+        print(f"\n{'='*60}")
+        print("NCCL Smoke Test - Quick Communication Check")
+        print(f"{'='*60}")
+        print(f"World Size: {world_size}")
+        print(f"CUDA Version: {torch.version.cuda}")
+        print(f"NCCL Version: {torch.cuda.nccl.version()}")
+        print(f"GPU: {torch.cuda.get_device_name(device)}")
+        print(f"{'='*60}")
+
+    tensor = torch.ones(1024, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    torch.cuda.synchronize()
+
+    expected = world_size
+    actual = tensor[0].item()
+
+    if rank == 0:
+        if abs(actual - expected) < 0.01:
+            print(f"  All-Reduce test PASSED: {actual:.0f} == {expected}")
+        else:
+            print(f"  All-Reduce test FAILED: {actual:.0f} != {expected}")
+        print(f"{'='*60}\n")
+
+    dist.destroy_process_group()
+
+
+if __name__ == '__main__':
+    import torch.multiprocessing as mp
+    import argparse
+
+    parser = argparse.ArgumentParser(description='GPU Communication Benchmark')
+    parser.add_argument('--smoke', action='store_true',
+                        help='Run quick smoke test instead of full benchmark')
+    args = parser.parse_args()
+
+    world_size = int(os.environ.get('WORLD_SIZE', 2))
+    output_file = os.environ.get('OUTPUT_FILE', 'benchmark_results.json')
+
+    # Set environment
+    os.environ.setdefault('MASTER_ADDR', 'localhost')
+    os.environ.setdefault('MASTER_PORT', '29500')
+
+    mp.set_start_method('spawn', force=True)
+    if args.smoke:
+        mp.spawn(smoke_test_worker, args=(world_size,), nprocs=world_size, join=True)
+    else:
+        mp.spawn(worker, args=(world_size, output_file), nprocs=world_size, join=True)

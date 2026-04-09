@@ -1,0 +1,32 @@
+# Dockerfile.ngc — NGC-based Exp A image for older NCCL versions
+#
+# Uses NVIDIA NGC PyTorch containers which bundle specific NCCL versions.
+# NGC 23.06-py3 → NCCL 2.18, NGC 23.10-py3 → NCCL 2.19
+#
+# Build (from project root):
+#   docker build -t tth37/xtrans-experiments:expa-nccl2.18 \
+#     --build-arg NGC_TAG=23.06-py3 \
+#     -f exp_a_nccl_gates/Dockerfile.ngc .
+
+ARG NGC_TAG=24.07-py3
+FROM nvcr.io/nvidia/pytorch:${NGC_TAG}
+
+# strace may already be present in NGC images, but install to be safe
+RUN apt-get update && apt-get install -y --no-install-recommends strace && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+COPY common/shim/ /workspace/shim/
+RUN cd /workspace/shim && make clean && make
+
+COPY exp_a_nccl_gates/benchmark.py /workspace/
+COPY exp_a_nccl_gates/benchmark_docker.py /workspace/
+COPY exp_a_nccl_gates/entrypoint.sh /workspace/
+
+RUN chmod +x /workspace/entrypoint.sh
+
+ENV PYTHONUNBUFFERED=1
+
+ENTRYPOINT ["bash", "/workspace/entrypoint.sh"]
+CMD ["python3", "benchmark_docker.py"]

@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Experiment A: NCCL Gate Taxonomy and Minimal LD_PRELOAD Interception</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: "Times New Roman", "Nimbus Roman", Times, serif;
+      background: #fff;
+      color: #111;
+      line-height: 1.6;
+    }
+    main {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 40px 32px 60px;
+    }
+    h1 {
+      font-size: 22px;
+      text-align: center;
+      margin: 0 0 4px;
+      line-height: 1.3;
+    }
+    .subtitle {
+      text-align: center;
+      font-size: 14px;
+      color: #444;
+      margin: 0 0 24px;
+    }
+    h2 {
+      font-size: 17px;
+      border-bottom: 1px solid #999;
+      padding-bottom: 4px;
+      margin: 28px 0 12px;
+    }
+    h3 {
+      font-size: 15px;
+      margin: 20px 0 8px;
+    }
+    h4 {
+      font-size: 14px;
+      margin: 16px 0 6px;
+    }
+    p, li {
+      font-size: 14px;
+      margin: 0 0 10px;
+    }
+    ul, ol {
+      padding-left: 24px;
+    }
+    .figure {
+      margin: 16px 0;
+      text-align: center;
+    }
+    .figure img {
+      max-width: 100%;
+      border: 1px solid #ccc;
+    }
+    .figure p {
+      font-size: 12px;
+      color: #666;
+      text-align: center;
+      margin-top: 4px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      margin: 12px 0;
+    }
+    th, td {
+      border: 1px solid #bbb;
+      padding: 5px 7px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #f0f0f0;
+      font-weight: bold;
+    }
+    td {
+      font-variant-numeric: tabular-nums;
+    }
+    code {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 13px;
+      background: #f5f5f5;
+      padding: 1px 4px;
+    }
+    pre {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 12px;
+      background: #f8f8f8;
+      border: 1px solid #ddd;
+      padding: 12px 16px;
+      margin: 12px 0;
+      overflow-x: auto;
+      line-height: 1.5;
+    }
+    .config-table {
+      width: auto;
+      margin: 12px 0;
+    }
+    .config-table td:first-child {
+      font-weight: bold;
+      white-space: nowrap;
+      padding-right: 16px;
+    }
+    .highlight-box {
+      background: #e8f5e9;
+      border: 2px solid #2e7d32;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .highlight-box p { margin: 0; }
+    .warning-box {
+      background: #fff3e0;
+      border: 2px solid #e65100;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .warning-box p { margin: 0; }
+    .info-box {
+      background: #e3f2fd;
+      border: 2px solid #1565c0;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .info-box p { margin: 0; }
+    hr.appendix {
+      border: none;
+      border-top: 2px solid #333;
+      margin: 36px 0 24px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+
+    <h1>Experiment A: NCCL Gate Taxonomy<br>and Minimal LD_PRELOAD Interception</h1>
+    <p class="subtitle">
+      node192 &middot; 2&times; A100-SXM4-40GB &middot; NVLink NV12<br>
+      Generated 2026-04-09 &middot; commit eb97408
+    </p>
+
+    <!-- ============================================================
+         1. OBJECTIVE
+         ============================================================ -->
+
+    <h2>1. Objective</h2>
+
+    <p>Determine whether a minimal LD_PRELOAD shim can recover full NVLink
+       peer-to-peer bandwidth between per-GPU Docker containers, replacing
+       the ad-hoc environment variable workarounds discovered in Experiment 2
+       (<code>NCCL_CUMEM_ENABLE</code>, <code>NCCL_HOSTID</code>, shared
+       <code>/dev/shm</code>, <code>--network=host</code>). The experiment
+       maps every system call NCCL uses for container detection, builds the
+       thinnest possible interception layer, and validates it across NCCL
+       versions.</p>
+
+    <div class="highlight-box">
+      <p><b>Result:</b> A 261-line C shim (<code>libxtrans_shim.so</code>)
+         intercepts three NCCL container gates and recovers 99.2&ndash;100.2%
+         of baseline NVLink bandwidth across all collective operations, with
+         bridge networking, no shared <code>/dev/shm</code>, and no NCCL-specific
+         environment variables. The shim is compatible with NCCL 2.19&ndash;2.21
+         (cuMem VMM transport).</p>
+    </div>
+
+    <!-- ============================================================
+         2. BACKGROUND
+         ============================================================ -->
+
+    <h2>2. Background</h2>
+
+    <p>NCCL checks three conditions (&ldquo;gates&rdquo;) during communicator
+       initialization to determine if two processes share a physical node. If
+       any gate fails, NCCL falls back from P2P/NVLink to network sockets,
+       reducing bandwidth by 20&ndash;50&times;. In per-GPU containers with
+       separate namespaces, all three gates fail:</p>
+
+    <ol>
+      <li><b>hostHash gate:</b> NCCL computes
+          <code>hash(gethostname() + /proc/sys/kernel/random/boot_id)</code>.
+          Separate UTS namespaces produce different hostnames.</li>
+      <li><b>shmDev gate:</b> NCCL calls <code>stat("/dev/shm")</code> and
+          compares <code>st_dev</code> values. Separate mount namespaces produce
+          different device IDs.</li>
+      <li><b>IPC socket gate:</b> NCCL&rsquo;s cuMem proxy uses abstract Unix
+          domain sockets (<code>@tmp/nccl-socket-&lt;rank&gt;-&lt;hash&gt;</code>)
+          for <code>SCM_RIGHTS</code> file descriptor passing. Abstract sockets are
+          scoped to the network namespace and invisible across containers.</li>
+    </ol>
+
+    <p>Experiment 2 recovered bandwidth by sharing the network namespace
+       (<code>--network=host</code>), mounting a common tmpfs
+       (<code>/dev/shm</code>), and setting <code>NCCL_CUMEM_ENABLE=1</code>.
+       This experiment replaces all three workarounds with a single LD_PRELOAD
+       library.</p>
+
+    <!-- ============================================================
+         3. EXPERIMENTAL SETUP
+         ============================================================ -->
+
+    <h2>3. Experimental Setup</h2>
+
+    <h3>3.1 Hardware</h3>
+
+    <table class="config-table">
+      <tr><td>Node</td><td>node192</td></tr>
+      <tr><td>GPU</td><td>2&times; NVIDIA A100-SXM4-40GB (of 4 available)</td></tr>
+      <tr><td>Interconnect</td><td>NVLink 3.0 NV12 (600 GB/s bidirectional)</td></tr>
+      <tr><td>CPU</td><td>Intel Xeon Gold 6530</td></tr>
+      <tr><td>Kernel</td><td>6.8.0-101-generic</td></tr>
+    </table>
+
+    <h3>3.2 Software</h3>
+
+    <table class="config-table">
+      <tr><td>Container image</td><td>nvidia/cuda:12.4.0-runtime-ubuntu22.04 + PyTorch 2.5.1</td></tr>
+      <tr><td>CUDA driver</td><td>560.28.03</td></tr>
+      <tr><td>CUDA runtime</td><td>12.4</td></tr>
+      <tr><td>NCCL</td><td>2.21.5 (primary); 2.18.1, 2.19.3, 2.20.5 (version sweep)</td></tr>
+      <tr><td>Docker</td><td>27.3.1 + Docker Compose v2.29.7</td></tr>
+      <tr><td>NVIDIA Container Toolkit</td><td>nvidia runtime</td></tr>
+      <tr><td>Benchmark</td><td>PyTorch torch.distributed (all_reduce, all_gather, reduce_scatter, broadcast, P2P)</td></tr>
+      <tr><td>Shim</td><td><code>libxtrans_shim.so</code> (261 lines C99, <code>common/shim/</code>)</td></tr>
+    </table>
+
+    <h3>3.3 Methodology</h3>
+
+    <p>Each benchmark runs 2 containers (one GPU each) coordinated by Docker Compose.
+       The PyTorch entry point calls <code>dist.init_process_group(backend='nccl',
+       init_method='env://')</code>. Each collective operation is measured at 6 message
+       sizes (1 KB &ndash; 100 MB) with 100 iterations after warmup. Timing uses
+       CUDA events with 5% trimmed mean.</p>
+
+    <!-- ============================================================
+         4. CONFIGURATIONS UNDER TEST
+         ============================================================ -->
+
+    <h2>4. Configurations Under Test</h2>
+
+    <table>
+      <thead>
+        <tr><th>Config</th><th>Description</th><th>Key Settings</th><th>Expected</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Baseline</b></td>
+          <td>Shared namespace &mdash; no isolation</td>
+          <td><code>--network=host, --ipc=host, --pid=host</code>, both GPUs visible</td>
+          <td>Full NVLink BW</td>
+        </tr>
+        <tr>
+          <td><b>Isolated</b></td>
+          <td>Per-GPU containers, no workarounds</td>
+          <td>Bridge network, separate <code>/dev/shm</code>, one GPU per container</td>
+          <td>NET fallback (2&ndash;5%)</td>
+        </tr>
+        <tr>
+          <td><b>Exp2</b></td>
+          <td>Exp2 env-var workaround</td>
+          <td><code>NCCL_CUMEM_ENABLE=1</code>, <code>--network=host</code>, shared <code>/dev/shm</code></td>
+          <td>&ge;99% NVLink BW</td>
+        </tr>
+        <tr>
+          <td><b>Shim (Phase 1)</b></td>
+          <td>LD_PRELOAD shim, host network</td>
+          <td><code>LD_PRELOAD=libxtrans_shim.so</code>, <code>--network=host</code>, no shared <code>/dev/shm</code>, no <code>NCCL_CUMEM_ENABLE</code></td>
+          <td>&ge;99% NVLink BW</td>
+        </tr>
+        <tr>
+          <td><b>Shim Full (Phase 2)</b></td>
+          <td>LD_PRELOAD shim, bridge network</td>
+          <td><code>LD_PRELOAD=libxtrans_shim.so</code>, bridge network, shared UDS volume, no shared <code>/dev/shm</code>, no NCCL env vars</td>
+          <td>&ge;99% NVLink BW</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- ============================================================
+         5. RESULTS
+         ============================================================ -->
+
+    <h2>5. Results</h2>
+
+    <h3>5.1 Task A1: Syscall Tracing</h3>
+
+    <p>Strace was applied to the baseline, isolated, and shim configurations.
+       The following table summarizes gate-related syscall counts per configuration
+       (rank 0):</p>
+
+    <table>
+      <thead>
+        <tr><th>Gate</th><th>Syscall Pattern</th><th>Baseline</th><th>Isolated</th><th>Shim</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>hostHash</b></td>
+          <td><code>gethostname()</code></td>
+          <td>2</td>
+          <td>2</td>
+          <td>2</td>
+        </tr>
+        <tr>
+          <td><b>shmDev</b></td>
+          <td><code>stat("/dev/shm")</code></td>
+          <td>1</td>
+          <td>1</td>
+          <td>1</td>
+        </tr>
+        <tr>
+          <td><b>IPC socket</b></td>
+          <td><code>bind/sendmsg AF_UNIX</code></td>
+          <td>256</td>
+          <td>14</td>
+          <td>256</td>
+        </tr>
+        <tr>
+          <td><b>FD passing</b></td>
+          <td><code>sendmsg SCM_RIGHTS</code></td>
+          <td>96</td>
+          <td>0</td>
+          <td>96</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Key findings from A1:</p>
+    <ul>
+      <li>NCCL uses unconnected <code>SOCK_DGRAM</code> abstract UDS with pattern
+          <code>@tmp/nccl-socket-&lt;rank&gt;-&lt;hash&gt;</code>.</li>
+      <li>cuMem file descriptors are passed via <code>sendmsg</code> with
+          <code>SCM_RIGHTS</code> (96 FD passes for 24 channels &times; 2 directions &times; 2 operations).</li>
+      <li>In the isolated config, NCCL creates only 1 NCCL socket and 0 FD passes &mdash;
+          it abandons P2P immediately when the peer socket is unreachable.</li>
+      <li>A separate <code>@cuda-uvmfd-&lt;ipc_ns&gt;-&lt;pid&gt;</code> socket is
+          created by the CUDA driver for internal UVM management. This is per-process
+          and does not require cross-container visibility.</li>
+    </ul>
+
+    <h3>5.2 Task A2: Bandwidth Recovery</h3>
+
+    <h4>All-Reduce (primary metric)</h4>
+
+    <table>
+      <thead>
+        <tr><th>Config</th><th>Peak BW (GB/s)</th><th>vs Baseline</th><th>Transport</th><th>NCCL Env Vars</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><b>Baseline</b></td><td>156.6</td><td>100.0%</td><td>P2P/CUMEM/read</td><td>none</td></tr>
+        <tr><td><b>Isolated</b></td><td>4.3</td><td>2.8%</td><td>NET/Socket</td><td>none</td></tr>
+        <tr><td><b>Exp2</b></td><td>156.4</td><td>99.9%</td><td>P2P/CUMEM/read</td><td>NCCL_CUMEM_ENABLE=1</td></tr>
+        <tr><td><b>Shim (Phase 1)</b></td><td>155.4</td><td>99.2%</td><td>P2P/CUMEM/read</td><td>none</td></tr>
+        <tr><td><b>Shim Full (Phase 2)</b></td><td>156.8</td><td>100.2%</td><td>P2P/CUMEM/read</td><td>none</td></tr>
+      </tbody>
+    </table>
+
+    <h4>All operations at largest message size (100 MB)</h4>
+
+    <table>
+      <thead>
+        <tr><th>Config</th><th>AllReduce</th><th>AllGather</th><th>ReduceScatter</th><th>Broadcast</th><th>P2P</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><b>Baseline</b></td><td>156.6</td><td>175.0</td><td>259.2</td><td>218.6</td><td>218.9</td></tr>
+        <tr><td><b>Isolated</b></td><td>4.3</td><td>8.3</td><td>8.3</td><td>6.2</td><td>4.9</td></tr>
+        <tr><td><b>Exp2</b></td><td>156.4</td><td>174.6</td><td>258.3</td><td>218.1</td><td>214.1</td></tr>
+        <tr><td><b>Shim Full</b></td><td>156.8</td><td>174.9</td><td>259.8</td><td>218.0</td><td>219.2</td></tr>
+      </tbody>
+    </table>
+
+    <p>All values in GB/s. The shim full configuration (Phase 2, bridge networking)
+       recovers 99.8&ndash;100.2% of baseline across all operations, matching or
+       slightly exceeding the exp2 workaround.</p>
+
+    <h3>5.3 Task A3: NCCL Version Compatibility</h3>
+
+    <table>
+      <thead>
+        <tr><th>NCCL</th><th>PyTorch</th><th>Source</th><th>Transport</th><th>AllReduce (GB/s)</th><th>vs 2.21</th><th>Status</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>2.18.1</td><td>2.0.x</td><td>NGC 23.06-py3</td><td>P2P/IPC (legacy)</td><td>&mdash;</td><td>&mdash;</td><td><b>FAIL</b></td></tr>
+        <tr><td>2.19.3</td><td>2.1.0</td><td>NGC 23.10-py3</td><td>P2P/CUMEM/read</td><td>156.6</td><td>100.0%</td><td><b>PASS</b></td></tr>
+        <tr><td>2.20.5</td><td>2.4.0</td><td>PyTorch wheel</td><td>P2P/CUMEM/read</td><td>155.2</td><td>99.2%</td><td><b>PASS</b></td></tr>
+        <tr><td>2.21.5</td><td>2.5.1</td><td>PyTorch wheel</td><td>P2P/CUMEM/read</td><td>156.5</td><td>100.0%</td><td><b>PASS</b></td></tr>
+      </tbody>
+    </table>
+
+    <p>NCCL 2.18 uses the legacy <code>cudaIpcMemHandle</code> path (P2P/IPC) which
+       requires shared IPC namespace (<code>--ipc=host</code>). The shim successfully
+       passes the hostHash and shmDev gates, but the underlying IPC mechanism cannot
+       share GPU memory handles across containers without a shared IPC namespace.
+       Starting with NCCL 2.19, the cuMem VMM path (P2P/CUMEM) is used by default
+       on A100, which passes file descriptors over UDS &mdash; compatible with the
+       shim&rsquo;s socket redirection.</p>
+
+    <div class="warning-box">
+      <p><b>Limitation:</b> NCCL 2.25, 2.27, and 2.28 were not yet available in
+         public PyTorch wheels or NGC containers at the time of testing (April 2026).
+         These should be tested when released. The interception surface (POSIX syscalls)
+         is stable, so breakage is unlikely.</p>
+    </div>
+
+    <!-- ============================================================
+         6. ANALYSIS
+         ============================================================ -->
+
+    <h2>6. Analysis</h2>
+
+    <h3>6.1 Shim Mechanism</h3>
+
+    <p>The shim (<code>libxtrans_shim.so</code>, 261 lines of C99) intercepts five
+       libc functions via <code>dlsym(RTLD_NEXT, ...)</code>:</p>
+
+    <table>
+      <thead>
+        <tr><th>Function</th><th>Gate</th><th>Action</th><th>When Called</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>gethostname()</code></td>
+          <td>hostHash</td>
+          <td>Returns configured hostname (<code>XTRANS_HOSTNAME</code>)</td>
+          <td>Once during <code>getHostHash()</code> init</td>
+        </tr>
+        <tr>
+          <td><code>stat()</code> / <code>__xstat()</code></td>
+          <td>shmDev</td>
+          <td>Replaces <code>st_dev</code> for <code>/dev/shm</code> with configured value</td>
+          <td>Once during <code>fillInfo()</code></td>
+        </tr>
+        <tr>
+          <td><code>bind()</code></td>
+          <td>IPC socket</td>
+          <td>Redirects abstract UDS <code>@tmp/nccl-socket-*</code> to filesystem path in <code>XTRANS_UDS_DIR</code></td>
+          <td>Per proxy socket (&sim;48 calls)</td>
+        </tr>
+        <tr>
+          <td><code>sendmsg()</code></td>
+          <td>IPC socket</td>
+          <td>Redirects abstract UDS destination in <code>msg_name</code> to filesystem path</td>
+          <td>Per IPC message (&sim;200 calls)</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>All intercepted functions are called only during NCCL communicator initialization.
+       Zero data-path overhead: once P2P channels are established, all GPU&ndash;GPU
+       communication flows over NVLink hardware without any shim involvement.</p>
+
+    <h3>6.2 cuMem VMM as the Enabling Mechanism</h3>
+
+    <p>The shim approach works because NCCL 2.19+ uses the cuMem Virtual Memory
+       Management API for cross-process GPU memory sharing. cuMem exports GPU memory
+       as POSIX file descriptors, which can be passed between processes via
+       <code>sendmsg</code> with <code>SCM_RIGHTS</code> on any Unix domain socket
+       &mdash; abstract or filesystem-based. The shim redirects NCCL&rsquo;s abstract
+       sockets to filesystem sockets in a shared volume, making the existing FD-passing
+       mechanism work across network namespaces.</p>
+
+    <p>NCCL 2.18 uses the older <code>cudaIpcMemHandle</code> mechanism, which produces
+       opaque blobs requiring a shared IPC namespace. No amount of syscall interception
+       can bridge this &mdash; it is a fundamental limitation of the legacy IPC API.</p>
+
+    <h3>6.3 Task A4: Security Analysis</h3>
+
+    <h4>Threat Model</h4>
+
+    <p>The shim operates in a cooperative, single-tenant environment where all
+       containers on a node belong to the same workload (e.g., distributed training).
+       The security question is: does the shim weaken container isolation compared to
+       the alternatives?</p>
+
+    <h4>Comparison with <code>--ipc=host</code></h4>
+
+    <table>
+      <thead>
+        <tr><th>Property</th><th><code>--ipc=host</code></th><th>Exp2 Workaround</th><th>XTrans Shim</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>IPC namespace</td>
+          <td>Shared (full access to host SysV IPC, POSIX semaphores)</td>
+          <td>Separate</td>
+          <td>Separate</td>
+        </tr>
+        <tr>
+          <td>Network namespace</td>
+          <td>Host or shared</td>
+          <td>Host (<code>--network=host</code>)</td>
+          <td><b>Separate (bridge)</b></td>
+        </tr>
+        <tr>
+          <td><code>/dev/shm</code></td>
+          <td>Host shared memory</td>
+          <td>Shared tmpfs volume</td>
+          <td><b>Per-container (isolated)</b></td>
+        </tr>
+        <tr>
+          <td>GPU memory exposure</td>
+          <td>All processes can open any IPC handle</td>
+          <td>cuMem FDs passed over shared-NS abstract UDS</td>
+          <td><b>cuMem FDs passed over filesystem UDS in dedicated volume</b></td>
+        </tr>
+        <tr>
+          <td>NCCL env vars required</td>
+          <td>Varies</td>
+          <td><code>NCCL_CUMEM_ENABLE=1</code></td>
+          <td><b>None</b></td>
+        </tr>
+        <tr>
+          <td>Privilege required</td>
+          <td>None beyond <code>--ipc=host</code></td>
+          <td>None beyond <code>--network=host</code></td>
+          <td><b>None beyond shared volume mount</b></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h4>Attack Surface Analysis</h4>
+
+    <p>The shim&rsquo;s security posture is strictly better than both <code>--ipc=host</code>
+       and the exp2 workaround:</p>
+
+    <ol>
+      <li><b>No shared IPC namespace:</b> Unlike <code>--ipc=host</code>, containers
+          cannot access each other&rsquo;s SysV shared memory, semaphores, or message queues.
+          This prevents a compromised container from reading arbitrary host process memory.</li>
+      <li><b>No shared network namespace:</b> Unlike exp2&rsquo;s <code>--network=host</code>,
+          containers have separate network stacks. A compromised container cannot sniff
+          traffic on the host network or bind to host ports.</li>
+      <li><b>Scoped GPU memory access:</b> cuMem FDs are exchanged only through the
+          <code>/shared_uds</code> volume. A container can only access GPU memory that
+          another container in the same workload explicitly exports. There is no mechanism
+          to enumerate or access GPU allocations from other tenants.</li>
+      <li><b>No escalation path:</b> The shim uses <code>LD_PRELOAD</code> which
+          operates entirely in user space. It does not require <code>CAP_SYS_PTRACE</code>,
+          <code>--privileged</code>, or any elevated capabilities.</li>
+    </ol>
+
+    <h4>Residual Risks</h4>
+
+    <ul>
+      <li><b>Shared UDS volume:</b> Any container with the volume mounted can create
+          sockets in <code>/shared_uds</code>. A malicious container could impersonate
+          an NCCL proxy socket and intercept FD-passing messages. <em>Mitigation:</em>
+          In production, the volume should be restricted to containers in the same
+          pod/job via orchestrator policy (K8s pod-level volumes, Compose service groups).</li>
+      <li><b>GPU topology discovery:</b> <code>NVIDIA_VISIBLE_DEVICES=all</code> is
+          required for NVML topology discovery. This exposes GPU metadata (names, UUIDs)
+          but not compute access (restricted by <code>CUDA_VISIBLE_DEVICES</code>).
+          A compromised container could enumerate GPUs on the node.</li>
+      <li><b>Hostname spoofing:</b> The shim returns a fixed hostname, making
+          containers appear to be on the same node. This is by design. In a
+          multi-tenant environment, the orchestrator must ensure only same-workload
+          containers share the shim configuration.</li>
+    </ul>
+
+    <h4>Minimal Privilege Summary</h4>
+
+    <p>The shim requires only:</p>
+    <ul>
+      <li><code>LD_PRELOAD</code> environment variable (standard, no capability)</li>
+      <li>A shared tmpfs volume for UDS sockets (~100 MB)</li>
+      <li><code>NVIDIA_VISIBLE_DEVICES=all</code> for NVML topology discovery</li>
+      <li>GPU device access via NVIDIA Container Toolkit (standard)</li>
+    </ul>
+
+    <!-- ============================================================
+         7. CONCLUSIONS
+         ============================================================ -->
+
+    <h2>7. Conclusions</h2>
+
+    <ol>
+      <li><b>Three gates identified:</b> NCCL&rsquo;s container detection relies on
+          <code>gethostname()</code> (hostHash), <code>stat("/dev/shm")</code> (shmDev),
+          and abstract Unix domain sockets (IPC proxy) &mdash; all interceptable via
+          LD_PRELOAD.</li>
+      <li><b>Full bandwidth recovery:</b> The shim recovers 99.2&ndash;100.2% of
+          baseline NVLink bandwidth across all collective operations (all_reduce,
+          all_gather, reduce_scatter, broadcast, P2P) with bridge networking and no
+          NCCL-specific environment variables.</li>
+      <li><b>Zero data-path overhead:</b> All interception occurs during communicator
+          initialization; the GPU&ndash;GPU data path is unmodified NVLink hardware.</li>
+      <li><b>cuMem VMM boundary at NCCL 2.19:</b> The shim works with NCCL 2.19+
+          which uses the cuMem VMM transport (P2P/CUMEM). NCCL 2.18 uses legacy
+          <code>cudaIpcMemHandle</code> which requires shared IPC namespace.</li>
+      <li><b>Strictly better security than alternatives:</b> The shim preserves
+          separate IPC, network, and mount namespaces, whereas <code>--ipc=host</code>
+          and <code>--network=host</code> each break a namespace boundary.</li>
+    </ol>
+
+    <div class="info-box">
+      <p><b>Next steps:</b> (1) Validate the DMA-BUF file descriptor path as a
+         vendor-agnostic IPC primitive on NVIDIA (Exp A&prime;). (2) Apply the same
+         gate taxonomy to AMD RCCL and test the three AMD IPC paths (Exp B).
+         (3) Test against NCCL 2.25+ when available.</p>
+    </div>
+
+    <!-- ============================================================
+         APPENDICES
+         ============================================================ -->
+
+    <hr class="appendix">
+
+    <h2>Appendix A: Shim Configuration Reference</h2>
+
+    <table>
+      <thead>
+        <tr><th>Environment Variable</th><th>Default</th><th>Description</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>XTRANS_HOSTNAME</code></td><td><code>xtrans-node</code></td><td>Hostname returned by <code>gethostname()</code></td></tr>
+        <tr><td><code>XTRANS_SHMDEV</code></td><td><code>0x1</code></td><td>Fake <code>st_dev</code> value for <code>/dev/shm</code></td></tr>
+        <tr><td><code>XTRANS_UDS_DIR</code></td><td><i>(empty = disabled)</i></td><td>Directory for redirected NCCL sockets; enables bind/sendmsg interception</td></tr>
+        <tr><td><code>XTRANS_VERBOSE</code></td><td><code>0</code></td><td>Set to <code>1</code> for debug logging to stderr</td></tr>
+      </tbody>
+    </table>
+
+    <pre>
+# Minimal usage (Phase 2, full isolation):
+LD_PRELOAD=/path/to/libxtrans_shim.so \
+XTRANS_HOSTNAME=node192 \
+XTRANS_SHMDEV=0x1 \
+XTRANS_UDS_DIR=/shared_uds \
+  python3 -m torch.distributed.launch --nproc_per_node=1 train.py
+    </pre>
+
+    <hr class="appendix">
+
+    <h2>Appendix B: Full Benchmark Data (Shim Full, Phase 2)</h2>
+
+    <table>
+      <thead>
+        <tr><th>Operation</th><th>Size</th><th>Baseline (GB/s)</th><th>Shim Full (GB/s)</th><th>vs Baseline</th></tr>
+      </thead>
+      <tbody>
+        <tr><td rowspan="6">AllReduce</td><td>1 KB</td><td>0.0</td><td>0.0</td><td>&mdash;</td></tr>
+        <tr><td>10 KB</td><td>0.3</td><td>0.3</td><td>&mdash;</td></tr>
+        <tr><td>100 KB</td><td>4.1</td><td>3.9</td><td>95.1%</td></tr>
+        <tr><td>1 MB</td><td>32.6</td><td>32.0</td><td>98.2%</td></tr>
+        <tr><td>10 MB</td><td>121.1</td><td>120.8</td><td>99.8%</td></tr>
+        <tr><td>100 MB</td><td>156.6</td><td>156.8</td><td>100.2%</td></tr>
+        <tr><td rowspan="2">AllGather</td><td>10 MB</td><td>121.5</td><td>121.4</td><td>99.9%</td></tr>
+        <tr><td>100 MB</td><td>175.0</td><td>174.9</td><td>100.0%</td></tr>
+        <tr><td rowspan="2">ReduceScatter</td><td>10 MB</td><td>197.3</td><td>196.8</td><td>99.7%</td></tr>
+        <tr><td>100 MB</td><td>259.2</td><td>259.8</td><td>100.2%</td></tr>
+        <tr><td rowspan="2">Broadcast</td><td>10 MB</td><td>159.9</td><td>159.5</td><td>99.7%</td></tr>
+        <tr><td>100 MB</td><td>218.6</td><td>218.0</td><td>99.7%</td></tr>
+        <tr><td rowspan="2">P2P</td><td>10 MB</td><td>149.3</td><td>149.0</td><td>99.8%</td></tr>
+        <tr><td>100 MB</td><td>218.9</td><td>219.2</td><td>100.1%</td></tr>
+      </tbody>
+    </table>
+
+    <hr class="appendix">
+
+    <h2>Appendix C: NCCL Version Compatibility Matrix</h2>
+
+    <table>
+      <thead>
+        <tr><th>NCCL</th><th>PyTorch</th><th>Source Image</th><th>P2P Transport</th><th>Shim Compatible</th><th>Notes</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>2.18.1</td><td>2.0.x</td><td>NGC 23.06-py3</td><td>P2P/IPC (legacy cudaIpc)</td><td>No</td><td>Requires <code>--ipc=host</code>; cuMem VMM not available</td></tr>
+        <tr><td>2.19.3</td><td>2.1.0</td><td>NGC 23.10-py3</td><td>P2P/CUMEM/read</td><td><b>Yes</b></td><td>cuMem VMM enabled by default on A100</td></tr>
+        <tr><td>2.20.5</td><td>2.4.0</td><td>PyTorch wheel cu124</td><td>P2P/CUMEM/read</td><td><b>Yes</b></td><td></td></tr>
+        <tr><td>2.21.5</td><td>2.5.1</td><td>PyTorch wheel cu124</td><td>P2P/CUMEM/read</td><td><b>Yes</b></td><td>Primary test version</td></tr>
+        <tr><td>2.25+</td><td>&mdash;</td><td>&mdash;</td><td>Expected CUMEM</td><td>Expected yes</td><td>Not yet released (April 2026)</td></tr>
+      </tbody>
+    </table>
+
+    <hr class="appendix">
+
+    <h2>Appendix D: Strace Gate Analysis (A1)</h2>
+
+    <h4>Abstract UDS patterns observed</h4>
+
+    <pre>
+# NCCL proxy sockets (cross-container FD passing):
+bind(60, {AF_UNIX, @"tmp/nccl-socket-0-3a77998fd5131508"}, 110) = 0
+sendmsg(63, {msg_name={AF_UNIX, @"tmp/nccl-socket-1-95edf9c3dc21ecd6"},
+  msg_control=[{cmsg_type=SCM_RIGHTS, cmsg_data=[63]}]}, 0) = 1
+
+# CUDA UVM internal socket (per-process, not cross-container):
+bind(23, {AF_UNIX, @"cuda-uvmfd-4026538674-70"}, 28) = 0
+    </pre>
+
+    <h4>Shim redirection in action</h4>
+
+    <pre>
+[xtrans-shim] bind(60): redirect @"tmp/nccl-socket-0-3a77998fd5131508"
+    -> "/shared_uds/nccl-socket-0-3a77998fd5131508"
+[xtrans-shim] sendmsg(63): redirect @"tmp/nccl-socket-1-95edf9c3dc21ecd6"
+    -> "/shared_uds/nccl-socket-1-95edf9c3dc21ecd6"
+    </pre>
+
+  </main>
+</body>
+</html>

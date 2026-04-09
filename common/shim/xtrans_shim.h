@@ -8,11 +8,14 @@
  * Intercepted functions:
  *   gethostname()  — returns a common hostname across containers
  *   stat()/__xstat() — fakes /dev/shm st_dev to match across containers
+ *   bind()         — redirects abstract NCCL UDS to filesystem paths (Phase 2)
+ *   sendmsg()      — redirects abstract NCCL UDS destinations (Phase 2)
  *
  * Configuration via environment variables:
  *   XTRANS_HOSTNAME    — hostname to return (default: "xtrans-node")
  *   XTRANS_SHMDEV      — st_dev value to return for /dev/shm (default: 0x1)
- *   XTRANS_VERBOSE      — set to "1" for debug logging to stderr
+ *   XTRANS_UDS_DIR     — directory for redirected NCCL sockets (default: "" = disabled)
+ *   XTRANS_VERBOSE     — set to "1" for debug logging to stderr
  *
  * Build:
  *   make              — builds libxtrans_shim.so
@@ -27,5 +30,6 @@
 #define XTRANS_DEFAULT_HOSTNAME "xtrans-node"
 #define XTRANS_DEFAULT_SHMDEV   0x1
 #define XTRANS_SHM_PATH         "/dev/shm"
+#define XTRANS_NCCL_SOCKET_PREFIX "tmp/nccl-socket-"
 
 #endif /* XTRANS_SHIM_H */

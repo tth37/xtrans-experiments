@@ -87,6 +87,7 @@ DMA-BUF file descriptors may be a universal cross-container GPU IPC primitive
 - Container configs: Docker Compose where possible
 - Results: JSON for structured data, CSV for time series
 - All paths in scripts should be relative to project root
+- Docker image tags: `tth37/xtrans-experiments:<experiment>` (e.g., `tth37/xtrans-experiments:expa-benchmark`)
 
 ## Experiment Reports
 
