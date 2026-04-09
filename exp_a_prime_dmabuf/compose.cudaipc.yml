@@ -1,0 +1,69 @@
+# Exp A' — Legacy cudaIPC comparison
+#
+# Requires --ipc=host for cudaIpcOpenMemHandle to work across containers.
+# Also uses --network=host for simplicity (legacy path needs it anyway).
+
+services:
+  exporter:
+    image: tth37/xtrans-experiments:expa-prime-dmabuf
+    container_name: expa-prime-cudaipc-exporter
+    runtime: nvidia
+    network_mode: host
+    ipc: host
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0,1
+      - ROLE=exporter
+      - IPC_PATH=cudaipc
+      - GPU_ID=0
+      - UDS_SOCKET=/shared_uds/dmabuf.sock
+      - SIZES=${SIZES:-1M,4M,16M,64M,256M,1G}
+      - ITERATIONS=${ITERATIONS:-100}
+      - WARMUP=${WARMUP:-10}
+      - OUTPUT_FILE=/results/cudaipc_bw.json
+      - VERBOSE=1
+    volumes:
+      - ./results:/results
+      - shared-uds:/shared_uds
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0', '1']
+              capabilities: [gpu]
+
+  importer:
+    image: tth37/xtrans-experiments:expa-prime-dmabuf
+    container_name: expa-prime-cudaipc-importer
+    runtime: nvidia
+    network_mode: host
+    ipc: host
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0,1
+      - ROLE=importer
+      - IPC_PATH=cudaipc
+      - GPU_ID=1
+      - UDS_SOCKET=/shared_uds/dmabuf.sock
+      - SIZES=${SIZES:-1M,4M,16M,64M,256M,1G}
+      - ITERATIONS=${ITERATIONS:-100}
+      - WARMUP=${WARMUP:-10}
+      - VERBOSE=1
+    volumes:
+      - shared-uds:/shared_uds
+    depends_on:
+      - exporter
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0', '1']
+              capabilities: [gpu]
+
+volumes:
+  shared-uds:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=100m

@@ -1,0 +1,80 @@
+# Exp A' — cuMem FD P2P across isolated containers
+#
+# Bridge network, separate IPC/PID/NET namespaces, shared UDS volume.
+# The only shared resource is the UDS socket directory.
+#
+# Parameterized by ${IPC_PATH}: cumem_fd (default) or dmabuf_fd
+#
+# Usage:
+#   IPC_PATH=cumem_fd docker compose -f compose.dmabuf.yml up --abort-on-container-exit
+
+services:
+  exporter:
+    image: tth37/xtrans-experiments:expa-prime-dmabuf
+    container_name: expa-prime-exporter
+    runtime: nvidia
+    networks:
+      - expa-prime-net
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - ROLE=exporter
+      - IPC_PATH=${IPC_PATH:-cumem_fd}
+      - GPU_ID=0
+      - REMOTE_GPU_ID=1
+      - UDS_SOCKET=/shared_uds/dmabuf.sock
+      - SIZES=${SIZES:-1M,4M,16M,64M,256M,1G}
+      - ITERATIONS=${ITERATIONS:-100}
+      - WARMUP=${WARMUP:-10}
+      - OUTPUT_FILE=/results/${IPC_PATH:-cumem_fd}_bw.json
+      - VERBOSE=1
+    volumes:
+      - ./results:/results
+      - shared-uds:/shared_uds
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0', '1']
+              capabilities: [gpu]
+
+  importer:
+    image: tth37/xtrans-experiments:expa-prime-dmabuf
+    container_name: expa-prime-importer
+    runtime: nvidia
+    networks:
+      - expa-prime-net
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - ROLE=importer
+      - IPC_PATH=${IPC_PATH:-cumem_fd}
+      - GPU_ID=1
+      - REMOTE_GPU_ID=0
+      - UDS_SOCKET=/shared_uds/dmabuf.sock
+      - SIZES=${SIZES:-1M,4M,16M,64M,256M,1G}
+      - ITERATIONS=${ITERATIONS:-100}
+      - WARMUP=${WARMUP:-10}
+      - VERBOSE=1
+    volumes:
+      - shared-uds:/shared_uds
+    depends_on:
+      - exporter
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0', '1']
+              capabilities: [gpu]
+
+networks:
+  expa-prime-net:
+    driver: bridge
+
+volumes:
+  shared-uds:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=100m
