@@ -330,31 +330,81 @@
 
     <h3>3.2 NVIDIA Acknowledges the Problem</h3>
 
-    <p>NVIDIA built <b>ComputeDomains</b> and <b>IMEX</b> specifically to address this:</p>
+    <p>NVIDIA built <b>ComputeDomains</b> and <b>IMEX</b> specifically to address this.
+       IMEX is &ldquo;software at the GPU-driver level that lets GPUs communicate across nodes.
+       With IMEX, every individual GPU memory export/import operation is subject to fine-grained
+       access control.&rdquo; ComputeDomains are the K8s-level abstraction on top: they
+       &ldquo;dynamically create, manage, and tear down IMEX domains as multi-node workloads
+       are scheduled to nodes and run to completion.&rdquo; When a workload is submitted,
+       a ComputeDomain &ldquo;will form just in time around workload pods when they are actually
+       scheduled onto nodes.&rdquo; When the workload finishes, &ldquo;its corresponding IMEX
+       domain and channels are automatically cleaned up.&rdquo;</p>
 
-    <div class="info-box">
-      <p style="margin:0"><b>NVIDIA ComputeDomains (2025):</b> A Kubernetes abstraction that
-         dynamically creates IMEX domains around pods, enabling cross-container NVLink
-         communication on GB200 NVL72. When a distributed job is scheduled, the platform
-         automatically creates an IMEX domain around whichever nodes the pods land on.
-         When the job finishes, the domain is torn down.
-         <br><br>
-         <b>NVIDIA&rsquo;s stated future direction:</b> &ldquo;They are planning to remove the
-         constraint [of one pod per node per ComputeDomain] to make the notion of individual
-         nodes less relevant. It will then be possible for the application to be composed of
-         <b>many single-GPU pods</b> that may or may not be placed next to each other on the
-         same node. In that mode, the unit of interest is the <b>individual GPU</b>, and not
-         the individual node.&rdquo;
-         <br><i>Source: NVIDIA Developer Blog, &ldquo;Enabling Multi-Node NVLink on Kubernetes
-         for GB200 and Beyond,&rdquo; Nov 2025</i></p>
+    <p>NVIDIA identifies three requirements that drove the design:</p>
+    <ol>
+      <li>&ldquo;<b>Security isolation:</b> In a zero-trust environment, there is a clear need
+          for neighboring GPU jobs to be securely isolated.&rdquo;</li>
+      <li>&ldquo;<b>Fault isolation:</b> Neighboring jobs, even if trusted, must not step onto
+          each other&rsquo;s toes.&rdquo;</li>
+      <li>&ldquo;<b>Cost efficiency:</b> Resource utilization must be kept high even with (1)
+          and (2) in place.&rdquo;</li>
+    </ol>
+
+    <h4>Current limitation: one pod per node, one ComputeDomain per node</h4>
+
+    <p>Despite these goals, ComputeDomains today have a <b>coarse-grained allocation model</b>
+       that falls far short of per-GPU granularity:</p>
+
+    <div class="warning-box">
+      <p style="margin:0"><b>Constraint 1:</b> &ldquo;<b>Currently, only one pod per node can be part
+         of any given ComputeDomain.</b> Users have to be aware of how many GPUs are available in
+         a node, and then typically grab them all from within a single workload pod. The application
+         in that pod then needs to subdivide its work across those GPUs.&rdquo;</p>
+      <p style="margin:8px 0 0"><b>Constraint 2:</b> &ldquo;<b>Currently, at most one ComputeDomain
+         is supported per node.</b>&rdquo; If a ComputeDomain uses only some GPUs on a node,
+         &ldquo;the remaining GPUs in that node cannot be part of any other ComputeDomain.&rdquo;</p>
+      <p style="margin:8px 0 0"><i>Source: NVIDIA Developer Blog, &ldquo;Enabling Multi-Node NVLink
+         on Kubernetes for GB200 and Beyond,&rdquo; Nov 2025</i></p>
     </div>
 
-    <p><b>But IMEX + ComputeDomains are:</b></p>
+    <p>This means that <b>even on the state-of-the-art GB200 NVL72, one job exclusively owns
+       entire nodes</b>. On an 18-node rack (72 GPUs), a job needing 8 GPUs occupies 2 full nodes
+       (8 GPUs) while the remaining GPUs on those nodes sit idle &mdash; they cannot be used by
+       any other ComputeDomain. This is the same monolithic, node-level allocation that plagues
+       existing A100/H100 clusters, just at a larger scale.</p>
+
+    <h4>NVIDIA&rsquo;s stated future direction: per-GPU pods</h4>
+
+    <div class="info-box">
+      <p style="margin:0">&ldquo;We are planning to remove this constraint to make the notion of
+         individual nodes less relevant. <b>It will then be possible for the application to be
+         composed of many single-GPU pods</b> that may or may not be placed next to each other
+         on the same node. In that mode, <b>the unit of interest is the individual GPU, and not
+         the individual node &mdash; node boundaries become almost transparent.</b>&rdquo;
+         <br><i>Source: NVIDIA Developer Blog, Nov 2025. Tracked in issue #309.</i></p>
+    </div>
+
+    <p>They also plan to lift the one-ComputeDomain-per-node constraint (tracked in issue #353),
+       but acknowledge the trade-off explicitly: &ldquo;Lifting that constraint allows for increased
+       resource utilization on the one hand but, on the flipside, <b>may weaken fault isolation
+       between workloads. No universal remedy exists</b>, and we will allow users to pick their
+       sweet spot in the trade-off spectrum.&rdquo;</p>
+
+    <h4>Limitations of IMEX + ComputeDomains</h4>
+
+    <p>Even when these constraints are lifted, fundamental limitations remain:</p>
     <ul>
       <li><b>GB200/Blackwell only.</b> Requires 4th-gen NVSwitches + IMEX kernel module.
-          Does not work on A100, H100, or any AMD/Intel hardware.</li>
-      <li><b>NVIDIA-proprietary.</b> No equivalent for AMD Infinity Fabric or Intel Xe Link.</li>
+          Does not work on A100, H100, or any AMD/Intel hardware. The vast majority of
+          deployed GPU infrastructure will never run IMEX.</li>
+      <li><b>NVIDIA-proprietary.</b> No equivalent exists for AMD Infinity Fabric or
+          Intel Xe Link. The isolation&ndash;communication trade-off is not NVIDIA-specific,
+          but their solution is.</li>
       <li><b>Requires specific kernel/driver versions</b> (GPU Operator 25.3+, K8s 1.32+).</li>
+      <li><b>The isolation&ndash;communication trade-off remains unsolved.</b> NVIDIA
+          acknowledges there is &ldquo;no universal remedy&rdquo; &mdash; they push the
+          trade-off to users rather than solving it. Our research aims to characterize
+          this trade-off space formally.</li>
     </ul>
 
     <h3>3.3 The Trajectory: From Node to GPU as the Unit</h3>
