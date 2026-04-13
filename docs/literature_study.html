@@ -1,0 +1,1437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Literature Study: Container Techniques in Systems Research (2020&ndash;2026)</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: "Times New Roman", "Nimbus Roman", Times, serif;
+      background: #fff;
+      color: #111;
+      line-height: 1.6;
+    }
+    main {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 40px 32px 60px;
+    }
+    h1 {
+      font-size: 22px;
+      text-align: center;
+      margin: 0 0 4px;
+      line-height: 1.3;
+    }
+    .subtitle {
+      text-align: center;
+      font-size: 14px;
+      color: #444;
+      margin: 0 0 24px;
+    }
+    h2 {
+      font-size: 17px;
+      border-bottom: 1px solid #999;
+      padding-bottom: 4px;
+      margin: 28px 0 12px;
+    }
+    h3 {
+      font-size: 15px;
+      margin: 20px 0 8px;
+    }
+    h4 {
+      font-size: 14px;
+      margin: 16px 0 6px;
+    }
+    p, li {
+      font-size: 14px;
+      margin: 0 0 10px;
+    }
+    ul, ol {
+      padding-left: 24px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      margin: 12px 0;
+    }
+    th, td {
+      border: 1px solid #bbb;
+      padding: 5px 7px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #f0f0f0;
+      font-weight: bold;
+    }
+    td {
+      font-variant-numeric: tabular-nums;
+    }
+    code {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 13px;
+      background: #f5f5f5;
+      padding: 1px 4px;
+    }
+    pre {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 12px;
+      background: #f8f8f8;
+      border: 1px solid #ddd;
+      padding: 12px 16px;
+      margin: 12px 0;
+      overflow-x: auto;
+      line-height: 1.5;
+    }
+    .highlight-box {
+      background: #e8f5e9;
+      border: 2px solid #2e7d32;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .warning-box {
+      background: #fff3e0;
+      border: 2px solid #e65100;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .info-box {
+      background: #e3f2fd;
+      border: 2px solid #1565c0;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    a {
+      color: #1565c0;
+      text-decoration: none;
+    }
+    a:hover {
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+  <main>
+
+    <h1>Literature Study: Container Techniques in<br>Top Systems Conferences (2020&ndash;2026)</h1>
+    <p class="subtitle">
+      Companion to the XTrans Research Plan &middot; 2026-04-09
+    </p>
+
+<!-- ============================================================ -->
+    <!-- SECTION 1: OVERVIEW                                           -->
+    <!-- ============================================================ -->
+
+    <h2>1. Overview</h2>
+
+    <div class="info-box">
+      <p style="margin:0"><b>Scope:</b> This survey covers container-related systems research published at
+         OSDI, SOSP, EuroSys, ASPLOS, USENIX ATC, NSDI, and select adjacent venues (SoCC, FAST, ISCA,
+         SIGCOMM, SC) from 2020 to 2026. We focus on techniques directly relevant to the XTrans research
+         agenda: GPU isolation and sharing in containers, cross-container communication, container runtimes
+         and security, serverless GPU computing, checkpoint/restore and live migration, resource
+         disaggregation, and GPU cluster scheduling.</p>
+    </div>
+
+    <p>Containers have become the dominant deployment abstraction for cloud-native workloads.
+       Over the past six years, top systems conferences have produced a rich body of work
+       addressing the fundamental tension: <b>containers provide isolation and manageability, but
+       isolation breaks the shared-memory and shared-namespace assumptions that high-performance
+       GPU communication depends on.</b></p>
+
+    <p>We organize this literature into seven research directions, each representing a distinct
+       thread of investigation with its own community, techniques, and open problems:</p>
+
+    <ol>
+      <li><b>GPU Sharing and Virtualization in Containers</b> &mdash; multiplexing GPU resources across tenants</li>
+      <li><b>GPU Cluster Scheduling and Orchestration</b> &mdash; topology-aware, elastic, and fair allocation</li>
+      <li><b>Container Runtime, Isolation, and Security</b> &mdash; microVMs, sandboxes, and the isolation&ndash;performance trade-off</li>
+      <li><b>Serverless Computing and Cold Start Optimization</b> &mdash; fast container provisioning for GPU workloads</li>
+      <li><b>GPU Checkpoint/Restore and Live Migration</b> &mdash; transparent GPU process mobility</li>
+      <li><b>Resource Disaggregation</b> &mdash; decoupling memory and accelerators from compute nodes</li>
+      <li><b>LLM Serving Infrastructure</b> &mdash; container-based systems for large model inference</li>
+    </ol>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 2: GPU SHARING AND VIRTUALIZATION                      -->
+    <!-- ============================================================ -->
+
+    <h2>2. GPU Sharing and Virtualization in Containers</h2>
+
+    <p>The standard practice of binding entire GPUs to individual containers leads to
+       severe underutilization&mdash;production clusters at Alibaba, Microsoft, and SenseTime
+       report only 25&ndash;50% GPU utilization. This has motivated extensive work on
+       <b>spatial sharing</b> (partitioning SMs and memory), <b>temporal sharing</b>
+       (time-slicing), and <b>spatio-temporal sharing</b> (combining both dimensions).</p>
+
+    <h3>2.1 Key Papers</h3>
+
+    <table>
+      <thead>
+        <tr><th>Paper</th><th>Venue</th><th>Year</th><th>Key Contribution</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>TGS</b> (Wu et al.)</td>
+          <td>NSDI</td>
+          <td>2023</td>
+          <td>Transparent GPU Sharing in container clouds with adaptive rate control
+              and unified memory; requires no application modifications</td>
+        </tr>
+        <tr>
+          <td><b>Orion</b> (Strati et al.)</td>
+          <td>EuroSys</td>
+          <td>2024</td>
+          <td>Interference-aware, fine-grained GPU sharing for ML; schedules at the
+              granularity of individual operators; up to 7.3&times; throughput improvement</td>
+        </tr>
+        <tr>
+          <td><b>Paella</b> (various)</td>
+          <td>SOSP</td>
+          <td>2023</td>
+          <td>Low-latency model serving with software-defined GPU scheduling; instruments
+              kernels to expose runtime SM occupancy information</td>
+        </tr>
+        <tr>
+          <td><b>GPUlet</b> (Park et al.)</td>
+          <td>ATC</td>
+          <td>2022</td>
+          <td>Spatio-temporal GPU sharing on multi-GPU servers; three-dimensional scheduling
+              across spatial share, temporal share, and batch size</td>
+        </tr>
+        <tr>
+          <td><b>KRYPTON</b> (Zhang et al.)</td>
+          <td>ATC</td>
+          <td>2025</td>
+          <td>Performance-aware spatio-temporal GPU orchestration; reduces required GPU
+              count by 32.1% while maintaining throughput targets</td>
+        </tr>
+        <tr>
+          <td><b>Mudi</b> (various)</td>
+          <td>EuroSys</td>
+          <td>2025</td>
+          <td>SLO-aware multiplexing of inference and training via spatial sharing;
+              42% utilization improvement, 2.27&times; training efficiency</td>
+        </tr>
+        <tr>
+          <td><b>GSLICE</b> (Dhakal et al.)</td>
+          <td>SoCC</td>
+          <td>2020</td>
+          <td>Controlled spatial sharing for scalable GPU inference platform</td>
+        </tr>
+        <tr>
+          <td><b>gShare</b> (various)</td>
+          <td>ASPLOS</td>
+          <td>2026</td>
+          <td>Efficient on-demand GPU sharing with aggressive scheduling in multi-tenant
+              FaaS platforms; fine-grained VM-level GPU virtualization</td>
+        </tr>
+        <tr>
+          <td><b>Microsecond Preemption</b> (REEF)</td>
+          <td>OSDI</td>
+          <td>2022</td>
+          <td>Microsecond-scale GPU preemption for concurrent DNN inference isolation
+              via dynamic kernel padding</td>
+        </tr>
+        <tr>
+          <td><b>Zico</b> (various)</td>
+          <td>ATC</td>
+          <td>2021</td>
+          <td>Efficient GPU memory sharing for concurrent DNN training jobs on
+              shared GPUs</td>
+        </tr>
+        <tr>
+          <td><b>PipeSwitch</b> (Bai et al.)</td>
+          <td>OSDI</td>
+          <td>2020</td>
+          <td>Pipelined GPU context switching for DL workload multiplexing</td>
+        </tr>
+        <tr>
+          <td><b>AntMan</b> (Xiao et al.)</td>
+          <td>OSDI</td>
+          <td>2020</td>
+          <td>Dynamic GPU memory and compute scaling for DL training; co-designs
+              framework memory management with GPU sharing scheduler</td>
+        </tr>
+        <tr>
+          <td><b>GMLake</b> (various)</td>
+          <td>ASPLOS</td>
+          <td>2024</td>
+          <td>GPU memory defragmentation via <code>cuMemCreate</code>/<code>cuMemMap</code>
+              virtual memory stitching; reduces GPU memory usage by up to 25 GB;
+              validates cuMem VMM capabilities central to XTrans IPC</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>2.2 Techniques and Trade-offs</h3>
+
+    <p>GPU sharing approaches fall into three categories of interposition:</p>
+    <ul>
+      <li><b>API-level interception:</b> Systems like GaiaGPU and gShare intercept CUDA Driver
+          APIs via <code>LD_LIBRARY_PATH</code> or <code>LD_PRELOAD</code>, managing GPU memory
+          allocation and kernel launches transparently. This is the most portable approach but
+          provides coarse control.</li>
+      <li><b>Kernel-level scheduling:</b> Orion and Paella intercept and schedule individual GPU
+          kernels, achieving fine-grained interference avoidance. This requires deeper integration
+          with the ML framework (e.g., PyTorch) but delivers superior isolation.</li>
+      <li><b>Hardware partitioning:</b> NVIDIA MIG (Multi-Instance GPU) provides hardware-enforced
+          isolation but at coarse granularity (up to 7 instances on A100/H100). AMD SR-IOV offers
+          up to 16 virtual partitions per GPU.</li>
+    </ul>
+
+    <div class="warning-box">
+      <p style="margin:0"><b>Gap relevant to XTrans:</b> All existing GPU sharing systems assume
+         either a single container or co-located containers sharing a GPU. None addresses the
+         orthogonal problem of high-bandwidth <i>inter-container</i> GPU communication when GPUs
+         are in <i>separate</i> containers on the same node. XTrans fills this gap.</p>
+    </div>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 3: GPU CLUSTER SCHEDULING                              -->
+    <!-- ============================================================ -->
+
+    <h2>3. GPU Cluster Scheduling and Orchestration</h2>
+
+    <p>GPU cluster scheduling has been one of the most active areas in systems research,
+       driven by the rapid growth of DL training workloads. The key challenges are
+       heterogeneity awareness, elasticity, fairness, and topology sensitivity.</p>
+
+    <h3>3.1 Key Papers</h3>
+
+    <table>
+      <thead>
+        <tr><th>Paper</th><th>Venue</th><th>Year</th><th>Key Contribution</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>HiveD</b> (Zhao et al.)</td>
+          <td>OSDI</td>
+          <td>2020</td>
+          <td>Topology-aware GPU cluster sharing with guaranteed resource allocation;
+              ensures jobs get GPUs with expected interconnect affinity</td>
+        </tr>
+        <tr>
+          <td><b>Gavel</b> (Narayanan et al.)</td>
+          <td>OSDI</td>
+          <td>2020</td>
+          <td>Heterogeneity-aware scheduling policies for DL workloads</td>
+        </tr>
+        <tr>
+          <td><b>Pollux</b> (Qiao et al.)</td>
+          <td>OSDI</td>
+          <td>2021</td>
+          <td>Co-adaptive scheduling: jointly optimizes GPU allocation and hyperparameters
+              (batch size, learning rate) for cluster-wide goodput. <b>Best Paper Award.</b></td>
+        </tr>
+        <tr>
+          <td><b>Synergy</b> (Mohan et al.)</td>
+          <td>OSDI</td>
+          <td>2022</td>
+          <td>Looking beyond GPUs: considers CPU, memory, and storage as first-class
+              resources in DNN scheduling on multi-tenant clusters</td>
+        </tr>
+        <tr>
+          <td><b>AlpaServe</b> (Li et al.)</td>
+          <td>OSDI</td>
+          <td>2023</td>
+          <td>Statistical multiplexing with model parallelism; uses parallelism for
+              serving (not just training) to handle bursty workloads; 10&times; higher request rates</td>
+        </tr>
+        <tr>
+          <td><b>Sia</b> (Subramanya et al.)</td>
+          <td>SOSP</td>
+          <td>2023</td>
+          <td>Heterogeneity-aware, goodput-optimized ML scheduling; scales to 2000+ GPU
+              clusters; 30&ndash;93% JCT reduction over Pollux</td>
+        </tr>
+        <tr>
+          <td><b>Themis</b> (Mahajan et al.)</td>
+          <td>NSDI</td>
+          <td>2020</td>
+          <td>Fair and efficient GPU cluster scheduling</td>
+        </tr>
+        <tr>
+          <td><b>Shockwave</b> (Zheng et al.)</td>
+          <td>NSDI</td>
+          <td>2023</td>
+          <td>Fair scheduling for dynamic ML resource requirements using market theory</td>
+        </tr>
+        <tr>
+          <td><b>CASSINI</b> (various)</td>
+          <td>NSDI</td>
+          <td>2024</td>
+          <td>Network-aware job scheduling considering communication patterns during placement</td>
+        </tr>
+        <tr>
+          <td><b>MAST</b> (various)</td>
+          <td>OSDI</td>
+          <td>2024</td>
+          <td>Global scheduling of ML training across geo-distributed datacenters at hyperscale</td>
+        </tr>
+        <tr>
+          <td><b>DeDe</b> (various)</td>
+          <td>OSDI</td>
+          <td>2025</td>
+          <td>Decoupled and decomposed resource allocation at scale</td>
+        </tr>
+        <tr>
+          <td><b>Lyra</b> (various)</td>
+          <td>EuroSys</td>
+          <td>2023</td>
+          <td>Elastic scheduling: loans idle inference GPU servers for elastic training</td>
+        </tr>
+        <tr>
+          <td><b>ElasticFlow</b> (various)</td>
+          <td>EuroSys</td>
+          <td>2023</td>
+          <td>Elastic serverless training platform for distributed deep learning</td>
+        </tr>
+        <tr>
+          <td><b>Crux</b> (various)</td>
+          <td>SIGCOMM</td>
+          <td>2024</td>
+          <td>GPU-efficient communication scheduling; transforms GPU utilization
+              maximization into intensity-aware communication scheduling</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>3.2 Evolution of Scheduling Approaches</h3>
+
+    <p>The field has evolved through several generations:</p>
+    <ol>
+      <li><b>2020: Topology and fairness awareness</b> &mdash; HiveD introduced topology-aware
+          guarantees; Themis and Gavel addressed fairness in heterogeneous clusters.</li>
+      <li><b>2021&ndash;2022: Co-adaptive and elastic scheduling</b> &mdash; Pollux pioneered
+          joint resource&ndash;hyperparameter optimization; Synergy expanded the resource model
+          beyond GPUs alone.</li>
+      <li><b>2023&ndash;2024: Heterogeneity and scale</b> &mdash; Sia solved the scaling problem
+          that plagued Pollux on heterogeneous clusters; MAST tackled geo-distributed scheduling;
+          AlpaServe brought scheduling innovations to inference.</li>
+      <li><b>2025+: Disaggregation and decomposition</b> &mdash; DeDe and emerging work decompose
+          the monolithic scheduling problem for hyperscale clusters.</li>
+    </ol>
+
+    <div class="info-box">
+      <p style="margin:0"><b>Relevance to XTrans:</b> Topology-aware schedulers like HiveD and
+         CASSINI assume that GPUs within a topology group share a container or VM. XTrans relaxes
+         this assumption: per-GPU containers can be independently scheduled while still achieving
+         high-bandwidth interconnect communication. This opens new scheduling possibilities
+         (e.g., fine-grained GPU-level preemption and migration).</p>
+    </div>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 4: CONTAINER RUNTIME, ISOLATION, AND SECURITY          -->
+    <!-- ============================================================ -->
+
+    <h2>4. Container Runtime, Isolation, and Security</h2>
+
+    <p>The container ecosystem has diversified beyond standard <code>runc</code> to include
+       multiple isolation technologies, each making different trade-offs between performance,
+       security, and compatibility.</p>
+
+    <h3>4.1 Key Papers and Systems</h3>
+
+    <table>
+      <thead>
+        <tr><th>Paper / System</th><th>Venue</th><th>Year</th><th>Key Contribution</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Firecracker</b> (Agache et al.)</td>
+          <td>NSDI</td>
+          <td>2020</td>
+          <td>Lightweight VMM in Rust for serverless; ~125ms boot, &lt;5 MiB overhead;
+              hardware-enforced isolation via KVM; used by AWS Lambda</td>
+        </tr>
+        <tr>
+          <td><b>Blending VMs &amp; Containers</b> (Anjali et al.)</td>
+          <td>VEE</td>
+          <td>2020</td>
+          <td>First fine-grained comparison of Firecracker vs. gVisor; code coverage
+              analysis of kernel surface exposure</td>
+        </tr>
+        <tr>
+          <td><b>gVisor</b> (Google)</td>
+          <td>HotCloud</td>
+          <td>2019</td>
+          <td>User-space kernel implementing ~200 Linux syscalls; strongest isolation
+              among container runtimes but significant I/O overhead</td>
+        </tr>
+        <tr>
+          <td><b>Junction</b> (Fried et al.)</td>
+          <td>NSDI</td>
+          <td>2024</td>
+          <td>High-performance syscall interposition; compared against gVisor for
+              user-space Linux syscall implementation</td>
+        </tr>
+        <tr>
+          <td><b>Kalium</b> (Jegan et al.)</td>
+          <td>Security</td>
+          <td>2023</td>
+          <td>Built atop gVisor runtime; intercepts containerized application syscalls
+              via ptrace or KVM mode for security enforcement</td>
+        </tr>
+        <tr>
+          <td><b>PVM</b> (various)</td>
+          <td>SOSP</td>
+          <td>2023</td>
+          <td>Efficient shadow paging for deploying secure containers in cloud-native
+              environments</td>
+        </tr>
+        <tr>
+          <td><b>Unikraft</b> (Kuenzer et al.)</td>
+          <td>EuroSys</td>
+          <td>2021</td>
+          <td>Modular micro-library OS for building specialized unikernels with
+              composable, performance-oriented APIs. <b>Best Paper Award.</b></td>
+        </tr>
+        <tr>
+          <td><b>BlackBox</b> (Van&rsquo;t Hof &amp; Nieh)</td>
+          <td>OSDI</td>
+          <td>2022</td>
+          <td>Container security monitor using Arm EL2 to create protected physical
+              address spaces; prevents data flow from containers to untrusted OS;
+              TCB &lt;5K lines</td>
+        </tr>
+        <tr>
+          <td><b>RunD</b> (Li et al.)</td>
+          <td>ATC</td>
+          <td>2022</td>
+          <td>Production secure container runtime at Alibaba; high-density deployment
+              with fast concurrent startup for serverless</td>
+        </tr>
+        <tr>
+          <td><b>ONCache</b> (Lin et al.)</td>
+          <td>NSDI</td>
+          <td>2025</td>
+          <td>eBPF-based container overlay network (524 LoC); eliminates tunneling
+              overhead; 12% TCP throughput and 36% request-rate improvement</td>
+        </tr>
+        <tr>
+          <td><b>LITESHIELD</b> (Manakkal et al.)</td>
+          <td>ATC</td>
+          <td>2025</td>
+          <td>Composable userspace microkernel services; enforces just 22 host syscalls
+              while maintaining POSIX compatibility; VM-level isolation without hypervisors</td>
+        </tr>
+        <tr>
+          <td><b>Cross Container Attacks</b> (He et al.)</td>
+          <td>Security</td>
+          <td>2023</td>
+          <td>Demonstrates eBPF-based cross-container attacks that break isolation;
+              found 5 vulnerable cloud services; proposes new eBPF permission model</td>
+        </tr>
+        <tr>
+          <td><b>MettEagle</b> (Miemietz et al.)</td>
+          <td>OSDI</td>
+          <td>2025</td>
+          <td>OCI-compatible containers on the L4Re microkernel; capability-based
+              access control provides stronger isolation than Linux namespaces/cgroups
+              with comparable performance</td>
+        </tr>
+        <tr>
+          <td><b>DuVisor</b> (Chen et al.)</td>
+          <td>OSDI</td>
+          <td>2023</td>
+          <td>User-level hypervisor with delegated virtualization; handles VM operations
+              without kernel traps after init; up to 47.96% faster than KVM;
+              supports device passthrough via IOMMU</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>4.2 The Isolation Spectrum</h3>
+
+    <table>
+      <thead>
+        <tr><th>Runtime</th><th>Isolation Mechanism</th><th>CPU Overhead</th><th>I/O Overhead</th><th>Security Boundary</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>runc</b> (Docker default)</td>
+          <td>Linux namespaces + cgroups</td>
+          <td>&lt;3%</td>
+          <td>Negligible</td>
+          <td>Kernel (40M lines of C)</td>
+        </tr>
+        <tr>
+          <td><b>gVisor</b></td>
+          <td>User-space kernel (Sentry)</td>
+          <td>Moderate</td>
+          <td>Significant (syscall interception)</td>
+          <td>Sentry (~200 syscalls)</td>
+        </tr>
+        <tr>
+          <td><b>Kata Containers</b></td>
+          <td>Lightweight VM (QEMU/Cloud Hypervisor)</td>
+          <td>~3&ndash;5%</td>
+          <td>Moderate (virtio-fs)</td>
+          <td>Hardware VM (VT-x)</td>
+        </tr>
+        <tr>
+          <td><b>Firecracker</b></td>
+          <td>MicroVM (KVM, ~83K lines Rust)</td>
+          <td>~3%</td>
+          <td>Moderate (virtio-blk)</td>
+          <td>Hardware VM (VT-x)</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="warning-box">
+      <p style="margin:0"><b>Gap relevant to XTrans:</b> None of the secure container runtimes
+         (gVisor, Kata, Firecracker) have GPU passthrough support as a first-class feature.
+         GPU access in containers today relies on <code>runc</code> with NVIDIA Container Toolkit,
+         which provides no hardware isolation for GPU memory. Cross-container GPU IPC (the XTrans
+         problem) is entirely unexplored in the container security literature.</p>
+    </div>
+
+    <h3>4.3 Container Networking: RDMA and Overlay Optimization</h3>
+
+    <p>High-performance container networking is critical for distributed GPU workloads.
+       Recent work has addressed RDMA virtualization and overlay overhead:</p>
+
+    <table>
+      <thead>
+        <tr><th>Paper</th><th>Venue</th><th>Year</th><th>Key Contribution</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>FreeFlow</b> (Kim et al.)</td>
+          <td>NSDI</td>
+          <td>2019</td>
+          <td>Software-based RDMA virtualization for containers; near bare-metal
+              RDMA performance with isolation and portability</td>
+        </tr>
+        <tr>
+          <td><b>ScalaCN</b> (Liu et al.)</td>
+          <td>NSDI</td>
+          <td>2025</td>
+          <td>Mitigating RNIC scalability walls in RDMA container networks;
+              1.4&times; bandwidth increase and 31% latency decrease at datacenter scale</td>
+        </tr>
+        <tr>
+          <td><b>MigrRDMA</b> (Li et al.)</td>
+          <td>SIGCOMM</td>
+          <td>2025</td>
+          <td>Software-based live migration for RDMA-using containers on commodity
+              Mellanox RNICs; minimal downtime at line rate</td>
+        </tr>
+        <tr>
+          <td><b>HD-IOV</b> (various)</td>
+          <td>EuroSys</td>
+          <td>2024</td>
+          <td>SW-HW co-designed I/O virtualization achieving SR-IOV performance
+              with 2.96&times; higher device count for container density</td>
+        </tr>
+        <tr>
+          <td><b>SG-IOV</b> (various)</td>
+          <td>ASPLOS</td>
+          <td>2026</td>
+          <td>Socket-granular I/O virtualization on SmartNICs; addresses SR-IOV
+              misalignment with container density</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>4.4 Confidential Containers</h3>
+
+    <p>An emerging direction combining container isolation with hardware-enforced
+       confidentiality (AMD SEV, Intel TDX, Arm CCA):</p>
+
+    <table>
+      <thead>
+        <tr><th>Paper</th><th>Venue</th><th>Year</th><th>Key Contribution</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>CAP-VMs</b> (Sartakov et al.)</td>
+          <td>OSDI</td>
+          <td>2022</td>
+          <td>Capability-based lightweight VMs; lower latency than containers
+              with smaller TCB and stronger isolation</td>
+        </tr>
+        <tr>
+          <td><b>Split Containers</b> (Shi et al.)</td>
+          <td>Security</td>
+          <td>2025</td>
+          <td>Confidential serverless via shadow containers; reduces Kata-CVM
+              cold start from 6.3s; &lt;14% overhead on SEV and TDX</td>
+        </tr>
+        <tr>
+          <td><b>PipeLLM</b> (Tan et al.)</td>
+          <td>ASPLOS</td>
+          <td>2025</td>
+          <td>CVM-hosted LLM serving with speculative pipelined encryption
+              for I/O performance</td>
+        </tr>
+        <tr>
+          <td><b>Wallet</b> (Sabanic et al.)</td>
+          <td>NSDI</td>
+          <td>2026</td>
+          <td>Confidential serverless computing; trusted monitor at VMPL-0
+              isolates each function from guest OS via CVM partitioning</td>
+        </tr>
+      </tbody>
+    </table>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 5: SERVERLESS AND COLD START                           -->
+    <!-- ============================================================ -->
+
+    <h2>5. Serverless Computing and Cold Start Optimization</h2>
+
+    <p>Serverless (FaaS) platforms use containers as the execution unit, making container
+       startup latency (&ldquo;cold start&rdquo;) a critical bottleneck&mdash;especially for
+       GPU workloads where CUDA context initialization alone takes hundreds of milliseconds.</p>
+
+    <h3>5.1 Key Papers</h3>
+
+    <table>
+      <thead>
+        <tr><th>Paper</th><th>Venue</th><th>Year</th><th>Key Contribution</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>PipeSwitch</b> (Bai et al.)</td>
+          <td>OSDI</td>
+          <td>2020</td>
+          <td>Fast pipelined context switching for DL applications; enables rapid
+              GPU task switching without full context teardown</td>
+        </tr>
+        <tr>
+          <td><b>Faasm</b> (Shillaker et al.)</td>
+          <td>ATC</td>
+          <td>2020</td>
+          <td>Lightweight isolation for stateful serverless using WebAssembly; shared
+              state management across co-located functions</td>
+        </tr>
+        <tr>
+          <td><b>On-demand Container Loading</b> (Brooker et al.)</td>
+          <td>ATC</td>
+          <td>2023</td>
+          <td>AWS Lambda&rsquo;s production container loading system; <b>Best Paper Award.</b>
+              Demand-paged container images with erasure-coded chunk storage</td>
+        </tr>
+        <tr>
+          <td><b>ServerlessLLM</b> (Fu et al.)</td>
+          <td>OSDI</td>
+          <td>2024</td>
+          <td>Low-latency serverless inference for LLMs; multi-tier checkpoint loading
+              and live migration to minimize model startup latency</td>
+        </tr>
+        <tr>
+          <td><b>RainbowCake</b> (various)</td>
+          <td>ASPLOS</td>
+          <td>2024</td>
+          <td>Layer-wise container caching and sharing; reduces cold-start latency by
+              68% and memory waste by 77% via sharing-aware layer management</td>
+        </tr>
+        <tr>
+          <td><b>Torpor</b> (Yu et al.)</td>
+          <td>ATC</td>
+          <td>2025</td>
+          <td>GPU-enabled serverless via GPU remoting; replaces CUDA libraries with
+              GPU client stubs for resource-efficient inference</td>
+        </tr>
+        <tr>
+          <td><b>Fork in the Road</b> (Chai et al.)</td>
+          <td>OSDI</td>
+          <td>2025</td>
+          <td>Cold start optimizations in production serverless systems; identifies
+              control-path latency and user init overhead; proposes FRI + resource pooling</td>
+        </tr>
+        <tr>
+          <td><b>Catalyzer</b> (Du et al.)</td>
+          <td>ASPLOS</td>
+          <td>2020</td>
+          <td>Sub-millisecond serverless startup via fork/snapshot; reuses state from
+              pre-warmed snapshots to skip initialization entirely</td>
+        </tr>
+        <tr>
+          <td><b>REAP</b> (Ustiugov et al.)</td>
+          <td>ASPLOS</td>
+          <td>2021</td>
+          <td>Working-set-aware page prefetching for VM snapshot restore; reduces
+              cold-start page fault delays by 3.7&times; on average</td>
+        </tr>
+        <tr>
+          <td><b>FaaSnap</b> (Ao et al.)</td>
+          <td>EuroSys</td>
+          <td>2022</td>
+          <td>Optimized snapshot restore for Firecracker microVMs using compact loading
+              sets, per-region mmap, and concurrent paging</td>
+        </tr>
+        <tr>
+          <td><b>SEUSS</b> (Cadden et al.)</td>
+          <td>EuroSys</td>
+          <td>2020</td>
+          <td>Unikernel-based layered snapshot stacks; reuses shared components like
+              language runtimes to skip redundant initialization paths</td>
+        </tr>
+        <tr>
+          <td><b>No Provisioned Concurrency</b> (Wei et al.)</td>
+          <td>OSDI</td>
+          <td>2023</td>
+          <td>RDMA-codesigned remote fork for serverless; creates new instances over
+              the network without pre-provisioning</td>
+        </tr>
+        <tr>
+          <td><b>CXLfork</b> (Alverti et al.)</td>
+          <td>ASPLOS</td>
+          <td>2025</td>
+          <td>Fast remote fork over CXL memory fabrics; enables efficient instance
+              creation across CXL-connected hosts</td>
+        </tr>
+        <tr>
+          <td><b>DupHunter</b> (Zhao et al.)</td>
+          <td>ATC</td>
+          <td>2020</td>
+          <td>Flexible high-performance deduplication for Docker registries; avoids
+              the 36&times; GET latency penalty of naive file-level dedup</td>
+        </tr>
+        <tr>
+          <td><b>Starlight</b> (Chen et al.)</td>
+          <td>NSDI</td>
+          <td>2022</td>
+          <td>Fast container provisioning on edge and WAN; redesigns deployment
+              protocol and filesystem; 3&times; faster provisioning</td>
+        </tr>
+        <tr>
+          <td><b>FlacIO</b> (Liu et al.)</td>
+          <td>FAST</td>
+          <td>2025</td>
+          <td>Memory-oriented &ldquo;runtime image&rdquo; abstraction; 23&times; faster cold
+              startup vs full-image loading, 4.6&times; vs lazy loading</td>
+        </tr>
+        <tr>
+          <td><b>Poby</b> (Chang et al.)</td>
+          <td>ATC</td>
+          <td>2025</td>
+          <td>SmartNIC-accelerated container image provisioning; offloads to
+              BlueField DPU; 13.2&times; speedup over containerd</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>5.2 Optimization Strategies</h3>
+
+    <p>Cold start mitigation techniques form a hierarchy:</p>
+    <ol>
+      <li><b>Container image optimization:</b> On-demand loading (AWS Lambda), layer sharing
+          (RainbowCake), lazy pulling (containerd stargz).</li>
+      <li><b>Process-level snapshotting:</b> CRIU-based checkpoint/restore, fork-based cloning
+          (REAP, Catalyzer). Avoids full container creation for warm starts.</li>
+      <li><b>GPU-specific optimization:</b> GPU context pooling (PhoenixOS), CUDA library
+          remoting (Torpor), pipelined context switching (PipeSwitch).</li>
+      <li><b>Model-level optimization:</b> Multi-tier checkpoint loading (ServerlessLLM),
+          selective state restoration (gCROP).</li>
+    </ol>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 6: GPU CHECKPOINT/RESTORE AND MIGRATION                -->
+    <!-- ============================================================ -->
+
+    <h2>6. GPU Checkpoint/Restore and Live Migration</h2>
+
+    <p>GPU checkpoint/restore (C/R) enables fault tolerance, live migration, and preemption&mdash;all
+       critical for per-GPU containerized deployments. This is one of the most technically
+       challenging areas due to opaque GPU driver state and lack of OS-level introspection.</p>
+
+    <h3>6.1 Key Papers</h3>
+
+    <table>
+      <thead>
+        <tr><th>Paper</th><th>Venue</th><th>Year</th><th>Key Contribution</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>PhoenixOS (PhOS)</b> (SJTU-IPADS)</td>
+          <td>SOSP</td>
+          <td>2025</td>
+          <td>First concurrent OS-level GPU C/R system using validated speculation;
+              probes GPU memory via kernel argument analysis + binary instrumentation;
+              orders of magnitude faster than <code>cuda-checkpoint</code></td>
+        </tr>
+        <tr>
+          <td><b>Singularity</b> (Microsoft)</td>
+          <td>arXiv</td>
+          <td>2022</td>
+          <td>Planet-scale preemptive and elastic AI scheduling; all jobs are preemptable,
+              migratable, and dynamically resizable by default; transparent to user code</td>
+        </tr>
+        <tr>
+          <td><b>Oobleck</b> (Jang et al.)</td>
+          <td>SOSP</td>
+          <td>2023</td>
+          <td>Resilient distributed training using pipeline templates; tolerates f
+              simultaneous failures via f+1 heterogeneous pipeline replicas;
+              up to 13.9&times; faster recovery than Bamboo/Varuna</td>
+        </tr>
+        <tr>
+          <td><b>Tenplex</b> (Wagenl&auml;nder et al.)</td>
+          <td>SOSP</td>
+          <td>2024</td>
+          <td>Dynamic parallelism via parallelizable tensor collections (PTCs);
+              enables changing multi-dimensional parallelism at runtime for
+              elastic scaling, redeployment, and failure recovery</td>
+        </tr>
+        <tr>
+          <td><b>ReCycle</b> (various)</td>
+          <td>SOSP</td>
+          <td>2024</td>
+          <td>Resilient DNN training via pipeline adaptation; reconfigures pipeline
+              parallelism without full restart after node failures</td>
+        </tr>
+        <tr>
+          <td><b>gCROP</b> (various)</td>
+          <td>SoCC</td>
+          <td>2024</td>
+          <td>On-demand and parallel GPU checkpoint/restore; achieves &lt;100ms startup
+              for GPU apps with up to 774M parameters (GPT-2 Large)</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>6.2 Technical Challenges</h3>
+
+    <p>GPU C/R is fundamentally harder than CPU C/R for several reasons:</p>
+    <ul>
+      <li><b>No dirty bits:</b> GPUs lack the page-table dirty bit mechanism that enables
+          efficient incremental checkpointing on CPUs. PhoenixOS addresses this through
+          speculative memory access tracking based on kernel launch arguments.</li>
+      <li><b>Opaque driver state:</b> GPU driver contexts, command queues, and page tables are
+          managed by proprietary drivers (NVIDIA, AMD) with no standardized introspection API.</li>
+      <li><b>Large state size:</b> GPU memory (80 GB on A100) dwarfs typical CPU process state,
+          making full-state checkpoints expensive. Concurrent C/R (PhOS) and selective restore
+          (gCROP) address this.</li>
+      <li><b>Multi-GPU coherence:</b> Distributed training state spans multiple GPUs with
+          NCCL/RCCL communication state. Oobleck and Tenplex sidestep this by operating at
+          the training framework level rather than the OS level.</li>
+    </ul>
+
+    <div class="highlight-box">
+      <p style="margin:0"><b>Key insight for XTrans:</b> PhoenixOS demonstrates that OS-level
+         GPU C/R is feasible and performant. Combined with XTrans&rsquo;s cross-container GPU IPC,
+         this enables true per-GPU container mobility: individual GPUs can be checkpointed,
+         migrated, and restored independently while maintaining high-bandwidth communication
+         with peer containers. This is a powerful combination that neither system achieves alone.</p>
+    </div>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 7: RESOURCE DISAGGREGATION                             -->
+    <!-- ============================================================ -->
+
+    <h2>7. Resource Disaggregation</h2>
+
+    <p>Resource disaggregation decouples hardware resources from monolithic servers into
+       independently managed pools, improving utilization and flexibility. Three forms are
+       relevant: memory disaggregation (RDMA/CXL), GPU disaggregation, and inference
+       disaggregation (separating prefill from decode).</p>
+
+    <h3>7.1 Memory Disaggregation</h3>
+
+    <table>
+      <thead>
+        <tr><th>Paper</th><th>Venue</th><th>Year</th><th>Key Contribution</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Clio</b> (Guo et al.)</td>
+          <td>ASPLOS</td>
+          <td>2022</td>
+          <td>Hardware-software co-designed disaggregated memory; custom ASIC achieves
+              2.7&times; faster than SmartNIC solutions with lower power</td>
+        </tr>
+        <tr>
+          <td><b>Pond</b> (Li et al.)</td>
+          <td>ASPLOS</td>
+          <td>2023</td>
+          <td>CXL-based memory pooling for cloud platforms; same-NUMA-node performance
+              with pooled memory via load/store semantics</td>
+        </tr>
+        <tr>
+          <td><b>Hermit</b> (various)</td>
+          <td>NSDI</td>
+          <td>2023</td>
+          <td>Low-latency, high-throughput transparent remote memory via
+              feedback-directed asynchrony</td>
+        </tr>
+        <tr>
+          <td><b>Ditto</b> (various)</td>
+          <td>SOSP</td>
+          <td>2023</td>
+          <td>Elastic and adaptive memory-disaggregated caching system</td>
+        </tr>
+        <tr>
+          <td><b>Motor</b> (various)</td>
+          <td>OSDI</td>
+          <td>2024</td>
+          <td>Multi-versioning for distributed transactions on disaggregated memory</td>
+        </tr>
+        <tr>
+          <td><b>FineMem</b> (various)</td>
+          <td>OSDI</td>
+          <td>2025</td>
+          <td>Fine-grained RDMA-connected remote memory management; eliminates
+              GB-scale allocation waste in disaggregated memory</td>
+        </tr>
+        <tr>
+          <td><b>CXLfork</b> (various)</td>
+          <td>OSDI</td>
+          <td>2025</td>
+          <td>Fast remote fork over CXL fabrics</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>7.2 GPU and Inference Disaggregation</h3>
+
+    <table>
+      <thead>
+        <tr><th>Paper</th><th>Venue</th><th>Year</th><th>Key Contribution</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>DistServe</b> (Zhong et al.)</td>
+          <td>OSDI</td>
+          <td>2024</td>
+          <td>Disaggregates prefill and decoding phases across separate GPU resources
+              for goodput-optimized LLM serving</td>
+        </tr>
+        <tr>
+          <td><b>Prism</b> (various)</td>
+          <td>NSDI</td>
+          <td>2025</td>
+          <td>Production-scale GPU-disaggregated serving for deep learning recommendation
+              models at Alibaba; GPUs and CPUs connected via RDMA</td>
+        </tr>
+        <tr>
+          <td><b>Beehive</b> (various)</td>
+          <td>NSDI</td>
+          <td>2025</td>
+          <td>Scalable disaggregated memory runtime exploiting asynchrony of
+              multithreaded programs</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>7.3 CXL: The Emerging Interconnect</h3>
+
+    <p>CXL (Compute Express Link) is rapidly becoming the key enabler for hardware disaggregation:</p>
+    <ul>
+      <li><b>CXL 1.x:</b> Memory expansion &mdash; attach more memory to a single server at ~150&ndash;250ns latency</li>
+      <li><b>CXL 2.0:</b> Memory pooling &mdash; shared memory pool across servers via CXL switches</li>
+      <li><b>CXL 3.0:</b> Memory sharing &mdash; cache-coherent shared memory across nodes</li>
+    </ul>
+
+    <p>Key systems papers: DirectCXL (ATC 2022), Pond (ASPLOS 2023), TPP (ASPLOS 2023),
+       CXL-ANNS (ATC 2023), CXLfork (OSDI 2025).</p>
+
+    <div class="info-box">
+      <p style="margin:0"><b>Relevance to XTrans:</b> GPU disaggregation (Prism, DistServe) separates
+         GPUs from CPUs across the network. XTrans addresses the complementary intra-node problem:
+         GPUs that are physically on the same node but isolated in different containers. CXL&rsquo;s
+         &ldquo;My CXL Pool Obviates Your PCIe Switch&rdquo; (HotOS 2025) hints at a future where
+         CXL-attached GPUs could use the same DMA-BUF FD passing that XTrans explores for
+         cross-container IPC.</p>
+    </div>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 8: LLM SERVING INFRASTRUCTURE                         -->
+    <!-- ============================================================ -->
+
+    <h2>8. LLM Serving Infrastructure</h2>
+
+    <p>The explosion of large language model deployment has produced a wave of container-based
+       serving systems, each addressing different aspects of the serving challenge.</p>
+
+    <h3>8.1 Key Papers</h3>
+
+    <table>
+      <thead>
+        <tr><th>Paper</th><th>Venue</th><th>Year</th><th>Key Contribution</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>vLLM / PagedAttention</b> (Kwon et al.)</td>
+          <td>SOSP</td>
+          <td>2023</td>
+          <td>OS-inspired paged KV cache management; reduces KV cache waste from
+              60&ndash;80% to &lt;4%; 2&ndash;4&times; throughput improvement; copy-on-write
+              sharing across requests</td>
+        </tr>
+        <tr>
+          <td><b>DistServe</b> (Zhong et al.)</td>
+          <td>OSDI</td>
+          <td>2024</td>
+          <td>Prefill&ndash;decode disaggregation across GPU resources</td>
+        </tr>
+        <tr>
+          <td><b>ServerlessLLM</b> (Fu et al.)</td>
+          <td>OSDI</td>
+          <td>2024</td>
+          <td>Multi-tier model loading for serverless LLM inference</td>
+        </tr>
+        <tr>
+          <td><b>AlpaServe</b> (Li et al.)</td>
+          <td>OSDI</td>
+          <td>2023</td>
+          <td>Model parallelism as statistical multiplexing for serving</td>
+        </tr>
+        <tr>
+          <td><b>Torpor</b> (Yu et al.)</td>
+          <td>ATC</td>
+          <td>2025</td>
+          <td>GPU remoting for resource-efficient serverless LLM inference</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>8.2 Cross-Vendor GPU Communication</h3>
+
+    <p>An emerging thread directly relevant to XTrans:</p>
+
+    <table>
+      <thead>
+        <tr><th>Paper</th><th>Venue</th><th>Year</th><th>Key Contribution</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>HetCCL</b> (Kim et al.)</td>
+          <td>arXiv</td>
+          <td>2026</td>
+          <td>Cross-vendor collective communication library enabling NVIDIA + AMD GPU
+              communication via RDMA without driver modifications; unified vendor
+              abstraction over NCCL/RCCL with IB Verbs API for GPU memory registration</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>HetCCL validates a key XTrans assumption: cross-vendor GPU communication is achievable
+       via standardized transport mechanisms. While HetCCL uses RDMA for inter-node communication,
+       XTrans addresses the intra-node case using DMA-BUF FD passing&mdash;the two are complementary.</p>
+
+    <h3>8.3 Container Implications</h3>
+
+    <p>LLM serving systems face a container dilemma: tensor parallelism across GPUs requires
+       high-bandwidth NCCL communication, which assumes shared namespaces. Current deployments
+       handle this in three ways:</p>
+    <ul>
+      <li><b>All-GPUs-in-one-container:</b> The common approach (used by vLLM, TGI). Simple but
+          coarse-grained: cannot independently scale, migrate, or upgrade individual GPUs.</li>
+      <li><b>Process-per-GPU with shared namespaces:</b> Uses <code>hostIPC</code>,
+          <code>hostNetwork</code>, and shared <code>/dev/shm</code> in Kubernetes.
+          Functionally works but defeats container isolation.</li>
+      <li><b>Per-GPU containers with XTrans:</b> (proposed) Maintain true isolation while
+          recovering high-bandwidth interconnect communication. Enables GPU-granular operations
+          (preemption, migration, scaling) without sacrificing NCCL performance.</li>
+    </ul>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 9: CROSS-CUTTING THEMES                                -->
+    <!-- ============================================================ -->
+
+    <h2>9. Cross-Cutting Themes and Research Directions</h2>
+
+    <h3>9.1 The Isolation&ndash;Performance Fundamental Trade-off</h3>
+
+    <p>Across all seven research areas, a unifying theme emerges: <b>stronger isolation
+       degrades communication performance.</b> This trade-off manifests differently at
+       each level:</p>
+
+    <table>
+      <thead>
+        <tr><th>Level</th><th>Isolation Mechanism</th><th>Communication Cost</th><th>Exemplar Work</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Process</td>
+          <td>PID namespace</td>
+          <td>Shared memory (fast)</td>
+          <td>NCCL SHM transport</td>
+        </tr>
+        <tr>
+          <td>Container (runc)</td>
+          <td>Linux namespaces</td>
+          <td>Cross-NS IPC (medium)</td>
+          <td>Shimmy (HotEdge &rsquo;19)</td>
+        </tr>
+        <tr>
+          <td>Sandbox (gVisor)</td>
+          <td>User-space kernel</td>
+          <td>Syscall interception (slow)</td>
+          <td>Junction (NSDI &rsquo;24)</td>
+        </tr>
+        <tr>
+          <td>MicroVM (Firecracker)</td>
+          <td>Hardware VM</td>
+          <td>Virtio / VFIO (slow)</td>
+          <td>Firecracker (NSDI &rsquo;20)</td>
+        </tr>
+        <tr>
+          <td>Disaggregated</td>
+          <td>Network boundary</td>
+          <td>RDMA / CXL (varies)</td>
+          <td>Prism (NSDI &rsquo;25)</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>9.2 Emerging Research Directions</h3>
+
+    <p>Based on this literature survey, we identify the following under-explored directions:</p>
+
+    <h4>Direction A: Cross-Container GPU IPC (the XTrans problem)</h4>
+    <p><b>Gap:</b> No existing work addresses fabric-agnostic, high-bandwidth GPU communication
+       across container boundaries. All GPU sharing papers assume co-location within a single
+       container. All container isolation papers ignore GPU IPC entirely.</p>
+    <p><b>Opportunity:</b> DMA-BUF file descriptors provide a vendor-neutral handle that can be
+       passed via UDS <code>SCM_RIGHTS</code> across containers. This has been validated on
+       NVIDIA (our exp2 results) but not systematically studied across AMD and Intel.</p>
+
+    <h4>Direction B: GPU-Aware Secure Container Runtimes</h4>
+    <p><b>Gap:</b> Firecracker, gVisor, and Kata have no GPU support. NVIDIA Container Toolkit
+       works only with runc, providing no hardware isolation for GPU memory.</p>
+    <p><b>Opportunity:</b> Combining VFIO-based GPU passthrough with microVM isolation,
+       or extending gVisor&rsquo;s syscall interposition to GPU driver ioctls.</p>
+
+    <h4>Direction C: Per-GPU Container Migration and Elasticity</h4>
+    <p><b>Gap:</b> PhoenixOS enables GPU C/R but assumes a monolithic process. Tenplex enables
+       elastic parallelism but operates at the framework level. Neither supports transparent
+       per-GPU container migration.</p>
+    <p><b>Opportunity:</b> Combine XTrans (cross-container IPC) + PhoenixOS (GPU C/R) to enable
+       truly transparent, GPU-granular live migration in containerized clusters.</p>
+
+    <h4>Direction D: CXL-Enabled GPU Memory Pooling Across Containers</h4>
+    <p><b>Gap:</b> CXL memory pooling (Pond, DirectCXL) has been studied for CPU memory but not
+       for GPU memory across containers.</p>
+    <p><b>Opportunity:</b> As CXL 3.0 enables cache-coherent shared memory, GPU memory pools
+       could be shared across per-GPU containers without the NCCL namespace assumptions.</p>
+
+    <h4>Direction E: Topology-Aware Scheduling for Per-GPU Containers</h4>
+    <p><b>Gap:</b> Schedulers like HiveD and CASSINI are topology-aware but treat containers as
+       multi-GPU units. Per-GPU containers enable finer scheduling granularity.</p>
+    <p><b>Opportunity:</b> A scheduler that understands both the physical interconnect topology
+       (NVLink, PCIe, CXL) and the container topology (which containers share which broker)
+       could make better placement decisions for distributed training.</p>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 10: COMPLETE PAPER INDEX                               -->
+    <!-- ============================================================ -->
+
+    <h2>10. Complete Paper Index</h2>
+
+    <p>The following table catalogs all papers surveyed, organized alphabetically.</p>
+
+    <table>
+      <thead>
+        <tr><th>#</th><th>Paper</th><th>Venue</th><th>Year</th><th>Direction(s)</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>1</td><td>AlpaServe: Statistical Multiplexing with Model Parallelism</td><td>OSDI</td><td>2023</td><td>&sect;3, &sect;8</td></tr>
+        <tr><td>2</td><td>AntMan: Dynamic GPU Scaling for DL Training</td><td>OSDI</td><td>2020</td><td>&sect;2</td></tr>
+        <tr><td>3</td><td>Beehive: Scalable Disaggregated Memory Runtime</td><td>NSDI</td><td>2025</td><td>&sect;7</td></tr>
+        <tr><td>4</td><td>BlackBox: Container Security Monitor via Arm EL2</td><td>OSDI</td><td>2022</td><td>&sect;4</td></tr>
+        <tr><td>5</td><td>Blending Containers and VMs: Firecracker vs. gVisor</td><td>VEE</td><td>2020</td><td>&sect;4</td></tr>
+        <tr><td>6</td><td>Blox: Modular Toolkit for DL Schedulers</td><td>EuroSys</td><td>2024</td><td>&sect;3</td></tr>
+        <tr><td>7</td><td>CAP-VMs: Capability-Based Isolation in the Cloud</td><td>OSDI</td><td>2022</td><td>&sect;4</td></tr>
+        <tr><td>8</td><td>CASSINI: Network-Aware Job Scheduling</td><td>NSDI</td><td>2024</td><td>&sect;3</td></tr>
+        <tr><td>9</td><td>Catalyzer: Sub-Millisecond Serverless Startup</td><td>ASPLOS</td><td>2020</td><td>&sect;5</td></tr>
+        <tr><td>10</td><td>Clio: HW-SW Co-Designed Disaggregated Memory</td><td>ASPLOS</td><td>2022</td><td>&sect;7</td></tr>
+        <tr><td>11</td><td>Cross Container Attacks via eBPF</td><td>Security</td><td>2023</td><td>&sect;4</td></tr>
+        <tr><td>12</td><td>Crux: GPU-Efficient Communication Scheduling</td><td>SIGCOMM</td><td>2024</td><td>&sect;3</td></tr>
+        <tr><td>13</td><td>CXLfork: Fast Remote Fork over CXL</td><td>ASPLOS</td><td>2025</td><td>&sect;5, &sect;7</td></tr>
+        <tr><td>14</td><td>DeDe: Decouple and Decompose Resource Allocation</td><td>OSDI</td><td>2025</td><td>&sect;3</td></tr>
+        <tr><td>15</td><td>DirectCXL: High-Performance Memory Disaggregation</td><td>ATC</td><td>2022</td><td>&sect;7</td></tr>
+        <tr><td>16</td><td>DistServe: Disaggregated Prefill and Decoding</td><td>OSDI</td><td>2024</td><td>&sect;7, &sect;8</td></tr>
+        <tr><td>17</td><td>Ditto: Elastic Memory-Disaggregated Caching</td><td>SOSP</td><td>2023</td><td>&sect;7</td></tr>
+        <tr><td>18</td><td>DupHunter: Docker Registry Deduplication</td><td>ATC</td><td>2020</td><td>&sect;5</td></tr>
+        <tr><td>19</td><td>DuVisor: User-Level Hypervisor</td><td>OSDI</td><td>2023</td><td>&sect;4</td></tr>
+        <tr><td>20</td><td>ElasticFlow: Elastic Serverless Training Platform</td><td>EuroSys</td><td>2023</td><td>&sect;3</td></tr>
+        <tr><td>21</td><td>Faasm: Lightweight Isolation for Serverless</td><td>ATC</td><td>2020</td><td>&sect;5</td></tr>
+        <tr><td>22</td><td>FaaSnap: Snapshot-Based MicroVMs for Serverless</td><td>EuroSys</td><td>2022</td><td>&sect;5</td></tr>
+        <tr><td>23</td><td>FineMem: Fine-Grained Remote Memory Management</td><td>OSDI</td><td>2025</td><td>&sect;7</td></tr>
+        <tr><td>24</td><td>Firecracker: Lightweight Virtualization for Serverless</td><td>NSDI</td><td>2020</td><td>&sect;4</td></tr>
+        <tr><td>25</td><td>FlacIO: Memory-Oriented Container Runtime Image</td><td>FAST</td><td>2025</td><td>&sect;5</td></tr>
+        <tr><td>26</td><td>Fork in the Road: Cold Start in Production Serverless</td><td>OSDI</td><td>2025</td><td>&sect;5</td></tr>
+        <tr><td>27</td><td>FreeFlow: RDMA Virtualization for Containers</td><td>NSDI</td><td>2019</td><td>&sect;4</td></tr>
+        <tr><td>28</td><td>Gavel: Heterogeneity-Aware Cluster Scheduling</td><td>OSDI</td><td>2020</td><td>&sect;3</td></tr>
+        <tr><td>29</td><td>gCROP: On-demand GPU Checkpoint/Restore</td><td>SoCC</td><td>2024</td><td>&sect;6</td></tr>
+        <tr><td>30</td><td>GMLake: GPU Memory Defragmentation via cuMem VMM</td><td>ASPLOS</td><td>2024</td><td>&sect;2</td></tr>
+        <tr><td>31</td><td>GPUlet: Spatio-Temporal GPU Sharing</td><td>ATC</td><td>2022</td><td>&sect;2</td></tr>
+        <tr><td>32</td><td>gShare: Efficient GPU Sharing in FaaS</td><td>ASPLOS</td><td>2026</td><td>&sect;2</td></tr>
+        <tr><td>33</td><td>GSLICE: Controlled Spatial GPU Sharing</td><td>SoCC</td><td>2020</td><td>&sect;2</td></tr>
+        <tr><td>34</td><td>HD-IOV: High-Density I/O Virtualization</td><td>EuroSys</td><td>2024</td><td>&sect;4</td></tr>
+        <tr><td>35</td><td>Hermit: Transparent Remote Memory</td><td>NSDI</td><td>2023</td><td>&sect;7</td></tr>
+        <tr><td>36</td><td>HetCCL: Cross-Vendor GPU Communication</td><td>arXiv</td><td>2026</td><td>&sect;8</td></tr>
+        <tr><td>37</td><td>HiveD: Topology-Aware GPU Cluster Sharing</td><td>OSDI</td><td>2020</td><td>&sect;3</td></tr>
+        <tr><td>38</td><td>Junction: Kernel Bypass for Cloud Containers</td><td>NSDI</td><td>2024</td><td>&sect;4</td></tr>
+        <tr><td>39</td><td>KRYPTON: Performance-Aware GPU Sharing</td><td>ATC</td><td>2025</td><td>&sect;2</td></tr>
+        <tr><td>40</td><td>LITESHIELD: Userspace Microkernel Secure Containers</td><td>ATC</td><td>2025</td><td>&sect;4</td></tr>
+        <tr><td>41</td><td>Lyra: Elastic Scheduling for DL Clusters</td><td>EuroSys</td><td>2023</td><td>&sect;3</td></tr>
+        <tr><td>42</td><td>MAST: Global ML Training Scheduling</td><td>OSDI</td><td>2024</td><td>&sect;3</td></tr>
+        <tr><td>43</td><td>MettEagle: Containers on Microkernels</td><td>OSDI</td><td>2025</td><td>&sect;4</td></tr>
+        <tr><td>44</td><td>MigrRDMA: Live Migration for RDMA Containers</td><td>SIGCOMM</td><td>2025</td><td>&sect;4</td></tr>
+        <tr><td>45</td><td>Motor: Multi-Versioning on Disaggregated Memory</td><td>OSDI</td><td>2024</td><td>&sect;7</td></tr>
+        <tr><td>46</td><td>Mudi: SLO-Aware GPU Multiplexing</td><td>EuroSys</td><td>2025</td><td>&sect;2</td></tr>
+        <tr><td>47</td><td>No Provisioned Concurrency: RDMA Remote Fork</td><td>OSDI</td><td>2023</td><td>&sect;5</td></tr>
+        <tr><td>48</td><td>Occlum: SGX Multitasking</td><td>ASPLOS</td><td>2020</td><td>&sect;4</td></tr>
+        <tr><td>49</td><td>On-demand Container Loading (AWS Lambda)</td><td>ATC</td><td>2023</td><td>&sect;5</td></tr>
+        <tr><td>50</td><td>ONCache: eBPF Container Overlay Network</td><td>NSDI</td><td>2025</td><td>&sect;4</td></tr>
+        <tr><td>51</td><td>Oobleck: Resilient Training with Pipeline Templates</td><td>SOSP</td><td>2023</td><td>&sect;6</td></tr>
+        <tr><td>52</td><td>Orion: Interference-Aware Fine-Grained GPU Sharing</td><td>EuroSys</td><td>2024</td><td>&sect;2</td></tr>
+        <tr><td>53</td><td>Paella: Software-Defined GPU Scheduling</td><td>SOSP</td><td>2023</td><td>&sect;2</td></tr>
+        <tr><td>54</td><td>PhoenixOS: Concurrent GPU Checkpoint/Restore</td><td>SOSP</td><td>2025</td><td>&sect;6</td></tr>
+        <tr><td>55</td><td>PipeLLM: Confidential LLM Serving</td><td>ASPLOS</td><td>2025</td><td>&sect;4</td></tr>
+        <tr><td>56</td><td>PipeSwitch: Pipelined Context Switching for DL</td><td>OSDI</td><td>2020</td><td>&sect;2, &sect;5</td></tr>
+        <tr><td>57</td><td>Poby: SmartNIC-Accelerated Image Provisioning</td><td>ATC</td><td>2025</td><td>&sect;5</td></tr>
+        <tr><td>58</td><td>Pollux: Co-adaptive Cluster Scheduling</td><td>OSDI</td><td>2021</td><td>&sect;3</td></tr>
+        <tr><td>59</td><td>Pond: CXL-Based Memory Pooling</td><td>ASPLOS</td><td>2023</td><td>&sect;7</td></tr>
+        <tr><td>60</td><td>Prism: GPU-Disaggregated DLRM Serving</td><td>NSDI</td><td>2025</td><td>&sect;7</td></tr>
+        <tr><td>61</td><td>PVM: Shadow Paging for Secure Containers</td><td>SOSP</td><td>2023</td><td>&sect;4</td></tr>
+        <tr><td>62</td><td>RainbowCake: Layer-Wise Container Caching</td><td>ASPLOS</td><td>2024</td><td>&sect;5</td></tr>
+        <tr><td>63</td><td>REAP: Working-Set-Aware Snapshot Prefetch</td><td>ASPLOS</td><td>2021</td><td>&sect;5</td></tr>
+        <tr><td>64</td><td>ReCycle: Resilient Training via Pipeline Adaptation</td><td>SOSP</td><td>2024</td><td>&sect;6</td></tr>
+        <tr><td>65</td><td>REEF: Microsecond-Scale GPU Preemption</td><td>OSDI</td><td>2022</td><td>&sect;2</td></tr>
+        <tr><td>66</td><td>RunD: Secure Container Runtime at Alibaba</td><td>ATC</td><td>2022</td><td>&sect;4</td></tr>
+        <tr><td>67</td><td>ScalaCN: RDMA Container Network Scalability</td><td>NSDI</td><td>2025</td><td>&sect;4</td></tr>
+        <tr><td>68</td><td>ServerlessLLM: Low-Latency Serverless LLM Inference</td><td>OSDI</td><td>2024</td><td>&sect;5, &sect;8</td></tr>
+        <tr><td>69</td><td>SEUSS: Unikernel Snapshot Stacks for Serverless</td><td>EuroSys</td><td>2020</td><td>&sect;5</td></tr>
+        <tr><td>70</td><td>SG-IOV: Socket-Granular I/O on SmartNICs</td><td>ASPLOS</td><td>2026</td><td>&sect;4</td></tr>
+        <tr><td>71</td><td>Shockwave: Fair Scheduling for Dynamic ML</td><td>NSDI</td><td>2023</td><td>&sect;3</td></tr>
+        <tr><td>72</td><td>Sia: Heterogeneity-Aware ML Scheduling</td><td>SOSP</td><td>2023</td><td>&sect;3</td></tr>
+        <tr><td>73</td><td>Singularity: Planet-Scale Elastic AI Scheduling</td><td>arXiv</td><td>2022</td><td>&sect;6</td></tr>
+        <tr><td>74</td><td>Split Containers: Confidential Serverless</td><td>Security</td><td>2025</td><td>&sect;4</td></tr>
+        <tr><td>75</td><td>Starlight: Fast Container Provisioning at Edge</td><td>NSDI</td><td>2022</td><td>&sect;5</td></tr>
+        <tr><td>76</td><td>Synergy: Beyond GPUs in DNN Scheduling</td><td>OSDI</td><td>2022</td><td>&sect;3</td></tr>
+        <tr><td>77</td><td>Tenplex: Dynamic Parallelism via PTCs</td><td>SOSP</td><td>2024</td><td>&sect;6</td></tr>
+        <tr><td>78</td><td>TGS: Transparent GPU Sharing in Containers</td><td>NSDI</td><td>2023</td><td>&sect;2</td></tr>
+        <tr><td>79</td><td>Themis: Fair GPU Cluster Scheduling</td><td>NSDI</td><td>2020</td><td>&sect;3</td></tr>
+        <tr><td>80</td><td>Torpor: GPU-Enabled Serverless Computing</td><td>ATC</td><td>2025</td><td>&sect;5, &sect;8</td></tr>
+        <tr><td>81</td><td>Unikraft: Fast, Specialized Unikernels</td><td>EuroSys</td><td>2021</td><td>&sect;4</td></tr>
+        <tr><td>82</td><td>vLLM / PagedAttention</td><td>SOSP</td><td>2023</td><td>&sect;8</td></tr>
+        <tr><td>83</td><td>Wallet: Confidential Serverless Computing</td><td>NSDI</td><td>2026</td><td>&sect;4</td></tr>
+        <tr><td>84</td><td>Zico: GPU Memory Sharing for DNN Training</td><td>ATC</td><td>2021</td><td>&sect;2</td></tr>
+      </tbody>
+    </table>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 11: DISTRIBUTION ANALYSIS                              -->
+    <!-- ============================================================ -->
+
+    <h2>11. Distribution Analysis</h2>
+
+    <h3>11.1 Papers by Venue</h3>
+    <table>
+      <thead>
+        <tr><th>Venue</th><th>Count</th><th>Focus Areas</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><b>OSDI</b></td><td>20</td><td>Scheduling, serverless, disaggregation, security</td></tr>
+        <tr><td><b>SOSP</b></td><td>10</td><td>C/R, resilience, LLM serving, scheduling</td></tr>
+        <tr><td><b>NSDI</b></td><td>14</td><td>Networking, RDMA, disaggregation, scheduling</td></tr>
+        <tr><td><b>ASPLOS</b></td><td>12</td><td>Memory disaggregation, GPU sharing, cold start, CXL, confidential</td></tr>
+        <tr><td><b>ATC</b></td><td>12</td><td>Serverless, GPU sharing, container runtimes, image provisioning</td></tr>
+        <tr><td><b>EuroSys</b></td><td>9</td><td>GPU sharing, elastic scheduling, unikernels, snapshots, I/O</td></tr>
+        <tr><td><b>Other</b></td><td>7</td><td>SoCC, SIGCOMM, VEE, Security, FAST</td></tr>
+      </tbody>
+    </table>
+
+    <h3>11.2 Papers by Year</h3>
+    <table>
+      <thead>
+        <tr><th>Year</th><th>Count</th><th>Notable Trends</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>2019&ndash;20</td><td>14</td><td>Foundations: Firecracker, HiveD, Gavel, PipeSwitch, Catalyzer, FreeFlow</td></tr>
+        <tr><td>2021</td><td>4</td><td>Co-adaptive scheduling (Pollux Best Paper), Unikraft, REAP, Zico</td></tr>
+        <tr><td>2022</td><td>10</td><td>GPU preemption, BlackBox, CAP-VMs, FaaSnap, CXL emergence, Starlight</td></tr>
+        <tr><td>2023</td><td>18</td><td>Peak year: vLLM, Sia, Oobleck, TGS, Paella, AlpaServe, eBPF attacks</td></tr>
+        <tr><td>2024</td><td>16</td><td>LLM serving (DistServe, ServerlessLLM), Tenplex, Orion, HD-IOV</td></tr>
+        <tr><td>2025&ndash;26</td><td>22</td><td>GPU C/R (PhoenixOS), confidential containers, CXL, RDMA migration</td></tr>
+      </tbody>
+    </table>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 12: CONCLUSIONS                                        -->
+    <!-- ============================================================ -->
+
+    <h2>12. Conclusions</h2>
+
+    <div class="highlight-box">
+      <p style="margin:0"><b>Key finding:</b> Despite 84 papers on container-related GPU systems
+         in the past six years, <b>no published work addresses cross-container GPU communication
+         as a first-class research problem.</b> The closest related work (TGS, Shimmy, C-GDR)
+         addresses intra-container GPU sharing or inter-container CPU communication, but not
+         high-bandwidth GPU-to-GPU IPC across container boundaries.</p>
+    </div>
+
+    <p>Our survey yields the following conclusions:</p>
+
+    <ol>
+      <li><b>GPU sharing is mature but orthogonal to XTrans.</b> Systems like TGS, Orion, and
+          Paella multiplex one GPU across containers. XTrans enables multiple GPUs in separate
+          containers to communicate at full interconnect bandwidth. These are complementary.</li>
+
+      <li><b>GPU C/R is now feasible.</b> PhoenixOS (SOSP &rsquo;25) demonstrates concurrent,
+          OS-level GPU checkpoint/restore with production-grade performance. This is the missing
+          piece for per-GPU container migration&mdash;combined with XTrans&rsquo;s cross-container
+          IPC, it enables true GPU-granular elasticity.</li>
+
+      <li><b>The scheduling community assumes coarse GPU allocation.</b> All major schedulers
+          (HiveD, Pollux, Sia, MAST) allocate GPUs in groups to a single job container.
+          Per-GPU containers with XTrans would enable a fundamentally finer scheduling
+          granularity.</li>
+
+      <li><b>Memory disaggregation is converging on CXL.</b> The RDMA-based disaggregated memory
+          era (Clio, Hermit, FineMem) is transitioning to CXL (Pond, DirectCXL, CXLfork). GPU
+          memory disaggregation via CXL is a natural next step but unexplored.</li>
+
+      <li><b>LLM serving drives urgent demand.</b> vLLM, DistServe, and ServerlessLLM all use
+          multi-GPU tensor parallelism that breaks under container isolation. XTrans directly
+          addresses this pain point.</li>
+
+      <li><b>The isolation&ndash;performance trade-off is the fundamental challenge.</b> Every
+          paper in this survey navigates this trade-off differently. XTrans proposes a principled
+          solution: maintain container-level isolation (namespaces, cgroups) while providing a
+          minimal, well-defined broker for GPU IPC handle exchange.</li>
+    </ol>
+
+    <div class="info-box">
+      <p style="margin:0"><b>Positioning XTrans in the literature:</b> XTrans sits at the
+         intersection of three research threads&mdash;container isolation (&sect;4), GPU
+         communication (&sect;2), and disaggregation (&sect;7)&mdash;addressing a gap that none
+         of the 53 surveyed papers fills. The closest related work is Shimmy (HotEdge &rsquo;19,
+         shared-memory inter-container communication for CPUs) and C-GDR (container-aware
+         GPUDirect MPI, cross-container but inter-node). No prior work combines
+         <i>intra-node</i>, <i>GPU-to-GPU</i>, <i>cross-container</i>, and
+         <i>vendor-agnostic</i> into a single system.</p>
+    </div>
+
+    <hr style="margin:32px 0;">
+    <p style="font-size:12px;color:#666;text-align:center;">
+      Generated 2026-04-09. Covers OSDI, SOSP, EuroSys, ASPLOS, ATC, NSDI, and select adjacent venues
+      (SoCC, FAST, SIGCOMM, VEE, USENIX Security) from 2019&ndash;2026. 84 papers surveyed.
+    </p>
+
+  </main>
+</body>
+</html>

@@ -1,0 +1,1079 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Research Plan v2: Per-GPU Container Communication</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: "Times New Roman", "Nimbus Roman", Times, serif;
+      background: #fff;
+      color: #111;
+      line-height: 1.6;
+    }
+    main {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 40px 32px 60px;
+    }
+    h1 {
+      font-size: 22px;
+      text-align: center;
+      margin: 0 0 4px;
+      line-height: 1.3;
+    }
+    .subtitle {
+      text-align: center;
+      font-size: 14px;
+      color: #444;
+      margin: 0 0 24px;
+    }
+    h2 {
+      font-size: 17px;
+      border-bottom: 1px solid #999;
+      padding-bottom: 4px;
+      margin: 28px 0 12px;
+    }
+    h3 {
+      font-size: 15px;
+      margin: 20px 0 8px;
+    }
+    h4 {
+      font-size: 14px;
+      margin: 16px 0 6px;
+    }
+    p, li {
+      font-size: 14px;
+      margin: 0 0 10px;
+    }
+    ul, ol {
+      padding-left: 24px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      margin: 12px 0;
+    }
+    th, td {
+      border: 1px solid #bbb;
+      padding: 5px 7px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #f0f0f0;
+      font-weight: bold;
+    }
+    td {
+      font-variant-numeric: tabular-nums;
+    }
+    code {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 13px;
+      background: #f5f5f5;
+      padding: 1px 4px;
+    }
+    pre {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 12px;
+      background: #f8f8f8;
+      border: 1px solid #ddd;
+      padding: 12px 16px;
+      margin: 12px 0;
+      overflow-x: auto;
+      line-height: 1.5;
+    }
+    .highlight-box {
+      background: #e8f5e9;
+      border: 2px solid #2e7d32;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .warning-box {
+      background: #fff3e0;
+      border: 2px solid #e65100;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .info-box {
+      background: #e3f2fd;
+      border: 2px solid #1565c0;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    a {
+      color: #1565c0;
+      text-decoration: none;
+    }
+    a:hover {
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+  <main>
+
+    <h1>Research Plan v2: Understanding and Recovering GPU<br>Communication Under Container Isolation on Kubernetes</h1>
+    <p class="subtitle">
+      A Research-First Reframing &middot; 2026-04-10 (revised)
+    </p>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 1: WHAT CHANGED AND WHY                              -->
+    <!-- ============================================================ -->
+
+    <h2>1. What Changed from v1 and Why</h2>
+
+    <div class="warning-box">
+      <p style="margin:0"><b>Problem with v1:</b> The v1 plan reads like an engineering project:
+         &ldquo;We will build XTrans, a fabric-agnostic broker daemon.&rdquo; It starts from a
+         solution and works backwards to justify it. This makes it hard to discover unexpected
+         challenges, and reviewers will see it as &ldquo;just engineering.&rdquo;</p>
+    </div>
+
+    <div class="highlight-box">
+      <p style="margin:0"><b>v2 approach:</b> Root on a <b>specific setting</b> &mdash;
+         multi-GPU workloads on Kubernetes that need to move from monolithic multi-GPU
+         containers to per-GPU containers &mdash; and let the research questions
+         and challenges emerge from studying that setting. The system (if we build one) is a
+         consequence of the research, not its starting point.</p>
+    </div>
+
+    <p>The difference is subtle but fundamental:</p>
+
+    <table>
+      <thead>
+        <tr><th>Aspect</th><th>v1 (Engineering-First)</th><th>v2 (Research-First)</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Starting point</b></td>
+          <td>&ldquo;Build XTrans, a broker daemon&rdquo;</td>
+          <td>&ldquo;Multi-GPU K8s workloads are stuck in monolithic containers. What happens when you try per-GPU containers?&rdquo;</td>
+        </tr>
+        <tr>
+          <td><b>Research questions</b></td>
+          <td>Implicit: Can we recover bandwidth?</td>
+          <td>Explicit: What breaks? Why? Is it fundamental? What&rsquo;s the minimal fix?
+              Is there a universal pattern across vendors?</td>
+        </tr>
+        <tr>
+          <td><b>Surprise potential</b></td>
+          <td>Low &mdash; we defined the system upfront</td>
+          <td>High &mdash; we might discover things we didn&rsquo;t expect</td>
+        </tr>
+        <tr>
+          <td><b>Negative results</b></td>
+          <td>Failure = &ldquo;XTrans doesn&rsquo;t work&rdquo;</td>
+          <td>Valuable = &ldquo;We discovered that X is fundamentally impossible / harder than
+              expected / requires Y that nobody realized&rdquo;</td>
+        </tr>
+        <tr>
+          <td><b>Paper framing</b></td>
+          <td>&ldquo;We present XTrans, a system that...&rdquo;</td>
+          <td>&ldquo;We study the per-GPU container setting and discover that...&rdquo;</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p><b>How good papers in our area root on specific settings:</b></p>
+
+    <table>
+      <thead>
+        <tr><th>Paper</th><th>Specific Setting</th><th>Challenge Discovered</th><th>Solution Emerged</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>PhoenixOS</b> (SOSP &rsquo;25)</td>
+          <td>&ldquo;OS-level GPU C/R&rdquo;</td>
+          <td>GPUs have no dirty bits, opaque driver state, 80GB state size</td>
+          <td>Validated speculation + concurrent C/R</td>
+        </tr>
+        <tr>
+          <td><b>vLLM</b> (SOSP &rsquo;23)</td>
+          <td>&ldquo;Efficient LLM serving&rdquo;</td>
+          <td>KV cache wastes 60&ndash;80% of GPU memory due to fragmentation</td>
+          <td>PagedAttention with virtual memory</td>
+        </tr>
+        <tr>
+          <td><b>HiveD</b> (OSDI &rsquo;20)</td>
+          <td>&ldquo;Multi-tenant GPU clusters&rdquo;</td>
+          <td>Topology-affinity guarantees break under sharing</td>
+          <td>Buddy cell abstraction</td>
+        </tr>
+        <tr>
+          <td><b>FreeFlow</b> (NSDI &rsquo;19)</td>
+          <td>&ldquo;RDMA inside containers&rdquo;</td>
+          <td>Container isolation breaks RDMA&rsquo;s shared-memory verbs model</td>
+          <td>Software RDMA virtualization layer</td>
+        </tr>
+        <tr>
+          <td><b>Firecracker</b> (NSDI &rsquo;20)</td>
+          <td>&ldquo;Multi-tenant serverless with strong isolation&rdquo;</td>
+          <td>VMs too heavy, containers too weak</td>
+          <td>MicroVM with minimal device model</td>
+        </tr>
+        <tr>
+          <td><b>This work</b></td>
+          <td>&ldquo;Multi-GPU workloads on K8s that need per-GPU containers&rdquo;</td>
+          <td>GPU CCLs assume shared namespaces; the only workaround today is monolithic containers, sacrificing GPU-granular management</td>
+          <td><i>To be discovered through research</i></td>
+        </tr>
+      </tbody>
+    </table>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 2: THE SETTING                                       -->
+    <!-- ============================================================ -->
+
+    <h2>2. The Setting: Multi-GPU Workloads on Kubernetes</h2>
+
+    <h3>2.1 The Starting Point: It Works Fine Today</h3>
+
+    <p>Multi-GPU workloads (distributed training, tensor-parallel serving) work well on
+       Kubernetes today. The standard practice is straightforward:</p>
+
+    <div class="info-box">
+      <p style="margin:0"><b>Current K8s practice:</b> All GPUs for a job go into <b>one container</b>.
+         A pod requests <code>nvidia.com/gpu: 4</code> (or 8), all GPUs are visible inside one
+         container, NCCL sees them all in the same namespace, NVLink P2P works perfectly.
+         A memory-backed <code>emptyDir</code> mounted at <code>/dev/shm</code> provides the
+         shared memory NCCL needs. No special privileges required for intra-node communication.</p>
+    </div>
+
+    <pre>
+  Today's K8s practice (works fine):
+  +-----------------------------------------------+
+  |              Single Pod / Container            |
+  |   nvidia.com/gpu: 4                            |
+  |                                                |
+  |   GPU0    GPU1    GPU2    GPU3                 |
+  |   ==========NVLink mesh============           |
+  |   NCCL sees all 4 GPUs, P2P works             |
+  |   /dev/shm mounted as emptyDir                |
+  +-----------------------------------------------+</pre>
+
+    <p>This works. So why change it?</p>
+
+    <h3>2.2 The Need: Why Per-GPU Containers Become Necessary</h3>
+
+    <p>The monolithic multi-GPU container works for NCCL, but it creates a
+       <b>coarse-grained management unit</b> that sacrifices key operational capabilities.
+       Several real, pressing scenarios force a move to per-GPU containers:</p>
+
+    <h4>Scenario A: GPU-level fault isolation</h4>
+    <p>In a monolithic 8-GPU container, one GPU failure (ECC error, driver crash, thermal
+       throttling) <b>kills the entire job</b>. All 8 GPUs are lost, and the workload must
+       restart from the last checkpoint. With per-GPU containers, only the failed GPU&rsquo;s
+       container dies; the remaining 7 can continue or reconfigure.</p>
+    <p><i>Scale of the problem:</i> Meta reports 5&ndash;20% of training GPUs experience
+       failures per week at scale (OPT-175B training log). At 10,000 GPUs, that&rsquo;s
+       500&ndash;2,000 GPU failures per week. Each failure in a monolithic container kills
+       an 8-GPU group, wasting the other 7 healthy GPUs until restart.</p>
+
+    <h4>Scenario B: GPU-granular scheduling and preemption</h4>
+    <p>A shared K8s cluster runs multiple workloads at different priorities. A high-priority
+       serving job arrives and needs 4 GPUs urgently. With monolithic containers, the scheduler
+       must <b>kill an entire 8-GPU training job</b> to free 4 GPUs &mdash; wasting the other 4.
+       With per-GPU containers, the scheduler preempts exactly the 4 GPUs it needs.</p>
+    <p><i>Industry direction:</i> Kubernetes DRA (GA in K8s 1.34) explicitly models per-GPU-device
+       allocation. NVIDIA&rsquo;s GPU Operator and DRA driver support single-GPU-per-container assignment.
+       Singularity (Microsoft, 2022) was designed around per-GPU preemption and migration.</p>
+
+    <h4>Scenario C: Multi-tenant GPU sharing on one node</h4>
+    <p>A cloud provider has an 8-GPU node. Tenant A needs 4 GPUs for Llama-70B serving (TP=4).
+       Tenant B needs 4 GPUs for training. Each tenant&rsquo;s GPUs <b>must</b> be in isolated
+       containers (security, billing, compliance). But Tenant A&rsquo;s 4 GPUs need NVLink
+       for tensor parallelism. Inside their separate containers, NCCL cannot use NVLink.</p>
+    <p><i>Reality:</i> This is how cloud GPU instances work (AWS p5, Azure ND, GCP a3). Today,
+       providers avoid sub-node sharing entirely &mdash; each tenant gets the whole node. This
+       wastes GPUs when a tenant needs fewer than 8.</p>
+
+    <h4>Scenario D: Disaggregated inference (DistServe model)</h4>
+    <p>LLM serving architectures increasingly separate prefill (compute-bound) from decode
+       (memory-bound) into different containers for independent scaling (DistServe, OSDI &rsquo;24).
+       KV cache transfer between the prefill and decode containers on the same node should
+       use NVLink, but container isolation prevents it.</p>
+
+    <h4>Scenario E: Rolling updates and independent GPU lifecycle</h4>
+    <p>You want to update the model on GPU 0&ndash;1 while GPU 2&ndash;3 continue serving.
+       With a monolithic container, any update requires restarting all GPUs. Per-GPU containers
+       enable rolling updates, canary deployments, and independent GPU lifecycle management &mdash;
+       standard K8s practices that work for every other resource type but break for multi-GPU workloads.</p>
+
+    <h3>2.3 The Breakdown: What Happens When You Try Per-GPU Containers</h3>
+
+    <pre>
+  Per-GPU containers (what we need):
+  +-------+ +-------+ +-------+ +-------+
+  |Cont 0 | |Cont 1 | |Cont 2 | |Cont 3 |
+  | GPU0  | | GPU1  | | GPU2  | | GPU3  |
+  +---+---+ +---+---+ +---+---+ +---+---+
+      |         |         |         |
+  ====NVLink mesh (physically present)=======
+  But NCCL can't use it! Falls back to TCP.
+  Bandwidth drops 2-10x. Latency SLO violated.</pre>
+
+    <p>When each GPU goes into its own container, NCCL (and RCCL, oneCCL) <b>falls back to
+       TCP/socket communication</b>, bypassing the high-bandwidth interconnect entirely.
+       This is not a configuration error &mdash; it is a fundamental consequence of how
+       CCLs detect co-located GPUs using OS-level mechanisms (hostnames, shared memory
+       devices, Unix domain sockets) that container namespaces isolate by design.</p>
+
+    <div class="warning-box">
+      <p style="margin:0"><b>The core tension:</b> Multi-GPU workloads on K8s work today only because
+         all GPUs are packed into one container. The moment you need per-GPU containers &mdash;
+         for fault isolation, scheduling granularity, multi-tenancy, or independent lifecycle &mdash;
+         GPU communication breaks. <b>The only reason K8s still uses monolithic multi-GPU
+         containers is that nobody has solved the cross-container GPU communication problem.</b></p>
+    </div>
+
+    <h3>2.4 The Fundamental Tension (Isolation vs. Communication)</h3>
+
+    <p>This is a structural conflict between two properties that GPU cloud infrastructure
+       needs simultaneously:</p>
+
+    <table>
+      <thead>
+        <tr><th>Property</th><th>What It Requires</th><th>Who Provides It</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Isolation</b></td>
+          <td>Separate PID/IPC/network namespaces, independent lifecycle, fault boundaries</td>
+          <td>Linux containers (namespaces + cgroups)</td>
+        </tr>
+        <tr>
+          <td><b>High-bandwidth GPU communication</b></td>
+          <td>Shared memory, shared IPC namespace, same-host detection, direct P2P access</td>
+          <td>GPU CCLs (NCCL, RCCL, oneCCL) over NVLink/xGMI/Xe Link</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Today&rsquo;s workarounds all sacrifice one for the other:</p>
+
+    <table>
+      <thead>
+        <tr><th>Workaround</th><th>Isolation?</th><th>Bandwidth?</th><th>Problem</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Monolithic multi-GPU container</td>
+          <td style="color:#c44e52;">No (all GPUs in one container)</td>
+          <td style="color:#2e7d32;">Full NVLink</td>
+          <td>Coarse-grained management, no GPU-level fault/scheduling/tenancy</td>
+        </tr>
+        <tr>
+          <td><code>hostIPC + hostNetwork</code></td>
+          <td style="color:#c44e52;">No (namespaces shared with host)</td>
+          <td style="color:#2e7d32;">Full NVLink</td>
+          <td>Defeats container isolation entirely</td>
+        </tr>
+        <tr>
+          <td>Per-GPU containers (default)</td>
+          <td style="color:#2e7d32;">Yes</td>
+          <td style="color:#c44e52;">TCP fallback (2&ndash;10x slower)</td>
+          <td>NVLink/xGMI bandwidth wasted</td>
+        </tr>
+        <tr>
+          <td style="color:#1565c0;"><b>Per-GPU containers + ???</b></td>
+          <td style="color:#2e7d32;"><b>Yes</b></td>
+          <td style="color:#2e7d32;"><b>Full NVLink</b></td>
+          <td style="color:#1565c0;"><b>This is the research problem</b></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>2.5 Why This Setting Is Research, Not Engineering</h3>
+
+    <p>The question is <b>not</b> &ldquo;can we build a daemon that passes file descriptors
+       between containers?&rdquo; (that is engineering). The questions are:</p>
+    <ul>
+      <li><b>What exactly breaks?</b> Is it the same mechanisms across all CCLs and vendors,
+          or fundamentally different?</li>
+      <li><b>Is there a minimal fix?</b> What is the thinnest possible intervention that
+          recovers native bandwidth? Can we prove it is both necessary and sufficient?</li>
+      <li><b>Is there a universal primitive?</b> Do DMA-BUF file descriptors provide a
+          cross-vendor solution, or is each vendor irreducibly different?</li>
+      <li><b>What is the isolation&ndash;bandwidth trade-off space?</b> Can we formalize it?</li>
+    </ul>
+    <p>These are questions whose answers teach the community something new about how GPU
+       communication interacts with container isolation &mdash; regardless of whether we
+       end up building a system.</p>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 3: RESEARCH QUESTIONS                                -->
+    <!-- ============================================================ -->
+
+    <h2>3. Research Questions</h2>
+
+    <p>Rooting on the setting of multi-GPU K8s workloads that need per-GPU containers,
+       the following research questions emerge naturally. Note that these are genuine
+       questions &mdash; we do not presuppose the answers.</p>
+
+    <h3>RQ1: What exactly breaks, and why?</h3>
+    <p><b>Type:</b> Measurement / characterization</p>
+    <p>When a CCL (NCCL, RCCL, oneCCL) runs inside a per-GPU container, what specific
+       mechanisms fail? Is the failure pattern the same across vendors, or does each
+       vendor break differently? Our preliminary exp1&ndash;2 work showed that NCCL has
+       three &ldquo;gates&rdquo; (hostHash, shmDev, IPC socket), but:</p>
+    <ul>
+      <li>Are there more gates we haven&rsquo;t found?</li>
+      <li>Does RCCL (AMD) have the same gates or different ones?</li>
+      <li>Does oneCCL (Intel) have the same pattern?</li>
+      <li>Is there a <b>universal pattern</b> (topology &rarr; transport &rarr; IPC) that all
+          CCLs follow, or is each vendor truly different?</li>
+    </ul>
+    <p><b>Why this matters:</b> Without a systematic understanding of what breaks, any fix is
+       ad hoc. If we discover a universal failure pattern, that&rsquo;s a research contribution
+       in itself (cf. &ldquo;Simple Testing Can Prevent Most Critical Failures,&rdquo;
+       OSDI &rsquo;14 &mdash; discovered a universal pattern across 5 systems).</p>
+
+    <h3>RQ2: What is the minimal intervention to recover native bandwidth?</h3>
+    <p><b>Type:</b> Systems design / minimality argument</p>
+    <p>Given the failure mechanisms identified in RQ1, what is the <b>smallest possible
+       change</b> to the container&rsquo;s environment that recovers full interconnect bandwidth?
+       Can we characterize the interception surface formally &mdash; i.e., prove that
+       intercepting exactly N functions is necessary and sufficient?</p>
+    <ul>
+      <li>Is LD_PRELOAD on 2&ndash;3 libc calls enough, or do we need more?</li>
+      <li>Can bind mounts replace some interceptions?</li>
+      <li>Does the intervention surface grow with CCL version, or is it stable?</li>
+      <li>What is the <b>trade-off between intervention scope and isolation preservation</b>?</li>
+    </ul>
+    <p><b>Why this matters:</b> A minimality result (&ldquo;these N functions are necessary
+       and sufficient&rdquo;) is an Exokernel-style contribution &mdash; it defines the
+       minimal interface between container isolation and GPU communication.</p>
+
+    <h3>RQ3: Is there a universal cross-container GPU memory sharing primitive?</h3>
+    <p><b>Type:</b> Systems insight / discovery</p>
+    <p>Pre-research reveals that DMA-BUF file descriptors are available on all three major
+       GPU platforms (NVIDIA, AMD, Intel). DMA-BUF FDs can be passed via UDS
+       <code>SCM_RIGHTS</code> across any container boundary. But:</p>
+    <ul>
+      <li>Does DMA-BUF import actually produce a GPU-accessible virtual address?</li>
+      <li>Does the imported buffer support P2P access (NVLink/xGMI) or only CPU access?</li>
+      <li>Is the performance equivalent to native vendor-specific IPC?</li>
+      <li>What kernel version, driver version, and configuration is required?</li>
+    </ul>
+    <p><b>Why this matters:</b> If DMA-BUF works as a universal GPU IPC primitive, this is a
+       genuine systems discovery: a standard Linux kernel subsystem (designed for graphics
+       buffer sharing) turns out to solve the cross-container GPU communication problem
+       across all vendors. If it <i>doesn&rsquo;t</i> work, understanding <i>why</i>
+       (e.g., the import path doesn&rsquo;t support P2P mapping) is equally valuable.</p>
+
+    <h3>RQ4: What does the isolation&ndash;communication spectrum look like?</h3>
+    <p><b>Type:</b> Conceptual model / characterization</p>
+    <p>Between &ldquo;no isolation&rdquo; (<code>--ipc=host</code>) and &ldquo;full isolation&rdquo;
+       (separate everything, TCP only), there is a spectrum. Can we formally characterize
+       this spectrum?</p>
+    <ul>
+      <li>What isolation properties does each intervention sacrifice?</li>
+      <li>Can we define &ldquo;levels&rdquo; of GPU communication isolation analogous to
+          database isolation levels?</li>
+      <li>Can we build a model that <b>predicts</b> bandwidth recovery for a given isolation
+          configuration?</li>
+      <li>What level of isolation do real workloads actually need?</li>
+    </ul>
+    <p><b>Why this matters:</b> A formal isolation&ndash;communication model would be a
+       conceptual contribution that guides future systems design. It would let operators
+       make informed trade-offs rather than choosing between &ldquo;no isolation&rdquo; and
+       &ldquo;no performance.&rdquo;</p>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 4: RESEARCH METHODOLOGY                              -->
+    <!-- ============================================================ -->
+
+    <h2>4. Research Methodology: Study-First, Build-If-Needed</h2>
+
+    <p>The experiments are structured as a study of what happens when multi-GPU K8s
+       workloads move to per-GPU containers, not as a system build plan. Each phase
+       answers specific research questions and informs whether the next phase is needed.</p>
+
+    <div class="info-box">
+      <p style="margin:0"><b>Key difference from v1:</b> In v1, every phase was &ldquo;build the next
+         piece of XTrans.&rdquo; In v2, every phase is &ldquo;answer a research question about what
+         breaks when multi-GPU workloads move to per-GPU containers on K8s.&rdquo; We may end up
+         building a system, but only if the research findings call for one.</p>
+    </div>
+
+    <h3>4.1 Phase 1: NCCL Deep Characterization (RQ1 + RQ2)</h3>
+
+    <div style="background:#f5f5f5;border-left:4px solid #1565c0;padding:8px 12px;margin:20px 0 12px;font-size:15px;font-weight:bold;">
+      &ldquo;What exactly breaks when NCCL runs in per-GPU containers, and what is the minimal fix?&rdquo;
+    </div>
+
+    <p><b>Setting:</b> node192, 4&times;A100 80GB with NVLink 3.0. Per-GPU Docker containers
+       (1 GPU per container) running NCCL allreduce benchmarks.</p>
+
+    <table>
+      <thead>
+        <tr><th>Experiment</th><th>Question</th><th>Method</th><th>Expected Finding</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>1a: Failure characterization</b></td>
+          <td>What syscalls does NCCL make during init that are sensitive to container isolation?</td>
+          <td>Run NCCL under <code>strace</code> in shared-namespace vs per-GPU-container configs.
+              Diff the syscall traces. Correlate with NCCL source code to identify each
+              &ldquo;gate&rdquo; &mdash; the decision point where NCCL chooses to fall back.</td>
+          <td>Complete gate taxonomy. Possibly more gates than the three we know of.</td>
+        </tr>
+        <tr>
+          <td><b>1b: Bandwidth degradation curve</b></td>
+          <td>How much bandwidth do we lose at each gate failure?</td>
+          <td>Progressively enable/disable each gate. Measure allreduce bandwidth at each
+              configuration point. Build a degradation curve: which gate matters most?</td>
+          <td>Quantified per-gate impact. Understanding of which failures are catastrophic
+              vs marginal.</td>
+        </tr>
+        <tr>
+          <td><b>1c: Minimal intervention</b></td>
+          <td>What is the smallest change that recovers full NVLink bandwidth?</td>
+          <td>Build the thinnest possible LD_PRELOAD shim (~200 LoC C). Intercept only
+              the identified gates. Measure: does it recover &ge;99% bandwidth? Which
+              intercepted calls are truly necessary vs redundant?</td>
+          <td>The minimal interception surface for NCCL. Count of intercepted functions
+              and proof that each is necessary.</td>
+        </tr>
+        <tr>
+          <td><b>1d: Version stability</b></td>
+          <td>Is the interception surface stable across NCCL versions?</td>
+          <td>Test the shim against NCCL 2.18, 2.21, 2.25, 2.27, 2.28, 2.29. Document
+              any gate changes. Identify which versions add, remove, or modify gates.</td>
+          <td>Stability characterization. If the surface is unstable, this is a finding
+              that argues for a different approach.</td>
+        </tr>
+        <tr>
+          <td><b>1e: Topology visibility</b></td>
+          <td>How does NCCL discover GPU topology in containers, and what goes wrong?</td>
+          <td>Analyze NCCL&rsquo;s sysfs reads (<code>/sys/bus/pci</code>). Test
+              <code>NCCL_TOPO_FILE</code> as a topology injection mechanism. Does
+              daemon-generated XML produce correct transport decisions?</td>
+          <td>Understanding of whether topology virtualization is needed in addition to
+              gate interception, and whether NCCL&rsquo;s existing <code>NCCL_TOPO_FILE</code>
+              mechanism is sufficient.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p><b>Output:</b> A comprehensive characterization paper on NCCL&rsquo;s behavior under
+       per-GPU containerization. This is publishable on its own (measurement contribution)
+       regardless of what follows.</p>
+
+    <p><b>Decision point:</b> After Phase 1, we know exactly what breaks in NCCL and how to
+       fix it. The question becomes: is this NCCL-specific, or is it a universal pattern?</p>
+
+    <h3>4.2 Phase 1.5: DMA-BUF Hypothesis Test (RQ3)</h3>
+
+    <div style="background:#f5f5f5;border-left:4px solid #1565c0;padding:8px 12px;margin:20px 0 12px;font-size:15px;font-weight:bold;">
+      &ldquo;Can DMA-BUF file descriptors serve as a universal cross-container GPU memory sharing primitive?&rdquo;
+    </div>
+
+    <p><b>Setting:</b> node192, A100s. Pure GPU memory IPC experiment &mdash; outside of any
+       CCL, test the raw DMA-BUF mechanism.</p>
+
+    <table>
+      <thead>
+        <tr><th>Experiment</th><th>Question</th><th>Method</th><th>Expected Finding</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>1.5a: DMA-BUF export + FD pass + import</b></td>
+          <td>Can a DMA-BUF FD from one container be imported in another container and
+              used for GPU P2P?</td>
+          <td>Write standalone C programs: Container A allocates GPU memory via cuMem,
+              exports DMA-BUF FD, sends via UDS. Container B receives FD, imports,
+              maps to GPU VA, performs P2P copy.</td>
+          <td>Yes/no answer. If yes: DMA-BUF is a viable universal primitive. If no:
+              understanding of why (e.g., import doesn&rsquo;t produce GPU VA).</td>
+        </tr>
+        <tr>
+          <td><b>1.5b: DMA-BUF vs native IPC performance</b></td>
+          <td>Does the DMA-BUF path match vendor-native IPC performance?</td>
+          <td>Compare three paths: (a) cuMem FD native, (b) DMA-BUF export/import,
+              (c) legacy <code>cudaIpcMemHandle</code> (shared IPC NS). Measure latency
+              and bandwidth for P2P copies of various sizes.</td>
+          <td>Performance characterization. Quantify any overhead from the DMA-BUF path.</td>
+        </tr>
+        <tr>
+          <td><b>1.5c: Kernel requirements</b></td>
+          <td>What kernel/driver version is needed for DMA-BUF GPU IPC?</td>
+          <td>Test on kernel 5.15 (node192) and 6.x. Document required modules and
+              capabilities.</td>
+          <td>Compatibility matrix.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p><b>Output:</b> Definitive answer on whether DMA-BUF is a viable universal GPU IPC primitive.
+       This finding is significant regardless of direction &mdash; if DMA-BUF works, it simplifies
+       the multi-vendor story; if it doesn&rsquo;t, we understand why and what vendor-specific
+       paths are needed instead.</p>
+
+    <p><b>Decision point:</b> If DMA-BUF works on NVIDIA with full performance, we have strong
+       evidence it will work on AMD/Intel (since DMA-BUF is a kernel subsystem). This de-risks Phase 2.</p>
+
+    <h3>4.3 Phase 2: Cross-Vendor Generality (RQ1 across vendors)</h3>
+
+    <div style="background:#f5f5f5;border-left:4px solid #1565c0;padding:8px 12px;margin:20px 0 12px;font-size:15px;font-weight:bold;">
+      &ldquo;Do RCCL (AMD) and oneCCL (Intel) break in the same way as NCCL, or differently?&rdquo;
+    </div>
+
+    <p><b>Setting:</b> AMD MI250X/MI300X (cloud) and/or Intel Data Center GPU Max (if accessible).
+       Per-GPU containers running vendor-native CCL benchmarks.</p>
+
+    <table>
+      <thead>
+        <tr><th>Experiment</th><th>Question</th><th>Method</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>2a: RCCL gate taxonomy</b></td>
+          <td>Does RCCL have the same three gates as NCCL, or different ones?</td>
+          <td>Source analysis (RCCL is open source, forked from NCCL) + strace on AMD hardware.
+              Compare gate-by-gate with NCCL findings.</td>
+        </tr>
+        <tr>
+          <td><b>2b: AMD IPC path exploration</b></td>
+          <td>Which AMD IPC mechanism(s) work across containers?</td>
+          <td>Test three paths in order: (a) opaque HSA handles via shared <code>/dev/kfd</code>,
+              (b) DMA-BUF export/import, (c) HIP VMM FD. Each is a different point in the
+              isolation&ndash;performance spectrum.</td>
+        </tr>
+        <tr>
+          <td><b>2c: RCCL bandwidth recovery</b></td>
+          <td>Can we recover Infinity Fabric bandwidth in per-GPU containers on AMD?</td>
+          <td>Apply Phase 1 methodology (gate interception + working IPC path) to RCCL.
+              Measure allreduce bandwidth vs baseline.</td>
+        </tr>
+        <tr>
+          <td><b>2d: Cross-vendor comparison</b></td>
+          <td>Is the failure pattern universal or vendor-specific?</td>
+          <td>Compare NCCL and RCCL gate taxonomies side-by-side. Identify shared patterns
+              vs vendor-specific divergences. Test whether the same shim approach works.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p><b>Output:</b> Cross-vendor characterization. The key finding is whether the
+       topology &rarr; transport &rarr; IPC failure pattern is universal (strong contribution)
+       or vendor-specific (still useful, but different paper).</p>
+
+    <p><b>Decision point:</b> Based on Phases 1&ndash;2 findings, choose paper direction:</p>
+    <ul>
+      <li><b>If universal pattern + DMA-BUF works:</b> Strong systems paper. &ldquo;We discover
+          that all CCLs break through the same three mechanisms, and DMA-BUF provides a
+          universal recovery path.&rdquo;</li>
+      <li><b>If patterns diverge but each is solvable:</b> Characterization + system paper.
+          &ldquo;We present a taxonomy of failure modes and vendor-specific recovery strategies.&rdquo;</li>
+      <li><b>If only NCCL is tractable:</b> Deep NCCL paper. Still publishable as a thorough
+          single-system study with measurement + mechanism contribution.</li>
+    </ul>
+
+    <h3>4.4 Phase 3: Isolation&ndash;Communication Model (RQ4)</h3>
+
+    <div style="background:#f5f5f5;border-left:4px solid #1565c0;padding:8px 12px;margin:20px 0 12px;font-size:15px;font-weight:bold;">
+      &ldquo;What does the isolation&ndash;communication trade-off space look like?&rdquo;
+    </div>
+
+    <p>This phase synthesizes findings from Phases 1&ndash;2 into a conceptual model.</p>
+
+    <table>
+      <thead>
+        <tr><th>Experiment</th><th>Question</th><th>Method</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>3a: Isolation level taxonomy</b></td>
+          <td>What are the meaningful levels between &ldquo;no isolation&rdquo; and &ldquo;full isolation&rdquo;?</td>
+          <td>Enumerate all namespace/mount combinations. For each, measure: (a) which CCL
+              transport is selected, (b) what bandwidth is achieved, (c) what isolation
+              properties are preserved.</td>
+        </tr>
+        <tr>
+          <td><b>3b: Security analysis</b></td>
+          <td>What does each intervention expose? Can a malicious container exploit the
+              intervention to access another container&rsquo;s GPU memory?</td>
+          <td>Threat model analysis. For each intervention (shim function, bind mount,
+              shared socket), enumerate what a malicious actor could do.</td>
+        </tr>
+        <tr>
+          <td><b>3c: Predictive model</b></td>
+          <td>Can we predict bandwidth recovery from isolation configuration?</td>
+          <td>Build a simple model: given a set of shared/isolated namespaces, predict
+              which CCL transport will be selected and what bandwidth will result.
+              Validate against experimental measurements.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p><b>Output:</b> A formal model of GPU communication under container isolation. This is
+       a conceptual contribution that frames the problem space for future work.</p>
+
+    <h3>4.5 Phase 4 (Conditional): System Construction</h3>
+
+    <div style="background:#f5f5f5;border-left:4px solid #1565c0;padding:8px 12px;margin:20px 0 12px;font-size:15px;font-weight:bold;">
+      Only if Phases 1&ndash;3 findings call for a system.
+    </div>
+
+    <p>If the research findings reveal that:</p>
+    <ol>
+      <li>The failure pattern is universal across vendors</li>
+      <li>A common mechanism (e.g., DMA-BUF) enables recovery</li>
+      <li>The recovery requires coordination (topology, handle brokering) beyond what
+          a simple shim can provide</li>
+    </ol>
+    <p>Then building a broker/daemon system is the natural next step &mdash; and it will be
+       informed by deep understanding of the problem rather than upfront architecture decisions.</p>
+
+    <p>If the findings show that a simple shim per vendor is sufficient and no coordination
+       is needed, then <b>the paper is the characterization + shims</b>, not a system. That is
+       equally valid and publishable.</p>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 5: WHAT WE ALREADY KNOW                              -->
+    <!-- ============================================================ -->
+
+    <h2>5. What We Already Know (Prior Results)</h2>
+
+    <p>We are not starting from zero. Our exp1&ndash;2 work and the experiments in this
+       repository have established several key findings:</p>
+
+    <table>
+      <thead>
+        <tr><th>Finding</th><th>Source</th><th>Implication</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>NCCL has three container &ldquo;gates&rdquo;: hostHash, shmDev, IPC socket</td>
+          <td>Exp A (this repo)</td>
+          <td>We know the specific failure points for NCCL. Phase 1 formalizes and extends this.</td>
+        </tr>
+        <tr>
+          <td>cuMem VMM FD passing recovers 100% NVLink bandwidth</td>
+          <td>Exp 1&ndash;2 (vllm-source)</td>
+          <td>FD-based IPC works for cross-container GPU P2P on NVIDIA. Baseline for Phase 1.5.</td>
+        </tr>
+        <tr>
+          <td>DMA-BUF FDs are available on NVIDIA, AMD, and Intel</td>
+          <td>Exp A&prime; (this repo) + pre-research</td>
+          <td>There is a candidate universal primitive. Phase 1.5 tests it.</td>
+        </tr>
+        <tr>
+          <td>An LD_PRELOAD shim intercepting 2&ndash;3 functions recovers NVLink P2P</td>
+          <td>Exp A (this repo)</td>
+          <td>Minimal intervention is possible on NCCL. Phase 1c proves minimality formally.</td>
+        </tr>
+        <tr>
+          <td>RCCL is a hard fork of NCCL with the same three gates but no cuMem escape hatch</td>
+          <td>Pre-research source analysis</td>
+          <td>AMD is harder than NVIDIA. Phase 2 explores alternative IPC paths.</td>
+        </tr>
+        <tr>
+          <td>oneCCL&rsquo;s <code>sockets</code> mode already works across PID namespaces</td>
+          <td>Pre-research source analysis</td>
+          <td>Intel is potentially the easiest vendor. One CCL already has the mechanism.</td>
+        </tr>
+      </tbody>
+    </table>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 6: POTENTIAL PAPER FRAMINGS                          -->
+    <!-- ============================================================ -->
+
+    <h2>6. Potential Paper Framings</h2>
+
+    <p>Depending on what we discover, the paper can take several forms. All start from
+       the same setting (per-GPU containers) but emphasize different findings:</p>
+
+    <h3>Framing A: Measurement + Discovery Paper</h3>
+    <p><i>&ldquo;We present the first systematic study of how container isolation breaks GPU
+       collective communication. We discover that all major CCLs (NCCL, RCCL, oneCCL) fail
+       through a universal three-stage pattern (topology &rarr; transport &rarr; IPC), despite
+       having completely different internal implementations. We identify DMA-BUF file
+       descriptors as a universal cross-container GPU memory sharing primitive, and show that
+       minimal interception (N syscall wrappers) recovers &ge;95% of native interconnect
+       bandwidth across vendors.&rdquo;</i></p>
+    <p><b>Contribution:</b> Taxonomy + discovery + minimality proof. No system needed.</p>
+    <p><b>Venue:</b> OSDI/SOSP (if the discovery is surprising enough), ATC/EuroSys (safe bet).</p>
+
+    <h3>Framing B: Deep Single-Vendor Study</h3>
+    <p><i>&ldquo;We present a comprehensive analysis of NCCL&rsquo;s behavior under per-GPU
+       containerization: the complete set of isolation-sensitive decision points, a minimal
+       LD_PRELOAD interception layer that recovers native NVLink bandwidth, a version
+       compatibility study across NCCL 2.18&ndash;2.29, and a formal isolation&ndash;communication
+       trade-off model.&rdquo;</i></p>
+    <p><b>Contribution:</b> Depth over breadth. Thorough single-system study.</p>
+    <p><b>Venue:</b> ATC, EuroSys, NSDI.</p>
+
+    <h3>Framing C: Systems Paper (if Phase 4 happens)</h3>
+    <p><i>&ldquo;We study the per-GPU container setting and discover that [universal pattern].
+       Based on this understanding, we build [system name], a lightweight broker that mediates
+       topology discovery and GPU memory handle exchange across container boundaries. [System]
+       recovers &ge;95% of native interconnect bandwidth on NVIDIA NVLink, AMD Infinity
+       Fabric, and Intel Xe Link, while preserving container isolation.&rdquo;</i></p>
+    <p><b>Contribution:</b> Measurement + system. Strongest paper but requires most work.</p>
+    <p><b>Venue:</b> OSDI, SOSP, EuroSys.</p>
+
+    <h3>Framing D: DMA-BUF Discovery Paper</h3>
+    <p><i>&ldquo;We discover that Linux DMA-BUF &mdash; a kernel subsystem designed for graphics
+       buffer sharing &mdash; can serve as a universal cross-container GPU memory sharing
+       primitive. We demonstrate that DMA-BUF file descriptors, passed via standard Unix
+       domain sockets, enable GPU P2P communication across container boundaries on NVIDIA,
+       AMD, and Intel hardware with &le;1% overhead compared to vendor-native IPC. This
+       eliminates the need for vendor-specific IPC workarounds and enables per-GPU
+       containerization without sacrificing interconnect bandwidth.&rdquo;</i></p>
+    <p><b>Contribution:</b> Focused discovery. Clean story around one key insight.</p>
+    <p><b>Venue:</b> ATC, ASPLOS, EuroSys.</p>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 7: TIMELINE AND MILESTONES                           -->
+    <!-- ============================================================ -->
+
+    <h2>7. Timeline and Decision Points</h2>
+
+    <table>
+      <thead>
+        <tr><th>Phase</th><th>Duration</th><th>Key Deliverable</th><th>Decision After</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Phase 1</b><br>NCCL characterization</td>
+          <td>3&ndash;4 weeks</td>
+          <td>Complete NCCL gate taxonomy, minimal shim, version stability matrix,
+              topology virtualization</td>
+          <td>Is the NCCL characterization alone strong enough for a paper? If yes,
+              proceed to Phase 2 for the cross-vendor story. If there are surprises,
+              dig deeper.</td>
+        </tr>
+        <tr>
+          <td><b>Phase 1.5</b><br>DMA-BUF hypothesis</td>
+          <td>1&ndash;2 weeks</td>
+          <td>DMA-BUF cross-container GPU P2P: works or doesn&rsquo;t. Performance numbers.</td>
+          <td>If DMA-BUF works: strong motivation for cross-vendor Phase 2. If not:
+              understand why (valuable finding) and adjust Phase 2 plans.</td>
+        </tr>
+        <tr>
+          <td><b>Phase 2</b><br>Cross-vendor</td>
+          <td>4&ndash;6 weeks</td>
+          <td>RCCL gate taxonomy + AMD IPC path results + cross-vendor comparison</td>
+          <td>Choose paper framing (A/B/C/D). If cross-vendor pattern is universal:
+              Framing A or C. If vendor-specific: Framing B. If DMA-BUF is the key
+              finding: Framing D.</td>
+        </tr>
+        <tr>
+          <td><b>Phase 3</b><br>Model</td>
+          <td>2&ndash;3 weeks</td>
+          <td>Isolation&ndash;communication model, security analysis</td>
+          <td>Does the paper need a system (Phase 4) or is the characterization +
+              model sufficient?</td>
+        </tr>
+        <tr>
+          <td><b>Phase 4</b><br>(Conditional)</td>
+          <td>4&ndash;6 weeks</td>
+          <td>Broker system if needed</td>
+          <td>&mdash;</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="info-box">
+      <p style="margin:0"><b>Note on decision points:</b> Each phase has an explicit decision point.
+         This is deliberate &mdash; a research project should let findings guide direction, not
+         follow a predetermined build plan. If Phase 1 reveals something unexpected (e.g., NCCL
+         has 10 gates instead of 3, or the gates are so simple that the problem is trivial),
+         we adjust.</p>
+    </div>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 8: WHAT MAKES THIS RESEARCH (NOT ENGINEERING)        -->
+    <!-- ============================================================ -->
+
+    <h2>8. What Makes This Research, Not Engineering</h2>
+
+    <p>An engineering project asks: &ldquo;How do I build a system that does X?&rdquo;
+       A research project asks: &ldquo;What do we not yet understand about domain Y,
+       and what can we discover?&rdquo;</p>
+
+    <p>Here is what makes our work research:</p>
+
+    <table>
+      <thead>
+        <tr><th>Engineering Mindset</th><th>Research Mindset (This Plan)</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>&ldquo;Build a broker daemon&rdquo;</td>
+          <td>&ldquo;Characterize what breaks and discover whether a universal pattern exists&rdquo;</td>
+        </tr>
+        <tr>
+          <td>Success = system works</td>
+          <td>Success = community learns something new about how GPU communication
+              interacts with container isolation</td>
+        </tr>
+        <tr>
+          <td>Negative result = failure</td>
+          <td>Negative result = valuable finding (e.g., &ldquo;DMA-BUF import does
+              not produce P2P-capable GPU VAs on AMD &mdash; here&rsquo;s why&rdquo;)</td>
+        </tr>
+        <tr>
+          <td>Architecture decided upfront</td>
+          <td>Architecture emerges from understanding</td>
+        </tr>
+        <tr>
+          <td>Multi-vendor support is a feature</td>
+          <td>Cross-vendor comparison reveals whether the problem is universal or
+              coincidental</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>8.1 The Potential Surprises</h3>
+
+    <p>Research should have room for surprise. Here are things we might discover that
+       we don&rsquo;t currently expect:</p>
+
+    <ul>
+      <li>NCCL might have <b>more than three gates</b> that only manifest in specific
+          configurations (e.g., NVSwitch systems, multi-node, CUDA MPS)</li>
+      <li>DMA-BUF import might work on NVIDIA but <b>not on AMD</b> for P2P (different
+          kernel driver implementations) &mdash; this would be a finding about vendor
+          divergence in Linux kernel GPU subsystems</li>
+      <li>The minimal intervention on AMD might be <b>fundamentally larger</b> than on NVIDIA
+          (because RCCL disables cuMem), meaning the isolation&ndash;communication trade-off
+          is vendor-dependent</li>
+      <li>oneCCL&rsquo;s <code>sockets</code> mode might already solve the problem for Intel,
+          meaning the &ldquo;universal&rdquo; problem is actually NVIDIA+AMD specific</li>
+      <li>The topology virtualization problem (making containers see the full interconnect
+          topology) might be <b>harder than the IPC problem</b> (NCCL cross-validates sysfs)</li>
+      <li>NCCL version changes might break the shim in non-obvious ways, revealing that
+          the interception surface is <b>inherently unstable</b></li>
+    </ul>
+
+    <p>Each of these surprises would change the paper&rsquo;s story. That&rsquo;s the point
+       of doing research rather than engineering &mdash; we follow the findings.</p>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 9: HARDWARE AND RESOURCES                            -->
+    <!-- ============================================================ -->
+
+    <h2>9. Hardware and Resources</h2>
+
+    <table>
+      <thead>
+        <tr><th>Resource</th><th>Status</th><th>Used For</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>node192</b><br>4&times;A100 80GB, NVLink 3.0</td>
+          <td style="color:#2e7d32;font-weight:bold">Available now</td>
+          <td>Phase 1 (NCCL characterization) + Phase 1.5 (DMA-BUF)</td>
+        </tr>
+        <tr>
+          <td><b>AMD MI250X or MI300X</b></td>
+          <td style="color:#e65100;font-weight:bold">Need cloud access</td>
+          <td>Phase 2 (RCCL characterization). Options: Azure ND-MI300X-v5,
+              AMD Accelerator Cloud, academic cluster.</td>
+        </tr>
+        <tr>
+          <td><b>Intel Data Center GPU Max</b></td>
+          <td style="color:#e65100;font-weight:bold">Nice-to-have</td>
+          <td>Phase 2 extension. oneCCL source analysis can be done without hardware.
+              The <code>sockets</code> mode finding from pre-research may be sufficient.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="warning-box">
+      <p style="margin:0"><b>Minimum viable paper:</b> Phases 1 + 1.5 on node192 alone produce a
+         publishable NCCL-focused paper (Framing B). AMD hardware is needed for the cross-vendor
+         story (Framings A/C/D). We should pursue AMD access in parallel with Phase 1 work.</p>
+    </div>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 10: RELATIONSHIP TO v1 PLAN                         -->
+    <!-- ============================================================ -->
+
+    <h2>10. Relationship to v1 Plan and Existing Work</h2>
+
+    <p>This v2 plan does not discard v1. It reframes the same technical work within a
+       research methodology:</p>
+
+    <table>
+      <thead>
+        <tr><th>v1 Element</th><th>v2 Counterpart</th><th>What Changed</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Exp A: NCCL gate taxonomy + shim</td>
+          <td>Phase 1: NCCL deep characterization</td>
+          <td>Same technical work, but framed as answering RQ1+RQ2 rather than
+              &ldquo;building the NCCL backend of XTrans&rdquo;</td>
+        </tr>
+        <tr>
+          <td>Exp A&prime;: DMA-BUF feasibility spike</td>
+          <td>Phase 1.5: DMA-BUF hypothesis test</td>
+          <td>Same experiments, but framed as testing a research hypothesis (RQ3)
+              rather than &ldquo;de-risking Phase 2&rdquo;</td>
+        </tr>
+        <tr>
+          <td>Exp A&Prime;: Topology virtualization</td>
+          <td>Phase 1e: Topology visibility</td>
+          <td>Folded into Phase 1 as one aspect of understanding NCCL&rsquo;s
+              container sensitivity</td>
+        </tr>
+        <tr>
+          <td>Exp B: AMD RCCL shim</td>
+          <td>Phase 2: Cross-vendor generality</td>
+          <td>Same hardware target, but framed as testing whether the failure
+              pattern is universal (RQ1 across vendors) rather than &ldquo;building
+              the RCCL backend&rdquo;</td>
+        </tr>
+        <tr>
+          <td>XTrans architecture (daemon + shim + backends)</td>
+          <td>Phase 4: Conditional system construction</td>
+          <td>Only built if research findings call for it. Architecture emerges
+              from understanding, not predetermined.</td>
+        </tr>
+        <tr>
+          <td>Feasibility assessment, related work, hardware landscape</td>
+          <td>Retained in v1 (still valid and comprehensive)</td>
+          <td>v1&rsquo;s sections 2&ndash;5 are excellent pre-research. v2 reframes
+              the <i>plan</i> (section 6) and <i>framing</i> (section 1).</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="info-box">
+      <p style="margin:0"><b>Bottom line:</b> v1&rsquo;s pre-research, feasibility assessment,
+         related work analysis, and hardware characterization are all solid and reusable.
+         What v2 changes is the <i>methodology</i>: instead of &ldquo;build XTrans in phases,&rdquo;
+         we &ldquo;study the per-GPU container setting and let findings guide the work.&rdquo;
+         The technical experiments are largely the same; the intellectual framing is different.</p>
+    </div>
+
+
+    <hr style="margin:32px 0;">
+    <p style="font-size:12px;color:#666;text-align:center;">
+      Research Plan v2 &middot; 2026-04-10 &middot; Reframed from engineering-first (v1) to research-first approach.
+    </p>
+
+  </main>
+</body>
+</html>

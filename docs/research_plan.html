@@ -1174,6 +1174,120 @@ Step 4: DATA TRANSFER
       </tbody>
     </table>
 
+    <h3>5.7 Topology Virtualization and Abstraction</h3>
+
+    <p>Topology virtualization &mdash; making a container&rsquo;s CCL see GPUs and interconnects
+       that are invisible due to namespace isolation &mdash; is a key component of XTrans
+       (L1: Topology Service). While no prior work addresses this specific problem, several
+       systems handle related aspects of GPU topology discovery, scheduling, and virtualization.</p>
+
+    <table>
+      <thead>
+        <tr><th>System</th><th>Year</th><th>Topology Mechanism</th><th>Relation to XTrans</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>NCCL Topology XML</b><br>(<code>NCCL_TOPO_FILE</code>)</td>
+          <td>2019+</td>
+          <td>NCCL reads <code>/sys/bus/pci</code> to auto-detect GPU/NIC/switch topology, or loads
+              a user-supplied XML file via <code>NCCL_TOPO_FILE</code>. Used in cloud VMs where
+              <code>/sys</code> is incomplete. Known crash (GitHub Issue #326) when container
+              <code>/sys</code> lacks PCI class entries.</td>
+          <td>XTrans daemon generates this XML dynamically from host-side NVML enumeration, solving
+              the incomplete-sysfs problem. <b>Primary mechanism</b> for NCCL topology virtualization.
+              Exp&nbsp;A&Prime; validates this approach.</td>
+        </tr>
+        <tr>
+          <td><b><code>nvidia-topologyd</code></b></td>
+          <td>2023+</td>
+          <td>Undocumented NVIDIA daemon in vGPU/GRID stack. Exposes GPU topology info (NVLink,
+              PCIe hierarchy, NUMA affinity) to VMs where <code>/sys</code> does not reflect
+              physical topology.</td>
+          <td>Closest existing precedent for XTrans L1 topology service &mdash; but proprietary,
+              vGPU-only, not container-aware, and NVIDIA-only. Confirms that topology virtualization
+              is a recognized need in GPU virtualization.</td>
+        </tr>
+        <tr>
+          <td><b>NVIDIA Topograph</b></td>
+          <td>2025</td>
+          <td>Open-source cluster topology discovery toolkit. Discovers NVLink domains, rack hierarchy,
+              switch tiers. Exposes topology as K8s node labels
+              (<code>network.topology.nvidia.com/accelerator</code>, <code>/block</code>,
+              <code>/spine</code>). Integrates with Slurm, K8s DRA, Run:ai.</td>
+          <td>Operates at <i>cluster/scheduling</i> level (which node to place jobs on). XTrans
+              operates at <i>container</i> level (how containers on the same node see each
+              other&rsquo;s GPUs). Complementary &mdash; Topograph decides placement,
+              XTrans enables communication.</td>
+        </tr>
+        <tr>
+          <td><b>NVIDIA NVTAGS</b></td>
+          <td>2022+</td>
+          <td>Topology-Aware GPU Selection for MPI. Profiles GPU communication patterns, discovers
+              NVLink/PCIe topology via nvidia-smi, assigns GPUs to MPI ranks to minimize
+              communication congestion.</td>
+          <td>Optimizes GPU-to-rank mapping <i>within</i> a shared namespace. Does not address
+              container isolation or topology visibility across namespaces.</td>
+        </tr>
+        <tr>
+          <td><b>Alibaba ACK<br>GPU Topology Scheduling</b></td>
+          <td>2023+</td>
+          <td>K8s scheduling extension (<code>gputopo-device-plugin</code>) that reports GPU
+              topology (NVLink/PCIe) and selects optimal GPU combinations for training jobs.
+              NUMA-aware scheduling via <code>ack-koordinator</code>.</td>
+          <td>Scheduling-level topology awareness (which GPUs to assign). Does not expose topology
+              information <i>inside</i> the container after scheduling. XTrans fills the gap:
+              after ACK assigns GPUs, XTrans makes the CCL see the full interconnect.</td>
+        </tr>
+        <tr>
+          <td><b>Kueue Topology-Aware<br>Scheduling</b></td>
+          <td>2025</td>
+          <td>K8s SIG project for batch workload queuing with topology-aware placement. Uses
+              <code>TopologyGroup</code> CRD to model GPU/NIC hierarchy.</td>
+          <td>Same pattern: scheduling-level topology, no intra-container visibility.</td>
+        </tr>
+        <tr>
+          <td><b>FlowVisor</b><br>(SDN analogy)</td>
+          <td>2009</td>
+          <td>Network virtualization layer for OpenFlow/SDN. Slices physical network into virtual
+              topologies with five isolation dimensions (bandwidth, topology, traffic, CPU,
+              flowspace). Each tenant controller sees only its slice. Deployed on production
+              networks since 2009; SIGCOMM demo 2011.</td>
+          <td><b>Conceptual precedent</b> for topology virtualization. FlowVisor virtualizes network
+              topology for SDN controllers; XTrans virtualizes GPU fabric topology for CCLs.
+              Same pattern: host-level full view &rarr; per-tenant virtual view.</td>
+        </tr>
+        <tr>
+          <td><b>NCCL Issues<br>#326 / #324 / #1781</b></td>
+          <td>2019&ndash;2025</td>
+          <td>Community-reported crashes and performance degradation when NCCL runs in containers
+              with incomplete <code>/sys</code> topology. #326: topology detection crash reading
+              PCI class. #324: NVLink not detected cross-container. #1781: P2P fails across
+              K8s pods (hostHash + shmDev + topology).</td>
+          <td>Confirms that topology visibility is a real, widespread problem. No upstream fix
+              exists &mdash; NVIDIA suggests <code>NCCL_TOPO_FILE</code> or <code>--ipc=host</code>
+              as workarounds. XTrans provides the principled solution.</td>
+        </tr>
+        <tr>
+          <td><b>lxcfs</b><br>(LXC/LXD)</td>
+          <td>2015+</td>
+          <td>FUSE-based <code>/proc</code> and <code>/sys</code> virtualization for containers.
+              Presents container-accurate CPU count, memory limits, and uptime. No GPU-specific
+              sysfs virtualization exists.</td>
+          <td>Implementation precedent for sysfs virtualization. XTrans extends this concept to
+              GPU sysfs entries (<code>/sys/class/kfd</code> for AMD, <code>/sys/bus/pci</code>
+              for NCCL topology detection).</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div style="background:#e3f2fd;border:2px solid #1565c0;border-radius:6px;padding:12px 16px;margin:16px 0;">
+      <p style="margin:0"><b>Gap:</b> All existing topology-aware systems operate at the <b>scheduling level</b>
+         (which GPUs/nodes to assign) or the <b>cluster level</b> (how nodes are connected).
+         None address <b>intra-node topology virtualization</b> &mdash; making a container&rsquo;s CCL
+         see GPUs and interconnects that are invisible due to namespace isolation. This is the
+         specific gap XTrans&rsquo;s L1 topology service fills.</p>
+    </div>
+
     <div style="background:#e3f2fd;border:2px solid #1565c0;border-radius:6px;padding:12px 16px;margin:16px 0;">
       <p style="margin:0"><b>Positioning:</b> XTrans operates at a layer that <b>no existing system addresses</b>.
          It sits <i>below</i> the CCL (NCCL/RCCL/oneCCL/HCCL) and <i>above</i> the hardware fabric,
@@ -1318,6 +1432,99 @@ Step 4: DATA TRANSFER
          sharing &mdash; can serve as a universal cross-container GPU memory sharing mechanism,
          eliminating the need for vendor-specific IPC workarounds.&rdquo; This is a genuine systems
          insight, not &ldquo;transplanting cuMem.&rdquo;</p>
+    </div>
+
+    <h3>6.2.1 Phase 1.75: NCCL Topology Virtualization (Exp A&Prime;)</h3>
+
+    <div style="background:#f5f5f5;border-left:4px solid #1565c0;padding:8px 12px;margin:20px 0 12px;font-size:15px;font-weight:bold;">
+      Exp A&Prime;: Topology Virtualization via NCCL_TOPO_FILE and Synthetic sysfs
+    </div>
+
+    <p><b>Goal:</b> Validate that a daemon-generated NCCL topology XML file can make per-GPU
+       containers see the full NVLink topology and select the correct P2P transport, without
+       relying on host <code>/sys</code> visibility.</p>
+
+    <p><b>Motivation:</b> Exp&nbsp;A proved that syscall interception (hostHash, shmDev) enables
+       cross-container IPC. But NCCL also reads <code>/sys/bus/pci</code> to discover GPU topology
+       (NVLink connections, PCIe hierarchy, NUMA affinity). In per-GPU containers, this sysfs view
+       is incomplete &mdash; each container sees only its own GPU&rsquo;s PCI subtree. NCCL Issue #326
+       shows this causes crashes. <code>NCCL_TOPO_FILE</code> is NCCL&rsquo;s mechanism to supply
+       external topology, but nobody has validated it for cross-container use with daemon-generated XML.</p>
+
+    <table>
+      <thead>
+        <tr><th>Task</th><th>Method</th><th>Deliverable</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>A&Prime;1: NCCL topology XML reverse-engineering</b></td>
+          <td>Dump NCCL&rsquo;s auto-detected topology XML on node192 (bare metal, 4&times;A100 NVLink)
+              using <code>NCCL_TOPO_DUMP_FILE</code>. Compare with <code>/sys/bus/pci</code> sysfs
+              tree. Document the XML schema: <code>&lt;system&gt;</code>, <code>&lt;cpu&gt;</code>,
+              <code>&lt;pci&gt;</code>, <code>&lt;gpu&gt;</code>, <code>&lt;nvlink&gt;</code>
+              elements. Identify which fields are required vs optional for transport selection.</td>
+          <td>Complete NCCL topology XML schema documentation. Reference XML for node192
+              A100 topology.</td>
+        </tr>
+        <tr>
+          <td><b>A&Prime;2: Daemon-generated topology XML</b></td>
+          <td>Write a Python script that uses NVML (<code>pynvml</code>) to enumerate GPUs, NVLink
+              connections, PCIe topology, and NUMA affinity on the host, then generates an
+              NCCL-compatible topology XML file. Test that NCCL accepts this file via
+              <code>NCCL_TOPO_FILE</code> and produces identical transport decisions as
+              auto-detected topology.</td>
+          <td><code>topo_gen_nvidia.py</code> &mdash; host-side topology XML generator. Validated
+              against NCCL auto-detection on node192.</td>
+        </tr>
+        <tr>
+          <td><b>A&Prime;3: Cross-container topology injection</b></td>
+          <td>Run per-GPU containers (1 GPU each) with the shim from Exp&nbsp;A. Set
+              <code>NCCL_TOPO_FILE</code> pointing to the daemon-generated XML (bind-mounted into
+              each container). Verify that NCCL selects P2P/NVLink transport (not NET/Socket).
+              Measure allreduce bandwidth and compare to: (a) bare-metal baseline, (b) shim-only
+              (no topo file), (c) <code>--ipc=host</code> baseline.</td>
+          <td>Proof that daemon-generated topology XML + shim enables correct transport selection
+              in per-GPU containers. Bandwidth comparison table.</td>
+        </tr>
+        <tr>
+          <td><b>A&Prime;4: Topology correctness validation</b></td>
+          <td>Compare NCCL&rsquo;s transport graph (logged via
+              <code>NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=GRAPH</code>) across configurations.
+              Verify that the topology XML produces the same NVLink ring/tree topology as bare metal.
+              Test with <code>NCCL_GRAPH_DUMP_FILE</code> to extract the algorithm graph.</td>
+          <td>Transport graph equivalence proof. Document any topology fields that affect algorithm
+              selection (ring vs tree vs split tree).</td>
+        </tr>
+        <tr>
+          <td><b>A&Prime;5: Incomplete/incorrect topology resilience</b></td>
+          <td>Test NCCL behavior with: (a) missing NVLink entries in XML, (b) incorrect bandwidth
+              values, (c) extra phantom GPUs not visible in the container. Characterize how topology
+              errors affect transport selection and bandwidth.</td>
+          <td>Robustness analysis &mdash; defines requirements for daemon topology accuracy.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p><b>Success criteria:</b> Daemon-generated <code>NCCL_TOPO_FILE</code> + Exp&nbsp;A shim
+       recovers &ge;99% of bare-metal NVLink allreduce bandwidth in per-GPU containers on node192,
+       with NCCL selecting the identical transport graph (P2P/NVLink rings) as bare metal.</p>
+
+    <div style="background:#e8f5e9;border:2px solid #2e7d32;border-radius:6px;padding:12px 16px;margin:16px 0;">
+      <p style="margin:0"><b>Why this matters:</b> This experiment validates the <i>first layer</i> of the
+         XTrans architecture (L1: Topology Service) on NVIDIA. If <code>NCCL_TOPO_FILE</code> works
+         reliably as the topology injection mechanism, the daemon&rsquo;s topology service reduces to
+         &ldquo;enumerate GPUs via NVML &rarr; generate XML &rarr; serve to containers.&rdquo; This is
+         a simple, well-defined interface. If it <i>doesn&rsquo;t</i> work (e.g., NCCL cross-validates
+         XML against sysfs), we discover this now rather than during Phase 3 daemon integration.</p>
+    </div>
+
+    <div style="background:#fff3e0;border:2px solid #e65100;border-radius:6px;padding:12px 16px;margin:16px 0;">
+      <p style="margin:0"><b>Risk:</b> NCCL may cross-validate <code>NCCL_TOPO_FILE</code> against
+         <code>/sys/bus/pci</code> entries. If the XML claims NVLink connections to GPUs not visible
+         in the container&rsquo;s sysfs, NCCL might reject the topology. <b>Mitigation:</b> sysfs
+         bind-mounts (selective <code>/sys/bus/pci/devices/</code> entries from host) or FUSE-based
+         sysfs overlay. This would be an important finding &mdash; it means topology virtualization
+         requires sysfs virtualization as well, increasing the interception surface.</p>
     </div>
 
     <h3>6.3 Phase 2: AMD RCCL Cross-Container Recovery (Exp B)</h3>
@@ -1822,6 +2029,15 @@ message ImportHandleResponse {
           <td style="color:#e65100;font-weight:bold">Medium</td>
         </tr>
         <tr>
+          <td><b>Phase 1.75</b></td>
+          <td>Exp A&Prime;: NCCL topology virtualization &mdash; daemon-generated XML,
+              cross-container topology injection, transport selection validation</td>
+          <td>node192 (A100 NVLink) &mdash; <i>available now</i></td>
+          <td>Phase 1 (shim), Phase 1.5 (DMA-BUF findings)</td>
+          <td>1&ndash;2 weeks</td>
+          <td style="color:#e65100;font-weight:bold">Low&ndash;Medium</td>
+        </tr>
+        <tr>
           <td><b>Phase 2</b></td>
           <td>Exp B: RCCL gate discovery + three-path IPC test + Infinity Fabric recovery</td>
           <td>AMD MI250X or MI300X &mdash; <i>need access</i></td>
@@ -1862,12 +2078,15 @@ Critical Path:
   Phase 1 (NCCL shim)
     |
     v
-  Phase 1.5 (DMA-BUF spike) ----+
+  Phase 1.5 (DMA-BUF spike)
+    |
+    v
+  Phase 1.75 (Topology XML) ----+
     |                            |
-    | DMA-BUF works?             | DMA-BUF fails?
+    | Topo file works?           | Needs sysfs virtualization?
     |                            |
     v                            v
-  Phase 2 (RCCL: test 3 paths)  Phase 2 (RCCL: broker needed early)
+  Phase 2 (RCCL: test 3 paths)  Phase 2 (RCCL: + sysfs virt investigation)
     |                            |
     +----------+-----------------+
                |
@@ -2263,6 +2482,56 @@ Critical Path:
           <td>2024</td>
           <td>seccomp-bpf adds ~3.6% overhead; cannot modify syscall return values (limitation for XTrans)</td>
         </tr>
+        <tr>
+          <td><code>nvidia-topologyd</code> (NVIDIA vGPU/GRID daemon)</td>
+          <td>2023+</td>
+          <td>Writes <code>/var/run/nvidia-topologyd/virtualTopology.xml</code>; NCCL loads it as fallback before sysfs detection. Closest precedent for XTrans L1 topology service.</td>
+        </tr>
+        <tr>
+          <td>Nebius nccl-topology (cloud topology XML generator)</td>
+          <td>2025</td>
+          <td>Generates custom <code>NCCL_TOPO_FILE</code> XML for VMs with invisible PCIe topology; contributed upstream NCCL support for custom topology files</td>
+        </tr>
+        <tr>
+          <td>Azure NCCL Topology Files (Microsoft)</td>
+          <td>2025</td>
+          <td>Per-SKU topology XMLs (<code>/opt/microsoft/ndv4-topo.xml</code>) for NDv4/NDv5 VMs; same pattern of host-side topology generation consumed by NCCL in guest</td>
+        </tr>
+        <tr>
+          <td>NVIDIA Topograph (open-source cluster topology discovery)</td>
+          <td>2025</td>
+          <td>Discovers NVLink domains, rack hierarchy; exposes as K8s node labels; cluster-level (complements XTrans container-level)</td>
+        </tr>
+        <tr>
+          <td>NVIDIA NVTAGS (Topology-Aware GPU Selection)</td>
+          <td>2022+</td>
+          <td>Assigns GPUs to MPI ranks based on NVLink/PCIe communication topology; shared-namespace only</td>
+        </tr>
+        <tr>
+          <td>FlowVisor: A Network Virtualization Layer (Sherwood et al.)</td>
+          <td>2009</td>
+          <td>SDN topology virtualization; conceptual precedent for XTrans &mdash; virtualizes network topology for controllers as XTrans virtualizes GPU topology for CCLs</td>
+        </tr>
+        <tr>
+          <td>NCCL Issues #326 / #324 / #1781 (GitHub)</td>
+          <td>2019&ndash;2025</td>
+          <td>Community reports of container topology detection crashes and NVLink fallback; confirms topology visibility is a widespread unresolved problem</td>
+        </tr>
+        <tr>
+          <td>lxcfs (LXC/LXD FUSE-based /proc and /sys virtualization)</td>
+          <td>2015+</td>
+          <td>Implementation precedent for container sysfs virtualization; CPU/memory only, no GPU support</td>
+        </tr>
+        <tr>
+          <td>Alibaba ACK GPU Topology-Aware Scheduling</td>
+          <td>2023+</td>
+          <td>K8s <code>gputopo-device-plugin</code> for NVLink-aware GPU selection; scheduling-level only, no intra-container topology exposure</td>
+        </tr>
+        <tr>
+          <td>Kueue Topology-Aware Scheduling (K8s SIG)</td>
+          <td>2025</td>
+          <td>Batch workload topology-aware queuing via <code>TopologyGroup</code> CRD; scheduling-level only</td>
+        </tr>
       </tbody>
     </table>
 
@@ -2285,6 +2554,11 @@ Critical Path:
         <tr><td><b>IMEX</b></td><td>Internode Memory Exchange (NVIDIA daemon for NVLink fabric communication)</td></tr>
         <tr><td><b>xGMI</b></td><td>AMD&rsquo;s inter-die Global Memory Interconnect (Infinity Fabric for GPUs)</td></tr>
         <tr><td><b>UALink</b></td><td>Ultra Accelerator Link (open standard GPU interconnect, 1.0 spec April 2025)</td></tr>
+        <tr><td><b>NCCL_TOPO_FILE</b></td><td>NCCL environment variable pointing to an XML file describing GPU/NIC/switch topology; overrides auto-detection from <code>/sys</code></td></tr>
+        <tr><td><b>Topograph</b></td><td>NVIDIA&rsquo;s open-source cluster topology discovery toolkit; exposes NVLink domains as K8s node labels</td></tr>
+        <tr><td><b>NVTAGS</b></td><td>NVIDIA Topology-Aware GPU Selection; assigns GPUs to MPI ranks based on communication topology</td></tr>
+        <tr><td><b>nvidia-topologyd</b></td><td>NVIDIA daemon that writes <code>virtualTopology.xml</code> for VMs where <code>/sys</code> does not reflect physical GPU topology</td></tr>
+        <tr><td><b>lxcfs</b></td><td>FUSE-based <code>/proc</code> and <code>/sys</code> virtualization for Linux containers; precedent for sysfs virtualization</td></tr>
         <tr><td><b>XTrans</b></td><td>Cross-container Transport &mdash; the system proposed in this plan</td></tr>
       </tbody>
     </table>

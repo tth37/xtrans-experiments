@@ -1,0 +1,1241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Research Plan v3: The Case for Per-GPU Containers</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: "Times New Roman", "Nimbus Roman", Times, serif;
+      background: #fff;
+      color: #111;
+      line-height: 1.6;
+    }
+    main {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 40px 32px 60px;
+    }
+    h1 {
+      font-size: 22px;
+      text-align: center;
+      margin: 0 0 4px;
+      line-height: 1.3;
+    }
+    .subtitle {
+      text-align: center;
+      font-size: 14px;
+      color: #444;
+      margin: 0 0 24px;
+    }
+    h2 {
+      font-size: 17px;
+      border-bottom: 1px solid #999;
+      padding-bottom: 4px;
+      margin: 28px 0 12px;
+    }
+    h3 {
+      font-size: 15px;
+      margin: 20px 0 8px;
+    }
+    h4 {
+      font-size: 14px;
+      margin: 16px 0 6px;
+    }
+    p, li {
+      font-size: 14px;
+      margin: 0 0 10px;
+    }
+    ul, ol {
+      padding-left: 24px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      margin: 12px 0;
+    }
+    th, td {
+      border: 1px solid #bbb;
+      padding: 5px 7px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #f0f0f0;
+      font-weight: bold;
+    }
+    td {
+      font-variant-numeric: tabular-nums;
+    }
+    code {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 13px;
+      background: #f5f5f5;
+      padding: 1px 4px;
+    }
+    pre {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 12px;
+      background: #f8f8f8;
+      border: 1px solid #ddd;
+      padding: 12px 16px;
+      margin: 12px 0;
+      overflow-x: auto;
+      line-height: 1.5;
+    }
+    .highlight-box {
+      background: #e8f5e9;
+      border: 2px solid #2e7d32;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .warning-box {
+      background: #fff3e0;
+      border: 2px solid #e65100;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .info-box {
+      background: #e3f2fd;
+      border: 2px solid #1565c0;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    a {
+      color: #1565c0;
+      text-decoration: none;
+    }
+    a:hover {
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+  <main>
+
+    <h1>Research Plan v3: The Case for Per-GPU Containers</h1>
+    <p class="subtitle">
+      Motivation, Setting, and Evidence &middot; 2026-04-10
+    </p>
+
+    <div class="info-box">
+      <p style="margin:0"><b>What this document is:</b> An evidence-based argument for why
+         per-GPU containers are an inevitable paradigm shift in GPU cloud infrastructure,
+         and why this creates a rich, under-explored research problem space. This document
+         focuses entirely on <b>motivation and setting</b> &mdash; not solutions.</p>
+    </div>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 1: THE STATUS QUO AND ITS PROBLEMS                   -->
+    <!-- ============================================================ -->
+
+    <h2>1. The Status Quo: The Monolithic Multi-GPU Container</h2>
+
+    <h3>1.1 How Multi-GPU Workloads Run Today</h3>
+
+    <p>Today, multi-GPU workloads on Kubernetes (training, tensor-parallel serving) run in
+       a simple model: <b>one container gets all GPUs on a node</b>.</p>
+
+    <pre>
+  Standard K8s multi-GPU deployment (2024&ndash;2026):
+  +-----------------------------------------------+
+  |              Single Pod / Container            |
+  |   requests: nvidia.com/gpu: 8                  |
+  |                                                |
+  |   GPU0  GPU1  GPU2  GPU3  GPU4  GPU5  GPU6  GPU7
+  |   ================NVLink mesh==================|
+  |   NCCL sees all 8 GPUs, full P2P bandwidth     |
+  +-----------------------------------------------+</pre>
+
+    <p>This works for NCCL. The CCL sees all GPUs in the same namespace, detects NVLink,
+       and achieves full interconnect bandwidth. vLLM, Megatron-LM, DeepSpeed, and every
+       other multi-GPU framework use this model.</p>
+
+    <p><b>So what&rsquo;s the problem?</b></p>
+
+    <h3>1.2 The Monolithic Container Is a Coarse-Grained Management Unit</h3>
+
+    <p>Packing all GPUs into one container means the <b>GPU is not the unit of management
+       &mdash; the node is</b>. This creates fundamental operational problems:</p>
+
+    <table>
+      <thead>
+        <tr><th>Problem</th><th>What Happens</th><th>Impact</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>One GPU fails &rarr; all GPUs lost</b></td>
+          <td>A single GPU ECC error, driver crash, or thermal event kills the entire
+              container. All 8 GPUs stop. The job must restart from the last checkpoint.</td>
+          <td>The 7 healthy GPUs are wasted until the job restarts.</td>
+        </tr>
+        <tr>
+          <td><b>Cannot preempt individual GPUs</b></td>
+          <td>A high-priority job needs 4 GPUs. The scheduler must kill an entire 8-GPU
+              job to free them, wasting the other 4 GPUs.</td>
+          <td>Coarse preemption granularity. GPU utilization drops.</td>
+        </tr>
+        <tr>
+          <td><b>Cannot add or remove GPUs at runtime</b></td>
+          <td>K8s containers have a fixed GPU count. Resizing tensor parallelism requires
+              recreating the container, which restarts the entire workload.</td>
+          <td>No elasticity. Resources locked for the job&rsquo;s lifetime.</td>
+        </tr>
+        <tr>
+          <td><b>Cannot share a node across tenants</b></td>
+          <td>If Tenant A needs 4 GPUs and Tenant B needs 4 GPUs, they cannot safely
+              coexist on the same 8-GPU node without sharing namespaces.</td>
+          <td>Nodes allocated exclusively to single tenants. Severe underutilization.</td>
+        </tr>
+        <tr>
+          <td><b>Cannot do rolling updates</b></td>
+          <td>Updating the model on GPU 0&ndash;1 requires restarting all 8 GPUs.
+              Standard K8s rolling update strategies don&rsquo;t apply.</td>
+          <td>GPU workloads can&rsquo;t use standard cloud-native operational patterns.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>These are not hypothetical concerns. They are backed by production data.</p>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 2: EVIDENCE PILLAR 1 - GPU FAILURES                  -->
+    <!-- ============================================================ -->
+
+    <h2>2. Evidence Pillar 1: GPU Failures Make Per-GPU Fault Isolation Critical</h2>
+
+    <h3>2.1 GPU Failure Rates in Production</h3>
+
+    <p>The most detailed public data comes from Meta&rsquo;s Llama 3.1 405B training
+       (2024), run on 16,384 NVIDIA H100 GPUs over 54 days:</p>
+
+    <div class="warning-box">
+      <p style="margin:0"><b>Meta Llama 3.1 405B training (16,384 H100s, 54 days):</b><br>
+         &bull; <b>419 unexpected failures</b> in 54 days &mdash; <b>one failure every 3 hours</b><br>
+         &bull; <b>58.7% caused by GPUs</b> (GPU faults: 30.1%, HBM3 memory: 17.2%, SRAM: 4.5%, system processor: 4.1%)<br>
+         &bull; <b>9% annualized GPU failure rate</b> (27% over 3 years)<br>
+         &bull; Only ~90% effective training time despite extensive automation<br>
+         &bull; 2.1% of training time spent on checkpointing and failure recovery<br>
+         <i>Source: Meta, &ldquo;The Llama 3 Herd of Models,&rdquo; 2024</i></p>
+    </div>
+
+    <p>Earlier, during OPT-175B training (992 A100s), Meta reported <b>56% of training
+       time was lost to failure handling</b>. The improvement to 90% effective time with
+       Llama 3 required massive engineering investment in automated recovery.</p>
+
+    <h3>2.2 The Scaling Problem</h3>
+
+    <p>GPU failure rates compound with scale:</p>
+
+    <table>
+      <thead>
+        <tr><th>Cluster Size</th><th>Expected Failure Interval</th><th>Impact with Monolithic Containers</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1,000 GPUs (125 nodes)</td>
+          <td>~1 failure every 50 hours</td>
+          <td>One 8-GPU node dies every ~2 days</td>
+        </tr>
+        <tr>
+          <td>16,384 GPUs (Meta Llama 3)</td>
+          <td>~1 failure every 3 hours</td>
+          <td>Every failure kills 8 GPUs; checkpoint &amp; restart</td>
+        </tr>
+        <tr>
+          <td>100,000 GPUs</td>
+          <td>~1 failure every 30 minutes</td>
+          <td>Continuous cascading restarts of 8-GPU groups</td>
+        </tr>
+        <tr>
+          <td>1,000,000 GPUs (projected 2027)</td>
+          <td>~1 failure every 3 minutes</td>
+          <td>Monolithic containers become unworkable</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>2.3 Why Per-GPU Containers Help</h3>
+
+    <p>With per-GPU containers, a single GPU failure kills only that GPU&rsquo;s container.
+       The remaining GPUs continue running. The system can:</p>
+    <ol>
+      <li><b>Isolate the failure:</b> Only the failed GPU&rsquo;s process dies, not all 8.</li>
+      <li><b>Reconfigure without full restart:</b> The training framework can reduce tensor
+          parallelism (7 instead of 8), switch to a different parallelism strategy (NTP,
+          Nonuniform-Tensor-Parallelism, arXiv 2025), or wait for a replacement GPU.</li>
+      <li><b>Replace the failed GPU:</b> K8s can reschedule a new single-GPU container
+          while the other 7 continue, rather than restarting the entire 8-GPU group.</li>
+    </ol>
+
+    <div class="highlight-box">
+      <p style="margin:0"><b>The argument:</b> At the failure rates observed in production
+         (one every 3 hours at 16K GPUs), the monolithic 8-GPU container is an amplifier
+         of failure impact. Per-GPU containers reduce the blast radius from 8 GPUs to 1 GPU.
+         As clusters scale to 100K+ GPUs, this reduction becomes essential &mdash; without it,
+         the entire cluster spends more time recovering from failures than training.</p>
+    </div>
+
+    <p><b>Related work confirming this direction:</b></p>
+    <ul>
+      <li><b>Oobleck</b> (SOSP &rsquo;23): Resilient training using pipeline templates.
+          Tolerates f simultaneous failures via f+1 heterogeneous pipeline replicas.
+          Up to 13.9&times; faster recovery than Bamboo/Varuna. Operates at the framework
+          level &mdash; per-GPU containers would make this transparent at the OS level.</li>
+      <li><b>NTP</b> (Nonuniform-Tensor-Parallelism, arXiv 2025): When a GPU fails in a
+          TP group of 8, NTP redistributes work to the remaining 7 GPUs with minimal overhead.
+          Requires the ability to isolate and replace individual GPUs &mdash; exactly what
+          per-GPU containers provide.</li>
+      <li><b>Singularity</b> (Microsoft, 2022): Designed around the principle that &ldquo;all
+          jobs are preemptable, migratable, and dynamically resizable by default.&rdquo;
+          This requires GPU-granular lifecycle management.</li>
+    </ul>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 3: EVIDENCE PILLAR 2 - HARDWARE TRAJECTORY           -->
+    <!-- ============================================================ -->
+
+    <h2>3. Evidence Pillar 2: Hardware Is Dissolving the &ldquo;Node&rdquo;</h2>
+
+    <h3>3.1 The GB200 NVL72: 72 GPUs in One Rack</h3>
+
+    <p>NVIDIA&rsquo;s GB200 NVL72 fundamentally changes the node concept:</p>
+
+    <div class="info-box">
+      <p style="margin:0"><b>GB200 NVL72 architecture:</b> 72 Blackwell GPUs connected via NVLink 5.0
+         (1.8 TB/s per GPU, 130 TB/s aggregate) across an entire rack. There is <b>no direct
+         GPU-to-GPU connectivity within a single server</b> &mdash; all 72 GPUs connect through
+         external NVSwitches. The entire rack acts as a single NVLink domain.
+         <br><i>Source: NVIDIA, Nebius, CoreWeave documentation</i></p>
+    </div>
+
+    <p>This creates a new reality:</p>
+
+    <ul>
+      <li><b>You cannot give all 72 GPUs to one job.</b> Most workloads need 4&ndash;32 GPUs.
+          Giving 72 to one job wastes the rest. Multiple jobs <b>must</b> share the rack.</li>
+      <li><b>Each job&rsquo;s GPUs must be in separate containers</b> for isolation, billing,
+          security, and independent lifecycle management.</li>
+      <li><b>But all 72 GPUs share one NVLink domain.</b> Jobs on the same rack should use
+          NVLink (1.8 TB/s), not InfiniBand (~400 GB/s), for communication between their GPUs.</li>
+      <li><b>Container isolation breaks NVLink communication.</b> This is exactly our problem.</li>
+    </ul>
+
+    <h3>3.2 NVIDIA Acknowledges the Problem</h3>
+
+    <p>NVIDIA built <b>ComputeDomains</b> and <b>IMEX</b> specifically to address this:</p>
+
+    <div class="info-box">
+      <p style="margin:0"><b>NVIDIA ComputeDomains (2025):</b> A Kubernetes abstraction that
+         dynamically creates IMEX domains around pods, enabling cross-container NVLink
+         communication on GB200 NVL72. When a distributed job is scheduled, the platform
+         automatically creates an IMEX domain around whichever nodes the pods land on.
+         When the job finishes, the domain is torn down.
+         <br><br>
+         <b>NVIDIA&rsquo;s stated future direction:</b> &ldquo;They are planning to remove the
+         constraint [of one pod per node per ComputeDomain] to make the notion of individual
+         nodes less relevant. It will then be possible for the application to be composed of
+         <b>many single-GPU pods</b> that may or may not be placed next to each other on the
+         same node. In that mode, the unit of interest is the <b>individual GPU</b>, and not
+         the individual node.&rdquo;
+         <br><i>Source: NVIDIA Developer Blog, &ldquo;Enabling Multi-Node NVLink on Kubernetes
+         for GB200 and Beyond,&rdquo; Nov 2025</i></p>
+    </div>
+
+    <p><b>But IMEX + ComputeDomains are:</b></p>
+    <ul>
+      <li><b>GB200/Blackwell only.</b> Requires 4th-gen NVSwitches + IMEX kernel module.
+          Does not work on A100, H100, or any AMD/Intel hardware.</li>
+      <li><b>NVIDIA-proprietary.</b> No equivalent for AMD Infinity Fabric or Intel Xe Link.</li>
+      <li><b>Requires specific kernel/driver versions</b> (GPU Operator 25.3+, K8s 1.32+).</li>
+    </ul>
+
+    <h3>3.3 The Trajectory: From Node to GPU as the Unit</h3>
+
+    <table>
+      <thead>
+        <tr><th>Era</th><th>Unit of Allocation</th><th>GPUs per Unit</th><th>Inter-GPU Fabric</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>DGX A100 (2020)</td>
+          <td>Node (8 GPUs)</td>
+          <td>8</td>
+          <td>NVLink 3.0 (intra-node only)</td>
+        </tr>
+        <tr>
+          <td>DGX H100 (2023)</td>
+          <td>Node (8 GPUs)</td>
+          <td>8</td>
+          <td>NVLink 4.0 (intra-node only)</td>
+        </tr>
+        <tr>
+          <td>DGX GB200 NVL72 (2025)</td>
+          <td>Rack (72 GPUs)</td>
+          <td>72</td>
+          <td>NVLink 5.0 (cross-node, intra-rack)</td>
+        </tr>
+        <tr>
+          <td>NVL576 (announced)</td>
+          <td>Multi-rack (576 GPUs)</td>
+          <td>576</td>
+          <td>NVLink (cross-rack)</td>
+        </tr>
+        <tr>
+          <td>UALink 1.0 (2027?)</td>
+          <td>Domain (up to 1,024 accelerators)</td>
+          <td>1,024</td>
+          <td>Open standard, multi-vendor</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="highlight-box">
+      <p style="margin:0"><b>The argument:</b> As the NVLink domain grows from 8 GPUs (one node) to
+         72 (one rack) to 576+ (multi-rack), the &ldquo;one container per NVLink domain&rdquo;
+         model becomes absurd. You cannot put 72 GPUs in one container for each job.
+         <b>Multiple containers must share the NVLink domain</b>, and each container&rsquo;s
+         GPUs must communicate at NVLink bandwidth, not InfiniBand/TCP. This is not a future
+         scenario &mdash; GB200 NVL72 is shipping now and NVIDIA built ComputeDomains
+         specifically because per-GPU pods on shared NVLink are <b>necessary</b>.</p>
+    </div>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 4: EVIDENCE PILLAR 3 - UTILIZATION CRISIS            -->
+    <!-- ============================================================ -->
+
+    <h2>4. Evidence Pillar 3: GPU Utilization Is Catastrophically Low</h2>
+
+    <h3>4.1 The Numbers</h3>
+
+    <table>
+      <thead>
+        <tr><th>Source</th><th>Reported GPU Utilization</th><th>Context</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>CNCF member survey (2025)</td>
+          <td><b>13&ndash;37%</b> baseline</td>
+          <td>Production K8s GPU clusters. Advanced scheduling triples utilization from 13% to 37%.</td>
+        </tr>
+        <tr>
+          <td>Microsoft Azure (2024)</td>
+          <td><b>&lt;15%</b> for ML inference</td>
+          <td>Inference workloads are bursty; GPUs idle during off-peak.</td>
+        </tr>
+        <tr>
+          <td>Alibaba PAI (2023&ndash;24)</td>
+          <td><b>25&ndash;50%</b></td>
+          <td>Production clusters. MIG sharing introduced <b>21&ndash;42% fragmentation</b>.</td>
+        </tr>
+        <tr>
+          <td>Industry average (2024)</td>
+          <td><b>20&ndash;30%</b></td>
+          <td>Cited by CIO, NVIDIA, multiple vendors.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>At H100 prices ($27,000&ndash;$40,000 per GPU, $2&ndash;$5/hour cloud), a 1,000-GPU
+       cluster at 25% utilization wastes ~$50&ndash;$100M annually.</p>
+
+    <h3>4.2 Why Utilization Is Low: The Fragmentation Problem</h3>
+
+    <p>The root cause is <b>coarse-grained allocation</b>: K8s allocates whole GPUs
+       (or whole nodes) to jobs, and jobs rarely need exactly what&rsquo;s allocated.</p>
+
+    <pre>
+  Example: 8-GPU node, three jobs arrive:
+
+  Job A: needs 3 GPUs     Job B: needs 3 GPUs     Job C: needs 4 GPUs
+
+  Monolithic allocation:
+  +--Node 1--+  +--Node 2--+  +--Node 3--+
+  | A A A . . . . . |  | B B B . . . . . |  | C C C C . . . . |
+  | 3/8 used (38%)  |  | 3/8 used (38%)  |  | 4/8 used (50%)  |
+  +----------+  +----------+  +----------+
+  Total: 10 GPUs used, 24 allocated.  Utilization: 42%.
+
+  Per-GPU allocation:
+  +------Node 1------+  +--Node 2--+
+  | A A A  B B B  C C |  | C C . . . . . . |
+  | 8/8 used (100%)  |  | 2/8 used (25%)  |
+  +------------------+  +----------+
+  Total: 10 GPUs used, 16 allocated.  Utilization: 63%.
+  (+50% improvement in allocation efficiency)</pre>
+
+    <p>This is the classic bin-packing advantage. NVIDIA&rsquo;s Volcano Scheduler achieved
+       <b>90% GPU occupancy</b> using bin-packing, up from much lower baselines. But effective
+       bin-packing requires fine-grained allocation units &mdash; per-GPU containers.</p>
+
+    <h3>4.3 GPU Sharing (MIG) Creates New Problems</h3>
+
+    <p>MIG (Multi-Instance GPU) can partition an A100/H100 into up to 7 slices. But:</p>
+    <ul>
+      <li><b>Fragmentation:</b> Alibaba&rsquo;s PAI platform found that MIG converted
+          <b>21&ndash;42% of unallocated GPU resources into fragmentation</b> &mdash; partially
+          allocated GPUs that can&rsquo;t fit any pending job.</li>
+      <li><b>Coarse partitions:</b> MIG slices have fixed sizes (e.g., 1g.10gb, 2g.20gb,
+          3g.40gb on A100). Jobs rarely fit exactly.</li>
+      <li><b>No cross-slice communication:</b> MIG partitions are hardware-isolated.
+          Two MIG slices on the same GPU cannot use NVLink to communicate.</li>
+    </ul>
+
+    <p>Per-GPU containers avoid these problems: each GPU is a whole unit, and the
+       communication layer (if solved) allows any subset of GPUs to form a group.</p>
+
+    <div class="highlight-box">
+      <p style="margin:0"><b>The argument:</b> GPU utilization is 20&ndash;30% in production, wasting
+         billions of dollars annually. The root cause is coarse-grained allocation at the
+         node level. Per-GPU containers enable GPU-level bin-packing, which can dramatically
+         improve utilization. MIG is an alternative but introduces its own fragmentation
+         problems and prevents high-bandwidth inter-GPU communication. Per-GPU containers
+         are the more flexible, software-defined approach.</p>
+    </div>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 5: EVIDENCE PILLAR 4 - ELASTIC SCHEDULING            -->
+    <!-- ============================================================ -->
+
+    <h2>5. Evidence Pillar 4: Elastic Scheduling Requires GPU-Granular Containers</h2>
+
+    <h3>5.1 The Elasticity Problem</h3>
+
+    <p>GPU workloads have fundamentally different resource needs over time:</p>
+    <ul>
+      <li><b>Inference:</b> Bursty. A serving endpoint sees 10&times; traffic spikes during
+          peak hours. Ideal: scale from 4 GPUs to 8 GPUs during peaks, back to 2 during off-peak.</li>
+      <li><b>Training:</b> Long-running but interruptible. A training job can use more GPUs
+          when available (faster training) and fewer when preempted (slower but continuing).</li>
+      <li><b>Mixed workloads:</b> Training during off-peak, inference during peak. GPUs
+          should flow between workload types dynamically.</li>
+    </ul>
+
+    <h3>5.2 Current Elastic Systems and Their Container Requirements</h3>
+
+    <table>
+      <thead>
+        <tr><th>System</th><th>What It Does</th><th>What It Needs from Containers</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Tenplex</b> (SOSP &rsquo;24)</td>
+          <td>Changes multi-dimensional parallelism (TP+PP+DP) at runtime by
+              re-partitioning model state across GPUs</td>
+          <td>Must add/remove individual GPUs from a running job. With monolithic
+              containers, this requires container recreation (full restart). With
+              per-GPU containers, a GPU can join or leave without disrupting others.</td>
+        </tr>
+        <tr>
+          <td><b>NTP</b> (arXiv 2025)</td>
+          <td>Nonuniform tensor parallelism: when a GPU fails in a TP group of 8,
+              redistributes work to remaining 7 GPUs with minimal overhead</td>
+          <td>Must detect and remove a single failed GPU from the TP group without
+              killing the other 7. Per-GPU containers provide exactly this isolation.</td>
+        </tr>
+        <tr>
+          <td><b>Lyra</b> (EuroSys &rsquo;23)</td>
+          <td>Loans idle inference GPUs for elastic training during off-peak</td>
+          <td>GPUs must be independently assignable between inference and training
+              workloads. Per-GPU containers enable this without node-level preemption.</td>
+        </tr>
+        <tr>
+          <td><b>Singularity</b> (Microsoft)</td>
+          <td>&ldquo;All jobs are preemptable, migratable, and dynamically resizable
+              by default&rdquo;</td>
+          <td>Requires GPU-granular lifecycle management. Their internal system
+              implements this, but on K8s it would require per-GPU containers.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>5.3 K8s Is Moving Toward Per-Device Allocation</h3>
+
+    <table>
+      <thead>
+        <tr><th>K8s Feature</th><th>Status</th><th>What It Enables</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Dynamic Resource Allocation (DRA)</b></td>
+          <td>GA in K8s 1.32 (2025)</td>
+          <td>Per-device GPU allocation with topology awareness.
+              Replaces the coarse <code>nvidia.com/gpu: N</code> model.</td>
+        </tr>
+        <tr>
+          <td><b>In-Place Pod Resize</b></td>
+          <td>Beta in K8s 1.33 (2025)</td>
+          <td>Resize CPU/memory without pod restart. GPU support is the obvious
+              next step (though not yet implemented).</td>
+        </tr>
+        <tr>
+          <td><b>NVIDIA KAI Scheduler</b></td>
+          <td>Open-sourced 2025</td>
+          <td>Fractional GPU allocation, topology-aware scheduling, bin-packing.
+              Designed for per-GPU granularity.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="highlight-box">
+      <p style="margin:0"><b>The argument:</b> Elastic GPU scheduling (adding/removing GPUs at runtime)
+         is an active research area with multiple published systems (Tenplex, NTP, Lyra, Singularity).
+         All of these require GPU-granular lifecycle management. On Kubernetes, this means
+         per-GPU containers. K8s itself is moving in this direction with DRA and In-Place Pod Resize.
+         The framework support exists; the container-level communication support does not.</p>
+    </div>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 6: EVIDENCE PILLAR 5 - MULTI-TENANCY                 -->
+    <!-- ============================================================ -->
+
+    <h2>6. Evidence Pillar 5: Multi-Tenancy on Shared GPU Nodes</h2>
+
+    <h3>6.1 The Economic Pressure</h3>
+
+    <p>An 8-GPU DGX H100 costs ~$300,000. A 72-GPU GB200 NVL72 rack costs substantially more.
+       Cloud providers cannot afford to give each customer exclusive access to the entire system.
+       Multi-tenancy &mdash; multiple customers sharing the same physical hardware &mdash; is an
+       economic necessity.</p>
+
+    <h3>6.2 Multi-Tenancy Requires Container Isolation</h3>
+
+    <p>When two tenants share a GPU node, their workloads <b>must</b> be in separate containers:</p>
+    <ul>
+      <li><b>Security:</b> Tenant A must not be able to read Tenant B&rsquo;s GPU memory,
+          intercept their communication, or interfere with their workload.</li>
+      <li><b>Billing:</b> Each tenant&rsquo;s GPU usage must be independently measurable.</li>
+      <li><b>Compliance:</b> Regulated industries require provable isolation boundaries.</li>
+      <li><b>Fault isolation:</b> Tenant A&rsquo;s crash must not affect Tenant B.</li>
+    </ul>
+
+    <h3>6.3 But Each Tenant May Need Multiple GPUs with High-Bandwidth Communication</h3>
+
+    <p>Consider a concrete scenario on a GB200 NVL72 rack (72 GPUs):</p>
+
+    <pre>
+  GB200 NVL72 Rack (72 GPUs, one NVLink domain):
+
+  Tenant A: Llama-70B serving (TP=8)  &rarr; needs 8 GPUs with NVLink
+  Tenant B: Training job              &rarr; needs 32 GPUs with NVLink
+  Tenant C: Mistral-7B serving (TP=2) &rarr; needs 2 GPUs with NVLink
+  Tenant D: Batch inference           &rarr; needs 16 GPUs with NVLink
+  Free: 14 GPUs
+
+  Each tenant's GPUs are in isolated containers (security, billing).
+  All 72 GPUs share ONE NVLink domain (1.8 TB/s per GPU).
+
+  Problem: Tenant A's 8 GPUs are in separate containers from Tenant B's 32.
+           But WITHIN each tenant, the GPUs also need NVLink communication.
+           If each tenant's GPUs are in separate containers (for fault isolation,
+           elasticity), then intra-tenant GPU communication also breaks.</pre>
+
+    <p>The multi-tenancy scenario has two levels:</p>
+    <ol>
+      <li><b>Inter-tenant isolation:</b> Tenant A&rsquo;s containers must not communicate with
+          Tenant B&rsquo;s containers (unless explicitly authorized). This is a security requirement.</li>
+      <li><b>Intra-tenant communication:</b> Within a tenant, multiple GPUs (possibly in
+          separate containers for fault isolation/elasticity) must communicate at NVLink bandwidth.
+          This is a performance requirement.</li>
+    </ol>
+
+    <p>Today, there is no way to achieve both.</p>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 7: SYNTHESIS                                         -->
+    <!-- ============================================================ -->
+
+    <h2>7. Synthesis: Why Per-GPU Containers Are Inevitable</h2>
+
+    <p>The five evidence pillars converge on the same conclusion:</p>
+
+    <table>
+      <thead>
+        <tr><th>Pillar</th><th>Force</th><th>Why It Requires Per-GPU Containers</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>1. GPU failures</b></td>
+          <td>Hardware reality</td>
+          <td>9% annualized GPU failure rate. Per-GPU containers reduce failure blast radius
+              from 8 GPUs to 1 GPU. Critical at scale (100K+ GPUs).</td>
+        </tr>
+        <tr>
+          <td><b>2. Hardware trajectory</b></td>
+          <td>Architecture trend</td>
+          <td>NVLink domains growing from 8 to 72 to 576+ GPUs. Multiple jobs <b>must</b>
+              share the domain. NVIDIA already building toward &ldquo;many single-GPU pods.&rdquo;</td>
+        </tr>
+        <tr>
+          <td><b>3. Utilization crisis</b></td>
+          <td>Economic pressure</td>
+          <td>20&ndash;30% GPU utilization wastes billions. GPU-level bin-packing requires
+              GPU-level allocation units (containers).</td>
+        </tr>
+        <tr>
+          <td><b>4. Elastic scheduling</b></td>
+          <td>Workload dynamics</td>
+          <td>Adding/removing GPUs at runtime requires independent GPU lifecycle.
+              Published systems (Tenplex, NTP, Singularity) all assume this.</td>
+        </tr>
+        <tr>
+          <td><b>5. Multi-tenancy</b></td>
+          <td>Economic + security</td>
+          <td>Shared GPU nodes require tenant isolation. Each tenant&rsquo;s GPUs must be
+              in separate containers, but still communicate at NVLink bandwidth.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="highlight-box">
+      <p style="margin:0"><b>The thesis:</b> Per-GPU containers are not a speculative idea &mdash;
+         they are being driven by five independent forces (hardware failures, architecture trends,
+         utilization economics, workload dynamics, and multi-tenancy requirements). NVIDIA is
+         already building toward this future (ComputeDomains, DRA, KAI Scheduler). But their
+         solution is proprietary and limited to newest hardware. <b>The research question is:
+         what challenges does the per-GPU container paradigm create, and how do we solve them
+         in a general, vendor-agnostic way?</b></p>
+    </div>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 8: THE CHALLENGES                                    -->
+    <!-- ============================================================ -->
+
+    <h2>8. The Challenges (Research Problem Space)</h2>
+
+    <p>If per-GPU containers are the future, what breaks? This is where the research lies.
+       We identify the challenges here but do not prescribe solutions &mdash; those should
+       emerge from systematic study.</p>
+
+    <h3>Challenge 1: High-Bandwidth Inter-Container GPU Communication</h3>
+    <p>GPU CCLs (NCCL, RCCL, oneCCL) assume shared OS namespaces for intra-node
+       communication. Container isolation breaks this assumption, causing fallback to
+       TCP/socket (2&ndash;10&times; bandwidth loss). Recovering native interconnect bandwidth
+       (NVLink, Infinity Fabric, Xe Link) across container boundaries is the primary
+       technical challenge.</p>
+    <p><i>What we already know:</i> Our exp1&ndash;2 showed this is solvable on NVIDIA
+       (cuMem FD passing). But is it solvable on AMD? Intel? Is there a universal mechanism?
+       What is the minimal intervention?</p>
+
+    <h3>Challenge 2: Topology Virtualization</h3>
+    <p>Each per-GPU container sees only its own GPU. The CCL cannot discover the full
+       interconnect topology (NVLink mesh, PCIe hierarchy, NUMA affinity). Without this,
+       even if communication is restored, the CCL may choose suboptimal algorithms
+       (e.g., ring instead of tree, or wrong ring order).</p>
+
+    <h3>Challenge 3: Elastic Reconfiguration</h3>
+    <p>When a GPU is added or removed (due to elasticity or failure), the communication
+       group must be reconfigured. In monolithic containers, this requires restarting the
+       entire job. Per-GPU containers should enable online reconfiguration, but the
+       mechanisms for this (NCCL communicator resize, state migration) are poorly understood.</p>
+
+    <h3>Challenge 4: Security Model</h3>
+    <p>Per-GPU containers with cross-container GPU communication partially re-opens the
+       isolation boundary. What is the security model? Can a malicious container exploit
+       the communication channel to access another container&rsquo;s GPU memory? How do we
+       provide communication without sacrificing isolation guarantees?</p>
+
+    <h3>Challenge 5: Scheduling and Placement</h3>
+    <p>The scheduler must understand both physical GPU topology (which GPUs share NVLink)
+       and logical communication groups (which containers need to communicate). Placing
+       communicating containers on GPUs that share NVLink is essential for performance.
+       Existing K8s schedulers (Kueue, Volcano, KAI) have topology awareness at the node
+       level, but not at the per-GPU level within a shared NVLink domain.</p>
+
+    <div class="info-box">
+      <p style="margin:0"><b>Note:</b> Communication recovery (Challenge 1) is the challenge we have
+         the most experience with (exp1&ndash;2). But it is only one of five challenges.
+         The research plan should ultimately address as many of these as feasible, with
+         communication as the starting point since we have a head start.</p>
+    </div>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 9: CONCRETE SETTINGS                                 -->
+    <!-- ============================================================ -->
+
+    <h2>9. Three Concrete Settings to Anchor the Research</h2>
+
+    <p>The five evidence pillars (Sections 2&ndash;6) establish <i>why</i> per-GPU containers
+       are needed. But a strong research project needs a <b>specific workload</b> where we can
+       demonstrate the need end-to-end: the workload works today &rarr; a real operational need
+       forces per-GPU containers &rarr; something breaks &rarr; we study and fix it. Below are
+       three candidates, each grounded in a real system and a real problem.</p>
+
+
+    <h3>Setting A: Elastic Expert Parallelism for MoE Serving (vLLM + DeepSeek)</h3>
+
+    <div style="background:#f5f5f5;border-left:4px solid #1565c0;padding:8px 12px;margin:20px 0 12px;font-size:15px;font-weight:bold;">
+      &ldquo;DeepSeek-V3 serving on 32 GPUs needs to scale down to 16 during off-peak.
+      Today this requires a full restart. Per-GPU containers would make it zero-downtime.&rdquo;
+    </div>
+
+    <h4>The workload</h4>
+    <p>Serving DeepSeek-V3/R1 (Mixture-of-Experts, 671B parameters) with Expert Parallelism
+       (EP) on 32+ GPUs. This is the hottest deployment pattern in LLM serving (2025&ndash;2026).
+       vLLM, SGLang, and NVIDIA Dynamo all support it.</p>
+
+    <h4>Why per-GPU containers become necessary</h4>
+    <p>MoE inference demand is highly bursty. During peak, you need 32 GPUs (EP=32) for
+       throughput. During off-peak, 16 GPUs suffice. Keeping 32 GPUs allocated 24/7 wastes
+       ~50% of GPU-hours. You need to <b>dynamically add and remove GPUs from a running
+       serving instance</b>.</p>
+
+    <h4>What breaks today</h4>
+    <ul>
+      <li><b>vLLM (current):</b> Scaling EP up or down requires a <b>full process restart</b>
+          with new configuration. vLLM&rsquo;s RFC #20323 (&ldquo;Elastic Expert Parallelism&rdquo;)
+          explicitly identifies this: &ldquo;The only viable solution today is to perform a
+          complete restart with a new configuration, which is quite slow and would drop a lot
+          of traffic.&rdquo;</li>
+      <li><b>SGLang EEP (2026-03):</b> SGLang&rsquo;s Elastic Expert Parallelism reduces
+          the scaling interruption from 2&ndash;3 minutes to ~10 seconds, but still interrupts
+          service and drops requests during reconfiguration. Tested with DeepSeek V3.2 on
+          32 GPUs (4 nodes), tolerating up to 16 rank failures.</li>
+      <li><b>Monolithic container limit:</b> In a single 32-GPU container, you cannot remove
+          16 GPUs without killing the container. K8s has no mechanism to shrink a container&rsquo;s
+          GPU allocation at runtime (In-Place Pod Resize does not yet support GPU resources).</li>
+    </ul>
+
+    <h4>How per-GPU containers solve it</h4>
+    <pre>
+  Peak (32 GPUs, EP=32):
+  [C0][C1][C2]...[C31]   &larr; 32 per-GPU containers, each hosts experts
+       NVLink mesh
+
+  Scale down to 16 (off-peak):
+  [C0][C1][C2]...[C15]   &larr; K8s removes 16 containers
+  Experts redistributed   &larr; EPLB (vLLM's load balancer) reshuffles
+  Remaining 16 continue   &larr; zero downtime, no dropped requests
+
+  Scale back up to 32 (next peak):
+  [C0][C1]...[C15][C16]...[C31]  &larr; K8s adds 16 new containers
+  Experts loaded into new containers
+  Standard K8s horizontal pod autoscaler (HPA)</pre>
+
+    <h4>The challenges this creates</h4>
+    <ol>
+      <li><b>Cross-container expert-to-expert communication.</b> EP requires all-to-all
+          communication between GPUs (experts route tokens to each other). With per-GPU
+          containers, this all-to-all must cross container boundaries at NVLink bandwidth.</li>
+      <li><b>Dynamic group membership.</b> When GPUs join or leave, the NCCL communicator
+          must be resized or recreated without disrupting ongoing inference.</li>
+      <li><b>Expert state migration.</b> When a GPU is removed, its experts must be
+          redistributed to remaining GPUs. When a GPU is added, experts must be loaded.</li>
+    </ol>
+
+    <h4>Evidence and references</h4>
+    <ul>
+      <li>vLLM RFC: <a href="https://github.com/vllm-project/vllm/issues/20323">Elastic Expert Parallelism (#20323)</a></li>
+      <li>SGLang EEP: <a href="https://www.lmsys.org/blog/2026-03-25-eep-partial-failure-tolerance/">Elastic EP: Partial Failure Tolerance for DeepSeek</a> (LMSYS, 2026-03)</li>
+      <li>vLLM NIXL-EP integration: <a href="https://github.com/vllm-project/vllm/releases">vLLM releases</a> (#35627)</li>
+      <li>Red Hat + vLLM wide EP: <a href="https://developers.redhat.com/articles/2025/09/08/scaling-deepseek-style-moes-vllm-and-llm-d-using-wide-ep">Scaling DeepSeek-style MoEs</a></li>
+      <li>vLLM large-scale serving: <a href="https://blog.vllm.ai/2025/12/17/large-scale-serving.html">DeepSeek @ 2.2k tok/s/H200</a></li>
+    </ul>
+
+    <div class="highlight-box">
+      <p style="margin:0"><b>Why this setting is strong:</b> (1) It is the <b>most active area in LLM
+         serving right now</b> &mdash; DeepSeek MoE is the dominant model architecture. (2) The
+         problem is <b>explicitly identified by vLLM</b> (RFC #20323) as unsolved. (3) The
+         solution maps directly to standard K8s patterns (HPA, rolling updates). (4) It requires
+         solving the cross-container GPU communication problem as a prerequisite.</p>
+    </div>
+
+
+    <h3>Setting B: Disaggregated Prefill/Decode Serving (DistServe Model)</h3>
+
+    <div style="background:#f5f5f5;border-left:4px solid #1565c0;padding:8px 12px;margin:20px 0 12px;font-size:15px;font-weight:bold;">
+      &ldquo;Prefill and decode need separate GPU groups for independent scaling.
+      But KV cache transfer between them needs NVLink on the same node.
+      Container isolation breaks this.&rdquo;
+    </div>
+
+    <h4>The workload</h4>
+    <p>LLM serving with prefill/decode disaggregation (DistServe, OSDI &rsquo;24; Splitwise,
+       ISCA &rsquo;24). Prefill processes the input prompt (compute-bound, needs FLOPS).
+       Decode generates tokens one at a time (memory-bound, needs HBM bandwidth). Separating
+       them onto different GPU groups allows independent scaling and hardware specialization.</p>
+
+    <p><b>Industry adoption (2026):</b> &ldquo;Almost every production-grade LLM serving
+       framework &mdash; NVIDIA Dynamo, llm-d, Ray Serve LLM, SGLang, vLLM, LMCache,
+       MoonCake &mdash; runs on disaggregation.&rdquo;
+       (<a href="https://haoailab.com/blogs/distserve-retro/">Hao AI Lab retrospective</a>)</p>
+
+    <h4>Why per-GPU containers become necessary</h4>
+    <p>Prefill and decode have different scaling needs:</p>
+    <ul>
+      <li><b>Prefill:</b> Scales with input length and request rate. Bursty.</li>
+      <li><b>Decode:</b> Scales with concurrent sessions. More stable.</li>
+    </ul>
+    <p>To scale them independently, they <b>must be in separate containers</b> (separate pods
+       in K8s, separate scaling groups). You cannot independently scale a sub-process within
+       a monolithic container using K8s primitives.</p>
+
+    <h4>What breaks today</h4>
+    <p>The critical data transfer between prefill and decode is the <b>KV cache</b>.
+       DistServe&rsquo;s own design notes:</p>
+
+    <div class="info-box">
+      <p style="margin:0">&ldquo;DistServe requires the prefill and decoding instance to maintain
+         the same stage on one machine, enabling the use of <b>intra-node NVLink bandwidth</b>
+         for transmission, thus significantly reducing transmission delay.&rdquo;
+         &mdash; DistServe (OSDI &rsquo;24)</p>
+    </div>
+
+    <p>The dilemma:</p>
+    <table>
+      <thead>
+        <tr><th>Option</th><th>Independent Scaling?</th><th>KV Cache Transfer Speed</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Same container (all GPUs)</td>
+          <td style="color:#c44e52;">No</td>
+          <td style="color:#2e7d32;">NVLink (600 GB/s)</td>
+        </tr>
+        <tr>
+          <td>Separate containers, same node</td>
+          <td style="color:#2e7d32;">Yes</td>
+          <td style="color:#c44e52;">TCP fallback (~10 GB/s) &mdash; <b>NCCL breaks</b></td>
+        </tr>
+        <tr>
+          <td>Separate containers, different nodes</td>
+          <td style="color:#2e7d32;">Yes</td>
+          <td style="color:#e65100;">InfiniBand (~50 GB/s) &mdash; works but wastes NVLink</td>
+        </tr>
+        <tr>
+          <td style="color:#1565c0;"><b>Separate containers, same node, NVLink recovered</b></td>
+          <td style="color:#2e7d32;"><b>Yes</b></td>
+          <td style="color:#2e7d32;"><b>NVLink (600 GB/s)</b></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h4>The challenges this creates</h4>
+    <ol>
+      <li><b>Cross-container KV cache transfer at NVLink bandwidth.</b> The prefill container
+          must send KV cache to the decode container via NVLink, not TCP.</li>
+      <li><b>Within each container, TP still needs NVLink.</b> A prefill group of 4 GPUs
+          uses tensor parallelism internally, requiring NVLink within the group. If these 4
+          GPUs are in per-GPU containers (for fault isolation or fine-grained scheduling),
+          the TP communication also breaks.</li>
+      <li><b>Dynamic assignment.</b> GPUs may shift between prefill and decode pools based
+          on load. This requires reconfiguring communication groups.</li>
+    </ol>
+
+    <h4>Evidence and references</h4>
+    <ul>
+      <li>DistServe: <a href="https://haoailab.com/blogs/distserve/">OSDI &rsquo;24</a> + <a href="https://haoailab.com/blogs/distserve-retro/">18-month retrospective</a></li>
+      <li>Splitwise: ISCA &rsquo;24, 2.35&times; throughput under same cost</li>
+      <li>NVIDIA Dynamo + NIXL: <a href="https://docs.vllm.ai/en/stable/serving/parallelism_scaling/">vLLM PD disaggregation docs</a></li>
+      <li>Gimlet Labs: <a href="https://gimletlabs.ai/blog/multivendor-prefill-decode-disaggregation">Multi-vendor prefill-decode disaggregation</a></li>
+    </ul>
+
+    <div class="highlight-box">
+      <p style="margin:0"><b>Why this setting is strong:</b> (1) Disaggregated serving is <b>already
+         universal</b> in production LLM systems. (2) The NVLink requirement is explicitly stated
+         by DistServe. (3) The tension (independent scaling needs containers, NVLink needs shared
+         namespace) is structural and unavoidable. (4) The workload is clearly defined (KV cache
+         transfer between two GPU groups).</p>
+    </div>
+
+
+    <h3>Setting C: GPU-Granular Preemption in Shared K8s Clusters</h3>
+
+    <div style="background:#f5f5f5;border-left:4px solid #1565c0;padding:8px 12px;margin:20px 0 12px;font-size:15px;font-weight:bold;">
+      &ldquo;A high-priority job needs 4 GPUs. Today K8s must kill an entire 8-GPU training job.
+      Per-GPU containers would allow reclaiming exactly the GPUs needed.&rdquo;
+    </div>
+
+    <h4>The workload</h4>
+    <p>A shared K8s GPU cluster with multiple priority levels. Training jobs (low priority,
+       batch, preemptible) and serving jobs (high priority, latency-sensitive, non-preemptible)
+       share the same GPUs. When a high-priority job arrives and no free GPUs exist, the
+       scheduler must preempt lower-priority work.</p>
+
+    <h4>Why per-GPU containers become necessary</h4>
+    <p>Today, K8s preemption operates at the <b>pod level</b>. A pod requesting 8 GPUs is
+       either running or killed &mdash; there is no partial preemption. This leads to waste:</p>
+
+    <pre>
+  Shared cluster, 16 GPUs across 2 nodes:
+
+  Node 1: [Training Job A: 8 GPUs, low priority]
+  Node 2: [Training Job B: 8 GPUs, low priority]
+
+  High-priority serving job arrives, needs 4 GPUs.
+
+  Today (pod-level preemption):
+    Kill Job A entirely (frees 8 GPUs).
+    4 GPUs used by new serving job, 4 GPUs idle.
+    Job A must checkpoint + restart on remaining resources.
+    Waste: 4 GPUs idle + Job A restart cost.
+
+  With per-GPU containers:
+    Preempt 4 of Job A's per-GPU containers.
+    Job A reconfigures to 4 GPUs (NTP-style, continues training).
+    Serving job takes the freed 4 GPUs.
+    Waste: zero idle GPUs. No full restart.</pre>
+
+    <h4>What breaks today</h4>
+    <ul>
+      <li><b>K8s has no partial GPU preemption.</b> The
+          <a href="https://www.cncf.io/blog/2026/01/20/reclaiming-underutilized-gpus-in-kubernetes-using-scheduler-plugins/">ReclaimIdleResource plugin</a>
+          (CNCF, 2026) and NVIDIA KAI Scheduler both reclaim GPUs by <b>killing entire pods</b>.
+          There is no mechanism to remove one GPU from a multi-GPU pod.</li>
+      <li><b>Training frameworks cannot shrink at runtime.</b> PyTorch Distributed Elastic
+          and Horovod Elastic support dynamic <b>data parallelism</b> only (add/remove replicas).
+          They cannot change tensor or pipeline parallelism without restart.
+          Tenplex (SOSP &rsquo;24) is the only system that supports runtime TP/PP changes,
+          but reconfiguration takes ~122 seconds for a 16&rarr;8 GPU resize.</li>
+      <li><b>NTP (2025) enables continued training on fewer GPUs</b> after failure, but assumes
+          the failure is detected and handled at the process level, not the container level.</li>
+    </ul>
+
+    <h4>The challenges this creates</h4>
+    <ol>
+      <li><b>Cross-container collective communication after group shrink.</b> After 4 of 8
+          per-GPU containers are preempted, the remaining 4 must reform the NCCL communicator
+          and continue training with a new parallelism configuration.</li>
+      <li><b>Rapid reconfiguration.</b> The preemption must be fast (&lt;10s) to be
+          practical. Full NCCL re-initialization takes seconds; can we do better?</li>
+      <li><b>Checkpoint integration.</b> The preempted GPUs&rsquo; state must be saved (or
+          the training algorithm must tolerate partial loss, as in NTP).</li>
+    </ol>
+
+    <h4>Evidence and references</h4>
+    <ul>
+      <li>CNCF: <a href="https://www.cncf.io/blog/2026/01/20/reclaiming-underutilized-gpus-in-kubernetes-using-scheduler-plugins/">ReclaimIdleResource: Reclaiming underutilized GPUs in K8s</a> (2026-01)</li>
+      <li>NVIDIA KAI Scheduler: reclamation + preemption, but pod-level only</li>
+      <li>NTP: <a href="https://arxiv.org/html/2504.06095v1">Nonuniform-Tensor-Parallelism</a> (arXiv 2025)</li>
+      <li>Tenplex: <a href="https://arxiv.org/html/2312.05181v2">SOSP &rsquo;24</a>, 122s reconfiguration for 16&rarr;8 GPU resize</li>
+    </ul>
+
+    <div class="highlight-box">
+      <p style="margin:0"><b>Why this setting is strong:</b> (1) GPU underutilization (20&ndash;30%)
+         is the industry&rsquo;s #1 infrastructure problem. (2) Preemption is the key mechanism for
+         improving utilization, but today it&rsquo;s too coarse. (3) The problem is confirmed by
+         CNCF and NVIDIA as unsolved at the K8s level. (4) Published systems (NTP, Tenplex) show
+         the framework-level support is emerging but the container-level support is missing.</p>
+    </div>
+
+
+    <h3>Comparing the Three Settings</h3>
+
+    <table>
+      <thead>
+        <tr><th>Aspect</th><th>Setting A: Elastic EP</th><th>Setting B: Disaggregated P/D</th><th>Setting C: GPU Preemption</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Specificity</b></td>
+          <td>Very specific: vLLM + DeepSeek MoE</td>
+          <td>Specific: any disaggregated LLM serving</td>
+          <td>General: any shared GPU cluster</td>
+        </tr>
+        <tr>
+          <td><b>Timeliness</b></td>
+          <td style="color:#2e7d32;">Hottest topic in 2026</td>
+          <td style="color:#2e7d32;">Already standard practice</td>
+          <td style="color:#e65100;">Emerging (not yet standard)</td>
+        </tr>
+        <tr>
+          <td><b>&ldquo;Must use per-GPU containers&rdquo; strength</b></td>
+          <td style="color:#2e7d32;">Strong: cannot shrink a 32-GPU container</td>
+          <td style="color:#2e7d32;">Strong: independent scaling needs separate containers</td>
+          <td style="color:#2e7d32;">Strong: K8s preemption is pod-level only</td>
+        </tr>
+        <tr>
+          <td><b>End-to-end demo feasibility</b></td>
+          <td style="color:#e65100;">Medium: requires MoE model (DeepSeek), 32+ GPUs</td>
+          <td style="color:#2e7d32;">High: can demo with any model + KV cache transfer</td>
+          <td style="color:#e65100;">Medium: requires scheduler integration + training framework</td>
+        </tr>
+        <tr>
+          <td><b>Communication challenge</b></td>
+          <td>All-to-all (expert routing) across containers</td>
+          <td>Point-to-point (KV cache) between two container groups</td>
+          <td>Allreduce within dynamic container group</td>
+        </tr>
+        <tr>
+          <td><b>Paper narrative</b></td>
+          <td>&ldquo;Zero-downtime elastic MoE serving via per-GPU containers&rdquo;</td>
+          <td>&ldquo;NVLink-speed disaggregated serving without sacrificing isolation&rdquo;</td>
+          <td>&ldquo;GPU-granular preemption for efficient cluster scheduling&rdquo;</td>
+        </tr>
+        <tr>
+          <td><b>Hardware needed</b></td>
+          <td>32+ GPUs (multi-node ideal)</td>
+          <td>4&ndash;8 GPUs (single node sufficient)</td>
+          <td>8+ GPUs (single node sufficient)</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="info-box">
+      <p style="margin:0"><b>Recommendation for mentor discussion:</b> All three settings are viable.
+         Setting B (disaggregated P/D) is the easiest to demo on our hardware (node192, 4&times;A100).
+         Setting A (elastic EP) is the most timely and impactful but requires more GPUs.
+         Setting C (preemption) has the broadest impact but requires the most system-building
+         (scheduler + framework integration). A strong paper could <b>use one as the primary
+         setting</b> and show that the same mechanisms also enable the other two.</p>
+    </div>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 10: POSITIONING VS RELATED WORK                      -->
+    <!-- ============================================================ -->
+
+    <h2>10. Positioning: What Exists vs What&rsquo;s Missing</h2>
+
+    <table>
+      <thead>
+        <tr><th>Existing Work</th><th>What It Addresses</th><th>What It Does NOT Address</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>NVIDIA ComputeDomains + IMEX</b></td>
+          <td>Cross-container NVLink on GB200</td>
+          <td>GB200-only. NVIDIA-proprietary. No A100/H100 support.
+              No AMD/Intel. No general mechanism.</td>
+        </tr>
+        <tr>
+          <td><b>K8s DRA</b></td>
+          <td>Per-GPU device allocation</td>
+          <td>Allocation only, not communication. No mechanism for cross-container
+              GPU IPC once GPUs are allocated.</td>
+        </tr>
+        <tr>
+          <td><b>NVIDIA KAI Scheduler</b></td>
+          <td>Topology-aware GPU scheduling, bin-packing</td>
+          <td>Scheduling only. Assumes intra-job communication works.
+              Does not address the communication problem.</td>
+        </tr>
+        <tr>
+          <td><b>Tenplex / NTP / Oobleck</b></td>
+          <td>Elastic/resilient training at the framework level</td>
+          <td>Assume that GPU communication works (they use NCCL/Gloo).
+              If communication breaks under containers, these systems break too.</td>
+        </tr>
+        <tr>
+          <td><b>TGS / Orion / Paella</b></td>
+          <td>GPU sharing within a single container</td>
+          <td>Intra-container GPU multiplexing, not inter-container communication.</td>
+        </tr>
+        <tr>
+          <td><b>HetCCL / UCCL</b></td>
+          <td>Cross-vendor GPU communication via RDMA</td>
+          <td>Inter-node (RDMA), not intra-node (P2P). Do not address
+              container isolation.</td>
+        </tr>
+        <tr>
+          <td><b>FreeFlow</b> (NSDI &rsquo;19)</td>
+          <td>RDMA virtualization in containers</td>
+          <td>CPU RDMA, not GPU P2P. Closest architectural analog to our
+              problem but for a different subsystem.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="warning-box">
+      <p style="margin:0"><b>The gap:</b> The industry is building the pieces (per-GPU allocation via DRA,
+         topology-aware scheduling via KAI, elastic frameworks via Tenplex) but <b>none of them
+         solve the communication problem</b> that arises when GPUs in separate containers need
+         to talk at NVLink bandwidth. NVIDIA&rsquo;s ComputeDomains solve it for one vendor on
+         one hardware generation. Nobody has studied whether this is solvable in general.</p>
+    </div>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 10: WHAT THIS ENABLES                                -->
+    <!-- ============================================================ -->
+
+    <h2>11. What Per-GPU Containers Would Enable</h2>
+
+    <p>If the challenges are solved, per-GPU containers unlock capabilities that
+       monolithic containers fundamentally cannot provide:</p>
+
+    <table>
+      <thead>
+        <tr><th>Capability</th><th>Monolithic Container</th><th>Per-GPU Container</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Fault blast radius</b></td>
+          <td>1 GPU fails &rarr; 8 GPUs lost</td>
+          <td>1 GPU fails &rarr; 1 GPU lost</td>
+        </tr>
+        <tr>
+          <td><b>Preemption granularity</b></td>
+          <td>Must preempt all 8 GPUs</td>
+          <td>Preempt exactly N GPUs needed</td>
+        </tr>
+        <tr>
+          <td><b>Elasticity</b></td>
+          <td>Resize requires full restart</td>
+          <td>Add/remove GPUs online</td>
+        </tr>
+        <tr>
+          <td><b>Multi-tenancy</b></td>
+          <td>One tenant per node</td>
+          <td>Multiple tenants per node, isolated</td>
+        </tr>
+        <tr>
+          <td><b>Bin-packing efficiency</b></td>
+          <td>Node-level granularity</td>
+          <td>GPU-level granularity (50%+ improvement in allocation)</td>
+        </tr>
+        <tr>
+          <td><b>Rolling updates</b></td>
+          <td>Restart all GPUs</td>
+          <td>Update individual GPUs, canary deploy</td>
+        </tr>
+        <tr>
+          <td><b>K8s integration</b></td>
+          <td>GPU workloads are &ldquo;special&rdquo;</td>
+          <td>GPU workloads use standard K8s patterns (rolling update,
+              horizontal scaling, health checks per container)</td>
+        </tr>
+      </tbody>
+    </table>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 11: SUMMARY                                          -->
+    <!-- ============================================================ -->
+
+    <h2>12. Summary</h2>
+
+    <div class="highlight-box">
+      <p style="margin:0"><b>Per-GPU containers are not a solution looking for a problem.</b>
+         They are demanded by five independent, well-evidenced forces: GPU hardware failure
+         rates (9% annualized, one failure every 3 hours at 16K GPUs), dissolving node
+         boundaries (GB200 NVL72: 72 GPUs per NVLink domain), catastrophic GPU utilization
+         (20&ndash;30% in production), elastic scheduling requirements (Tenplex, NTP, Singularity),
+         and multi-tenancy economics. NVIDIA is already building toward this future with
+         ComputeDomains and DRA. The research opportunity is to study and solve the challenges
+         this paradigm shift creates &mdash; starting with the most fundamental one: recovering
+         high-bandwidth GPU communication across container isolation boundaries.</p>
+    </div>
+
+
+    <hr style="margin:32px 0;">
+    <p style="font-size:12px;color:#666;text-align:center;">
+      Research Plan v3 &middot; 2026-04-10 &middot; Motivation and setting only. Experiments TBD.
+    </p>
+
+  </main>
+</body>
+</html>
