@@ -1,0 +1,35 @@
+# Phase 2: Multi-GPU Container (Production Approach)
+#
+# Single container with all 4 GPUs — the standard production deployment.
+# This tests whether Tenplex's elasticity provides cluster-level benefit
+# when running inside a monolithic container.
+#
+# Usage:
+#   docker compose -f compose.phase2.yml up -d
+#   docker exec -it exp-a1-multi bash
+#   # ... run training, trigger elastic resize, observe
+#   docker compose -f compose.phase2.yml down
+
+services:
+  multi:
+    container_name: exp-a1-multi
+    image: xtrans-exp-a1:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NCCL_DEBUG=INFO
+    shm_size: "8g"
+    volumes:
+      - ..:/workspace/xtrans:ro       # Mount project for scripts/common
+      - ./results:/workspace/results   # Persist results
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: sleep infinity

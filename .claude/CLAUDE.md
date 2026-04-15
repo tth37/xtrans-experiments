@@ -2,83 +2,77 @@
 
 ## What This Project Is
 
-An experiment framework for the XTrans research project. NOT the XTrans system
-itself. This contains exploration code, experiment scripts, and shared utilities
-for investigating cross-container GPU communication across vendors.
+An experiment framework for studying what happens when GPU scheduling techniques
+— designed and validated on bare metal — meet containerized production
+environments. The current research plan (v4) selects open-source scheduling
+systems (Tenplex, Oobleck) and progressively containerizes them to discover
+challenges at each stage.
 
-## Research Context
+## Research Plan (v4)
 
-- **exp1/exp2** (in vllm-source) proved NCCL cuMem VMM recovers NVLink bandwidth
-  in per-GPU containers on NVIDIA A100. The exp2 workaround uses env vars
-  (NCCL_HOSTID, NCCL_CUMEM_ENABLE) + shared /dev/shm + host networking.
-- **This project** extends that finding: build a principled LD_PRELOAD shim
-  (not env var hacks), test across NCCL versions, then replicate on AMD/Intel.
-- **Full research plan**: `docs/research_plan.html` — read Section 2 (Feasibility)
-  and Section 6 (Phased Experiments) for experiment details.
+**Document:** `docs/research_plan_v4.html`
 
-## Key Technical Background
+**Research question:** What happens when GPU scheduling techniques — designed
+for bare metal — are deployed in containerized production environments?
 
-### NCCL's Three Container Gates (from exp2)
+**Motivation (three acts):**
+1. GPU scheduling evolved toward per-GPU granularity (Tenplex, NTP)
+2. Production demands containers (K8s, NVL72, multi-tenancy)
+3. Nobody has studied what happens when these two collide
 
+**Methodology:** Progressive containerization — for each scheduling technique:
+- Phase 1: Bare metal (baseline)
+- Phase 2: Multi-GPU container (production approach) — discover limitations
+- Phase 3: Per-GPU containers (only if motivated by Phase 2) — discover new challenges
+
+Challenges are discovered empirically, not imagined a priori.
+
+## Current Experiments
+
+### Exp A1 (`exp_a1_tenplex/`) — Elastic GPU Scaling
+- **System:** [Tenplex](https://github.com/kungfu-team/tenplex) (SOSP '24)
+- **Operation:** Add/remove GPUs from a running training job at runtime
+- **Key question:** Does framework-level elasticity translate to cluster-level
+  elasticity in containers? Or are freed GPUs trapped?
+
+### Exp A2 (`exp_a2_oobleck/`) — Fault-Tolerant Training
+- **System:** [Oobleck](https://github.com/SymbioticLab/Oobleck) (SOSP '23)
+- **Operation:** Continue training after GPU failure via pipeline templates
+- **Key question:** Does framework-level recovery work when the failure unit
+  is a container, not a process? What is the blast radius?
+
+### Archived (v1-v3 experiments in `archived/`)
+- `exp_a_nccl_gates/` — NCCL gate taxonomy + LD_PRELOAD shim (completed)
+- `exp_a_prime_dmabuf/` — DMA-BUF feasibility spike (completed)
+- `exp_a_double_prime_topo/` — Topology virtualization (scaffold only)
+- `exp_b_rccl/` — AMD RCCL analysis (not started)
+
+These validated that cross-container NCCL communication CAN be recovered
+(100% NVLink bandwidth via LD_PRELOAD shim). The v4 plan pivots from
+"can we recover communication?" to "what happens when real scheduling
+techniques hit the container wall?"
+
+## Technical Background
+
+### NCCL's Three Container Gates
 NCCL checks three things to decide if two GPUs are on the same node:
-1. **hostHash**: `hash(gethostname() + /proc/sys/kernel/random/boot_id)` — must match
-2. **shmDev**: `stat("/dev/shm").st_dev` — must match (same tmpfs mount)
+1. **hostHash**: `hash(gethostname() + /proc/sys/kernel/random/boot_id)`
+2. **shmDev**: `stat("/dev/shm").st_dev`
 3. **IPC socket**: abstract UDS (network-namespace-scoped) for cuMem FD passing
 
 If any gate fails → falls back to TCP/socket (2-10x slower than NVLink).
 
-### The LD_PRELOAD Shim Approach
-
-Intercept `gethostname()` and `stat()` via LD_PRELOAD to make NCCL's gates pass
-in per-GPU containers. Also use bind mounts for /proc/sys/kernel/random/boot_id.
-This is the core mechanism being developed in `common/shim/`.
-
-- NCCL/RCCL/oneCCL are always shared libraries with dynamic libc linkage
-- The intercepted functions are POSIX syscalls called once at init (zero data-path overhead)
-- Published precedent: Trickle (ATC'05), HetCCL (2026), PhoenixOS (SOSP'24)
-
-### Vendor IPC Divergence (key research finding)
-
-| Vendor | IPC Mechanism | Handle Type | Cross-Container Path |
-|--------|--------------|-------------|---------------------|
-| NVIDIA | cuMem VMM | POSIX FD | UDS SCM_RIGHTS (proven) |
-| NVIDIA legacy | cudaIpcMemHandle | Opaque blob | Requires shared IPC NS (blocked) |
-| AMD (RCCL uses) | hsa_amd_ipc_memory_create | Opaque 32B blob | Via /dev/kfd (untested) |
-| AMD (HIP VMM) | hipMemExportToShareableHandle | POSIX FD | Beta API, RCCL disables it |
-| AMD (DMA-BUF) | hsa_amd_portable_export_dmabuf | DMA-BUF FD | Kernel-mature, untested for P2P |
-| Intel L0 | zeMemGetIpcHandle | DMA-BUF FD | oneCCL sockets mode works |
-
-### DMA-BUF Hypothesis
-
-DMA-BUF file descriptors may be a universal cross-container GPU IPC primitive
-(available on NVIDIA, AMD, Intel). Validating this is the Phase 1.5 experiment.
-
-## Experiment Phases
-
-### Exp A (exp_a_nccl_gates/) — NCCL Gate Taxonomy + Shim
-- Syscall tracing under strace to map all gates
-- Build minimal LD_PRELOAD shim to recover NVLink P2P
-- Test across NCCL versions (2.18-2.28)
-- Hardware: node192 (A100)
-- Success: ≥99% NVLink bandwidth without NCCL_* env vars
-
-### Exp A' (exp_a_prime_dmabuf/) — DMA-BUF Feasibility Spike
-- Test DMA-BUF export → FD passing → import → GPU P2P on NVIDIA
-- Compare: native cuMem IPC vs DMA-BUF vs legacy cudaIPC
-- Hardware: node192 (A100)
-- Success: DMA-BUF achieves ≥95% of native cuMem bandwidth
-
-### Exp B (exp_b_rccl/) — AMD RCCL Analysis
-- RCCL source analysis (same three gates as NCCL, cuMem disabled)
-- Test three AMD IPC paths: opaque HSA, DMA-BUF, HIP VMM FD
-- Hardware: AMD MI250X/MI300X (cloud)
+### The LD_PRELOAD Shim (`common/shim/`)
+A 261-line C99 shim that intercepts `gethostname()`, `stat()`, `bind()`, and
+`sendmsg()` to make NCCL's gates pass across container boundaries. Validated
+at 100% NVLink bandwidth (156.8 GB/s AllReduce, 262.4 GB/s raw P2P). This
+is infrastructure for Phase 3 of v4 experiments, not the research itself.
 
 ## Hardware: node192
 
-- 4x NVIDIA A100 80GB with NVLink 3.0 (600 GB/s bidirectional)
-- Available now for Exp A and Exp A'
-- Docker + NVIDIA Container Toolkit installed
-- NCCL 2.21.5 in current container images (can install others)
+- 4x NVIDIA A100-SXM4-40GB with NVLink 3.0 (600 GB/s bidirectional)
+- CUDA 12.4+, NCCL 2.21.5
+- Docker 27.3.1 with NVIDIA Container Toolkit
 
 ## Coding Conventions
 
@@ -87,37 +81,29 @@ DMA-BUF file descriptors may be a universal cross-container GPU IPC primitive
 - Container configs: Docker Compose where possible
 - Results: JSON for structured data, CSV for time series
 - All paths in scripts should be relative to project root
-- Docker image tags: `tth37/xtrans-experiments:<experiment>` (e.g., `tth37/xtrans-experiments:expa-benchmark`)
+- Docker image tags: `tth37/xtrans-experiments:<experiment>`
 
 ## Experiment Reports
 
 Each experiment produces an `analysis_report.html` following a standardized format.
 
-- **Template**: `docs/report_template.html` — copy into experiment dir to start a report
+- **Template**: `docs/report_template.html` — copy into experiment dir to start
 - **Guide**: `docs/report_guide.md` — section structure, style rules, checklist
-- **Examples**: exp1 and exp2 reports in vllm-source (the template is derived from these)
 
-Report structure (required sections):
-1. **Objective** — hypothesis + green highlight-box with one-sentence result
-2. **Background** — (optional) context for the experiment
-3. **Experimental Setup** — hardware table + software table with exact versions
-4. **Configurations Under Test** — table of all configs being compared
-5. **Results** — data tables with "vs Baseline" column, figures in `analysis_assets/`
-6. **Analysis** — (optional) deeper interpretation, limitations
-7. **Conclusions** — numbered findings, each one sentence; blue info-box with next steps
-8. **Appendices** — full data tables, separated by `<hr class="appendix">`
-
-Three callout box types:
-- `highlight-box` (green): key results
-- `warning-box` (orange): limitations, risks
-- `info-box` (blue): context, next steps
+Report structure: Objective, Background, Setup, Configurations, Results,
+Analysis, Conclusions, Appendices.
 
 ## File Locations
 
-- Research plan: `docs/research_plan.html`
+- Research plan (current): `docs/research_plan_v4.html`
+- Prior plans: `docs/research_plan.html`, `docs/research_plan_v2.html`, `docs/research_plan_v3.html`
 - Report template: `docs/report_template.html`
 - Report guide: `docs/report_guide.md`
-- Shim source: `common/shim/`
+- LD_PRELOAD shim: `common/shim/`
 - Container helpers: `common/containers/`
-- Benchmark harness: `common/benchmarks/`
-- Per-experiment code: `exp_a_*/`, `exp_b_*/`
+- NCCL benchmark: `common/benchmarks/`
+- Observation recorder: `common/harness/record_observation.py`
+- Phase comparison: `common/harness/compare_phases.py`
+- Exp A1 (Tenplex): `exp_a1_tenplex/`
+- Exp A2 (Oobleck): `exp_a2_oobleck/`
+- Archived experiments: `archived/`

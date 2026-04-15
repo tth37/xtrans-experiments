@@ -1,0 +1,83 @@
+# Phase 3: Per-GPU Containers
+#
+# Each GPU in its own isolated container. Scaling is expressed as
+# container lifecycle: scale-down = stop containers, scale-up = start new ones.
+#
+# Usage:
+#   docker compose -f compose.phase3.yml up -d
+#   # ... launch distributed training across containers
+#
+#   # Scale down: stop GPU 2 and 3
+#   docker stop exp-a1-gpu2 exp-a1-gpu3
+#
+#   # Scale up: restart them (or start new ones)
+#   docker start exp-a1-gpu2 exp-a1-gpu3
+#
+#   docker compose -f compose.phase3.yml down
+
+x-gpu-common: &gpu-common
+  image: xtrans-exp-a1:latest
+  build:
+    context: .
+    dockerfile: Dockerfile
+  runtime: nvidia
+  environment:
+    - NCCL_DEBUG=INFO
+    # Workaround Level 3: uncomment to load the LD_PRELOAD shim
+    # - LD_PRELOAD=/workspace/xtrans/common/shim/libxtrans_shim.so
+    # - XTRANS_HOSTNAME=node192
+    # - XTRANS_UDS_DIR=/tmp/xtrans-uds
+    # - XTRANS_VERBOSE=1
+  shm_size: "1g"
+  volumes:
+    - ..:/workspace/xtrans:ro
+    - ./results:/workspace/results
+    # Workaround Level 3: shared UDS directory for NCCL FD passing
+    # - uds_volume:/tmp/xtrans-uds
+  networks:
+    - exp-a1-net
+
+services:
+  gpu0:
+    <<: *gpu-common
+    container_name: exp-a1-gpu0
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - NCCL_DEBUG=INFO
+    command: sleep infinity
+
+  gpu1:
+    <<: *gpu-common
+    container_name: exp-a1-gpu1
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=1
+      - NCCL_DEBUG=INFO
+    command: sleep infinity
+
+  gpu2:
+    <<: *gpu-common
+    container_name: exp-a1-gpu2
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=2
+      - NCCL_DEBUG=INFO
+    command: sleep infinity
+
+  gpu3:
+    <<: *gpu-common
+    container_name: exp-a1-gpu3
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=3
+      - NCCL_DEBUG=INFO
+    command: sleep infinity
+
+networks:
+  exp-a1-net:
+    driver: bridge
+
+# Workaround Level 3: shared tmpfs for UDS
+# volumes:
+#   uds_volume:
+#     driver: local
+#     driver_opts:
+#       type: tmpfs
+#       device: tmpfs
