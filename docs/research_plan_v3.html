@@ -556,59 +556,206 @@
     <!-- SECTION 5: EVIDENCE PILLAR 4 - ELASTIC SCHEDULING            -->
     <!-- ============================================================ -->
 
-    <h2>5. Evidence Pillar 4: Elastic Scheduling Requires GPU-Granular Containers</h2>
+    <h2>5. Evidence Pillar 4: GPU Scheduling Has Evolved Toward GPU Granularity &mdash; but Stopped at the Container Wall</h2>
 
-    <h3>5.1 The Elasticity Problem</h3>
+    <h3>5.1 The Evolution of GPU Scheduling Granularity</h3>
 
-    <p>GPU workloads have fundamentally different resource needs over time:</p>
-    <ul>
-      <li><b>Inference:</b> Bursty. A serving endpoint sees 10&times; traffic spikes during
-          peak hours. Ideal: scale from 4 GPUs to 8 GPUs during peaks, back to 2 during off-peak.</li>
-      <li><b>Training:</b> Long-running but interruptible. A training job can use more GPUs
-          when available (faster training) and fewer when preempted (slower but continuing).</li>
-      <li><b>Mixed workloads:</b> Training during off-peak, inference during peak. GPUs
-          should flow between workload types dynamically.</li>
-    </ul>
-
-    <h3>5.2 Current Elastic Systems and Their Container Requirements</h3>
+    <p>GPU cluster scheduling research has progressively moved from coarse to fine granularity
+       over the past six years:</p>
 
     <table>
       <thead>
-        <tr><th>System</th><th>What It Does</th><th>What It Needs from Containers</th></tr>
+        <tr><th>Era</th><th>Granularity</th><th>Key Systems</th><th>Scheduling Unit</th></tr>
       </thead>
       <tbody>
         <tr>
-          <td><b>Tenplex</b> (SOSP &rsquo;24)</td>
-          <td>Changes multi-dimensional parallelism (TP+PP+DP) at runtime by
-              re-partitioning model state across GPUs</td>
-          <td>Must add/remove individual GPUs from a running job. With monolithic
-              containers, this requires container recreation (full restart). With
-              per-GPU containers, a GPU can join or leave without disrupting others.</td>
+          <td>2020</td>
+          <td>Node-level</td>
+          <td>HiveD (OSDI &rsquo;20), Gavel (OSDI &rsquo;20), Themis (NSDI &rsquo;20)</td>
+          <td>Allocate whole nodes or GPU groups (&ldquo;cells&rdquo;) to jobs</td>
         </tr>
         <tr>
-          <td><b>NTP</b> (arXiv 2025)</td>
-          <td>Nonuniform tensor parallelism: when a GPU fails in a TP group of 8,
-              redistributes work to remaining 7 GPUs with minimal overhead</td>
-          <td>Must detect and remove a single failed GPU from the TP group without
-              killing the other 7. Per-GPU containers provide exactly this isolation.</td>
+          <td>2021&ndash;22</td>
+          <td>GPU-group-level</td>
+          <td>Pollux (OSDI &rsquo;21), Synergy (OSDI &rsquo;22), AntMan (OSDI &rsquo;20)</td>
+          <td>Dynamically adjust GPU count per job, co-adaptive batch size tuning</td>
         </tr>
         <tr>
-          <td><b>Lyra</b> (EuroSys &rsquo;23)</td>
-          <td>Loans idle inference GPUs for elastic training during off-peak</td>
-          <td>GPUs must be independently assignable between inference and training
-              workloads. Per-GPU containers enable this without node-level preemption.</td>
+          <td>2023&ndash;24</td>
+          <td>GPU-level</td>
+          <td>Sia (SOSP &rsquo;23), CASSINI (NSDI &rsquo;24), Crux (SIGCOMM &rsquo;24)</td>
+          <td>Per-GPU allocation with topology and communication awareness</td>
         </tr>
         <tr>
-          <td><b>Singularity</b> (Microsoft)</td>
-          <td>&ldquo;All jobs are preemptable, migratable, and dynamically resizable
-              by default&rdquo;</td>
-          <td>Requires GPU-granular lifecycle management. Their internal system
-              implements this, but on K8s it would require per-GPU containers.</td>
+          <td>2025+</td>
+          <td>GPU-level (elastic)</td>
+          <td>Tenplex (SOSP &rsquo;24), NTP (arXiv &rsquo;25), KAI Scheduler, Kale (SoCC &rsquo;24)</td>
+          <td>Add/remove individual GPUs from running jobs at runtime</td>
+        </tr>
+        <tr>
+          <td>2025+</td>
+          <td>Sub-GPU</td>
+          <td>LithOS (SOSP &rsquo;25), Tally (ASPLOS &rsquo;25), REEF (OSDI &rsquo;22)</td>
+          <td>TPC-level or thread-block-level partitioning within a single GPU</td>
         </tr>
       </tbody>
     </table>
 
-    <h3>5.3 K8s Is Moving Toward Per-Device Allocation</h3>
+    <div class="warning-box">
+      <p style="margin:0"><b>The critical observation:</b> Every single one of these systems assumes
+         either bare metal or all GPUs within one container. <b>None handles per-GPU scheduling
+         across container boundaries with high-bandwidth communication.</b> The scheduling gets
+         finer, but the container boundary stays monolithic.</p>
+    </div>
+
+    <h3>5.2 What Each System Assumes About Containers</h3>
+
+    <table>
+      <thead>
+        <tr><th>System</th><th>Venue</th><th>Scheduling Granularity</th><th>Container Model</th><th>Handles Cross-Container GPU Comm?</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>HiveD</b></td>
+          <td>OSDI &rsquo;20</td>
+          <td>GPU-group (&ldquo;cells&rdquo; with topology affinity)</td>
+          <td>K8s pods &mdash; all GPUs in one pod</td>
+          <td style="color:#c44e52;">No</td>
+        </tr>
+        <tr>
+          <td><b>Pollux</b></td>
+          <td>OSDI &rsquo;21</td>
+          <td>Per-job GPU count + batch size</td>
+          <td>Bare metal / one container per job</td>
+          <td style="color:#c44e52;">No</td>
+        </tr>
+        <tr>
+          <td><b>Sia</b></td>
+          <td>SOSP &rsquo;23</td>
+          <td>Per-job GPU count, heterogeneity-aware</td>
+          <td>Bare metal / one container per job</td>
+          <td style="color:#c44e52;">No</td>
+        </tr>
+        <tr>
+          <td><b>Tenplex</b></td>
+          <td>SOSP &rsquo;24</td>
+          <td>Dynamic GPU add/remove with TP+PP+DP resize</td>
+          <td>Bare metal (framework-level state management)</td>
+          <td style="color:#c44e52;">No</td>
+        </tr>
+        <tr>
+          <td><b>Singularity</b></td>
+          <td>Microsoft &rsquo;22</td>
+          <td>Dynamic preemption + migration + resize</td>
+          <td>Internal system (not K8s)</td>
+          <td style="color:#c44e52;">No</td>
+        </tr>
+        <tr>
+          <td><b>KAI Scheduler</b></td>
+          <td>NVIDIA &rsquo;25</td>
+          <td>Per-GPU with topology, fractional, bin-packing</td>
+          <td>K8s pods &mdash; all GPUs in one pod</td>
+          <td style="color:#c44e52;">No</td>
+        </tr>
+        <tr>
+          <td><b>LithOS</b></td>
+          <td>SOSP &rsquo;25</td>
+          <td>Sub-GPU (TPC-level partitioning)</td>
+          <td>Bare metal (OS-level GPU management)</td>
+          <td style="color:#c44e52;">No</td>
+        </tr>
+        <tr>
+          <td><b>Tally</b></td>
+          <td>ASPLOS &rsquo;25</td>
+          <td>Thread-block level, LD_PRELOAD interception</td>
+          <td style="color:#2e7d32;"><b>Container-aware</b> (intercepts across containers)</td>
+          <td style="color:#e65100;">Single-GPU sharing only, not multi-GPU distributed</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p><b>Tally</b> (ASPLOS &rsquo;25) is the closest related work to our approach &mdash; it
+       uses LD_PRELOAD to intercept CUDA API calls across container boundaries for GPU sharing
+       with performance isolation (7.2% overhead). But Tally addresses <b>sharing a single GPU</b>
+       between containers, not <b>multi-GPU distributed communication</b> (NCCL allreduce, etc.)
+       across containers. These are fundamentally different problems.</p>
+
+    <h3>5.3 The Elasticity Problem: Framework Support Exists, Container Support Does Not</h3>
+
+    <p>GPU workloads have fundamentally different resource needs over time:</p>
+    <ul>
+      <li><b>Inference:</b> Bursty. 10&times; traffic spikes during peak hours.</li>
+      <li><b>Training:</b> Long-running but interruptible. Can use more GPUs when available.</li>
+      <li><b>Mixed workloads:</b> GPUs should flow between training and inference dynamically.</li>
+    </ul>
+
+    <p>Recent systems have made significant progress on elastic GPU allocation at the
+       framework level:</p>
+
+    <table>
+      <thead>
+        <tr><th>System</th><th>Venue</th><th>What It Does</th><th>Restart Required?</th><th>Container Assumption</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Tenplex</b></td>
+          <td>SOSP &rsquo;24</td>
+          <td>Changes TP+PP+DP at runtime by re-partitioning model state
+              across GPUs via Parallelizable Tensor Collections (PTCs)</td>
+          <td style="color:#e65100;">No restart, but 122s reconfiguration for 16&rarr;8 GPU resize</td>
+          <td>Bare metal. Cannot add/remove containers.</td>
+        </tr>
+        <tr>
+          <td><b>NTP</b></td>
+          <td>arXiv &rsquo;25</td>
+          <td>When a GPU fails in TP group of 8, redistributes work to remaining 7
+              with nonuniform tensor parallelism. ~14% more compute per surviving GPU.</td>
+          <td style="color:#2e7d32;">No restart. Continuous training.</td>
+          <td>Bare metal. Detects failure at process level.</td>
+        </tr>
+        <tr>
+          <td><b>Singularity</b></td>
+          <td>Microsoft &rsquo;22</td>
+          <td>&ldquo;All jobs are preemptable, migratable, and dynamically resizable
+              by default.&rdquo; Transparent to user code.</td>
+          <td style="color:#e65100;">Requires checkpointing for recovery.</td>
+          <td>Internal Microsoft system. Not K8s.</td>
+        </tr>
+        <tr>
+          <td><b>Kale</b></td>
+          <td>SoCC &rsquo;24</td>
+          <td>Traffic-forecasted GPU count adjustment for online model training.
+              Uses time-series prediction + resource-throughput modeling.</td>
+          <td style="color:#e65100;">Requires reconfiguration.</td>
+          <td>Bare metal.</td>
+        </tr>
+        <tr>
+          <td><b>Lyra</b></td>
+          <td>EuroSys &rsquo;23</td>
+          <td>Loans idle inference GPUs for elastic training during off-peak.
+              1.48&times; speedup in job completion time.</td>
+          <td style="color:#e65100;">Job-level scaling.</td>
+          <td>Cluster-level job scheduler (bare metal).</td>
+        </tr>
+        <tr>
+          <td><b>ElasticFlow</b></td>
+          <td>ASPLOS &rsquo;23</td>
+          <td>Elastic serverless training with admission control and deadline-aware
+              scaling. 12.95&times; deadline satisfaction improvement.</td>
+          <td style="color:#e65100;">Deadline-based planning.</td>
+          <td>Serverless platform (bare metal workloads).</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>The pattern is clear: <b>the framework-level support for elastic GPU scheduling is
+       maturing rapidly</b> (Tenplex can even resize tensor parallelism at runtime). But every
+       one of these systems assumes bare-metal deployment. On Kubernetes, adding or removing
+       a GPU means adding or removing a <b>container</b> &mdash; and when you do that, the
+       remaining containers must continue communicating at NVLink bandwidth. No existing
+       system handles this.</p>
+
+    <h3>5.4 K8s Is Moving Toward Per-Device Allocation</h3>
 
     <table>
       <thead>
@@ -617,31 +764,42 @@
       <tbody>
         <tr>
           <td><b>Dynamic Resource Allocation (DRA)</b></td>
-          <td>GA in K8s 1.32 (2025)</td>
+          <td>GA in K8s 1.32 (2025). NVIDIA donated DRA driver to CNCF (KubeCon 2026).</td>
           <td>Per-device GPU allocation with topology awareness.
-              Replaces the coarse <code>nvidia.com/gpu: N</code> model.</td>
+              Replaces the coarse <code>nvidia.com/gpu: N</code> model.
+              Reduces GPU idle from 20&ndash;30% fragmentation via fine-grained allocation.</td>
         </tr>
         <tr>
           <td><b>In-Place Pod Resize</b></td>
           <td>Beta in K8s 1.33 (2025)</td>
-          <td>Resize CPU/memory without pod restart. GPU support is the obvious
-              next step (though not yet implemented).</td>
+          <td>Resize CPU/memory without pod restart. GPU support not yet implemented
+              but is the natural next step.</td>
         </tr>
         <tr>
           <td><b>NVIDIA KAI Scheduler</b></td>
-          <td>Open-sourced 2025</td>
-          <td>Fractional GPU allocation, topology-aware scheduling, bin-packing.
-              Designed for per-GPU granularity.</td>
+          <td>Open-sourced 2025 (Apache 2.0, now CNCF Sandbox)</td>
+          <td>Fractional GPU allocation, topology-aware scheduling, hierarchical
+              fairshare, gang scheduling, bin-packing. Supports reclamation and
+              preemption &mdash; but at pod level only.</td>
+        </tr>
+        <tr>
+          <td><b>K8s 1.35 Restart All Containers</b></td>
+          <td>Alpha in K8s 1.35 (2026)</td>
+          <td>Efficient pod state reset without deletion/recreation. &ldquo;Especially
+              useful for AI/ML workloads&rdquo; per K8s docs.</td>
         </tr>
       </tbody>
     </table>
 
     <div class="highlight-box">
-      <p style="margin:0"><b>The argument:</b> Elastic GPU scheduling (adding/removing GPUs at runtime)
-         is an active research area with multiple published systems (Tenplex, NTP, Lyra, Singularity).
-         All of these require GPU-granular lifecycle management. On Kubernetes, this means
-         per-GPU containers. K8s itself is moving in this direction with DRA and In-Place Pod Resize.
-         The framework support exists; the container-level communication support does not.</p>
+      <p style="margin:0"><b>The argument:</b> GPU scheduling has evolved through four generations of
+         increasing granularity, from node-level (HiveD, 2020) to sub-GPU (LithOS, 2025). Elastic
+         systems (Tenplex, NTP, Singularity) can now add/remove individual GPUs from running jobs.
+         K8s is moving toward per-device allocation (DRA, KAI Scheduler). But <b>all of this
+         assumes either bare metal or all GPUs in one container.</b> The moment you containerize
+         at GPU granularity &mdash; which K8s DRA enables and NVIDIA is planning for &mdash; the
+         communication layer (NCCL) breaks. The framework support exists; the container-level
+         communication support does not. This is the gap.</p>
     </div>
 
 
@@ -1002,22 +1160,127 @@
     </div>
 
 
-    <h3>Setting C: GPU-Granular Preemption in Shared K8s Clusters</h3>
+    <h3>Setting C: GPU-Granular Scheduling on Containerized GPU Fabrics</h3>
 
     <div style="background:#f5f5f5;border-left:4px solid #1565c0;padding:8px 12px;margin:20px 0 12px;font-size:15px;font-weight:bold;">
-      &ldquo;A high-priority job needs 4 GPUs. Today K8s must kill an entire 8-GPU training job.
-      Per-GPU containers would allow reclaiming exactly the GPUs needed.&rdquo;
+      &ldquo;GPU scheduling evolved toward per-GPU granularity. Hardware evolved toward
+      rack-scale fabrics. Production evolved toward Kubernetes containers. When all three
+      meet, GPU communication breaks. We study and solve this.&rdquo;
     </div>
 
-    <h4>The workload</h4>
-    <p>A shared K8s GPU cluster with multiple priority levels. Training jobs (low priority,
-       batch, preemptible) and serving jobs (high priority, latency-sensitive, non-preemptible)
-       share the same GPUs. When a high-priority job arrives and no free GPUs exist, the
-       scheduler must preempt lower-priority work.</p>
+    <h4>The research story arc</h4>
 
-    <h4>Why per-GPU containers become necessary</h4>
-    <p>Today, K8s preemption operates at the <b>pod level</b>. A pod requesting 8 GPUs is
-       either running or killed &mdash; there is no partial preemption. This leads to waste:</p>
+    <p>This setting generalizes preemption into the broader problem of <b>GPU-granular
+       scheduling across container boundaries</b>. The story has three acts:</p>
+
+    <ol>
+      <li><b>Act 1: GPU scheduling got finer.</b> Over six years, the community moved from
+          node-level allocation (HiveD, 2020) to per-GPU elastic scheduling (Tenplex, 2024)
+          to sub-GPU partitioning (LithOS, 2025). This evolution enables preemption,
+          elasticity, bin-packing, and fault recovery at GPU granularity. (See Section 5 for
+          the full evolution table.)</li>
+
+      <li><b>Act 2: Hardware and operations demand containers.</b> NVLink domains grew from
+          8 GPUs (DGX A100) to 72 (NVL72) to 576 (NVL576). You cannot give all 72 GPUs to one
+          job. Multiple jobs must share the fabric. Meanwhile, production deployment requires
+          containers for isolation, billing, security, health monitoring, and rolling updates.
+          K8s has 92% market share in orchestration; AI/ML workloads on K8s at 54% and growing
+          (CNCF survey: 90%+ expect increase). Even NVIDIA runs Slurm inside K8s (Slinky).</li>
+
+      <li><b>Act 3: The container wall breaks GPU-granular scheduling.</b> Every scheduling
+          operation &mdash; allocation, preemption, elasticity, migration &mdash; that worked
+          on bare metal breaks when GPUs are in separate containers. NCCL falls back to TCP
+          (2&ndash;10&times; bandwidth loss). The scheduler places GPUs on the same NVLink mesh,
+          but the CCL inside the container cannot use it.</li>
+    </ol>
+
+    <h4>What GPU-granular scheduling requires (and what containers break)</h4>
+
+    <table>
+      <thead>
+        <tr><th>Scheduling Operation</th><th>What It Needs</th><th>How Containers Break It</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Allocation</b><br>(place N GPUs for a job)</td>
+          <td>GPUs allocated to the same job must communicate at NVLink bandwidth</td>
+          <td>Per-GPU containers have separate namespaces; NCCL cannot detect co-location</td>
+        </tr>
+        <tr>
+          <td><b>Preemption</b><br>(reclaim K GPUs from a job)</td>
+          <td>Remaining N&minus;K GPUs must continue running and reform the collective group</td>
+          <td>Removing a container severs NCCL communicator; surviving containers cannot
+              re-establish P2P communication without shared namespaces</td>
+        </tr>
+        <tr>
+          <td><b>Elasticity</b><br>(add/remove GPUs at runtime)</td>
+          <td>New GPUs must join the existing collective group; departed GPUs must leave cleanly</td>
+          <td>New container cannot join existing NCCL communicator across container boundaries;
+              <code>ncclCommSplit/Shrink</code> not designed for cross-container use</td>
+        </tr>
+        <tr>
+          <td><b>Migration</b><br>(move a GPU&rsquo;s workload to another GPU)</td>
+          <td>Checkpoint GPU state, transfer to new GPU, rejoin collective group</td>
+          <td>Cross-container GPU memory transfer requires NVLink; container isolation prevents it</td>
+        </tr>
+        <tr>
+          <td><b>Bin-packing</b><br>(consolidate jobs to free nodes)</td>
+          <td>After consolidation, GPUs from the same job on the same node must communicate</td>
+          <td>Even after optimal placement, per-GPU containers on the same node cannot use NVLink</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h4>The gap confirmed by exhaustive literature search</h4>
+
+    <p>We surveyed all major GPU scheduling systems from 2020&ndash;2026. The finding is stark:</p>
+
+    <table>
+      <thead>
+        <tr><th>Capability</th><th>Best Existing System</th><th>Handles Containers?</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Sub-GPU scheduling (TPC/thread-block level)</td>
+          <td>LithOS (SOSP &rsquo;25), Tally (ASPLOS &rsquo;25)</td>
+          <td style="color:#e65100;">Tally handles single-GPU sharing across containers;
+              LithOS is bare metal. Neither handles multi-GPU distributed jobs.</td>
+        </tr>
+        <tr>
+          <td>Topology-aware per-GPU allocation</td>
+          <td>KAI Scheduler (NVIDIA &rsquo;25), HiveD (OSDI &rsquo;20)</td>
+          <td style="color:#c44e52;">K8s pod-level only. Cannot schedule individual GPUs
+              across container boundaries with NVLink communication.</td>
+        </tr>
+        <tr>
+          <td>Elastic GPU add/remove without restart</td>
+          <td>Tenplex (SOSP &rsquo;24)</td>
+          <td style="color:#c44e52;">Bare metal only. Cannot add/remove containers.</td>
+        </tr>
+        <tr>
+          <td>GPU preemption from multi-GPU job</td>
+          <td><b>NONE FOUND</b></td>
+          <td style="color:#c44e52;">All K8s preemption (KAI, ReclaimIdleResource) is pod-level.
+              No system reclaims individual GPUs from a running multi-GPU job.</td>
+        </tr>
+        <tr>
+          <td>Per-GPU preemption for distributed jobs across containers</td>
+          <td><b>NOTHING EXISTS</b></td>
+          <td style="color:#c44e52;"><b>This is the gap.</b></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="warning-box">
+      <p style="margin:0"><b>Core finding:</b> Distributed training/serving jobs use collective
+         communication (NCCL). Removing one GPU requires <b>all GPUs to coordinate</b> &mdash;
+         the collective must be reformed. Most scheduling research assumes single-process or
+         bare-metal deployments where this coordination is straightforward. In per-GPU containers,
+         the coordination must cross container boundaries at NVLink bandwidth. No existing system
+         does this.</p>
+    </div>
+
+    <h4>Concrete example: preemption</h4>
 
     <pre>
   Shared cluster, 16 GPUs across 2 nodes:
@@ -1027,58 +1290,67 @@
 
   High-priority serving job arrives, needs 4 GPUs.
 
-  Today (pod-level preemption):
+  Today (pod-level preemption, monolithic container):
     Kill Job A entirely (frees 8 GPUs).
-    4 GPUs used by new serving job, 4 GPUs idle.
-    Job A must checkpoint + restart on remaining resources.
-    Waste: 4 GPUs idle + Job A restart cost.
+    4 GPUs used by new serving job. 4 GPUs idle.
+    Job A must checkpoint + full restart.
+    Waste: 4 idle GPUs + restart cost.
 
-  With per-GPU containers:
-    Preempt 4 of Job A's per-GPU containers.
-    Job A reconfigures to 4 GPUs (NTP-style, continues training).
-    Serving job takes the freed 4 GPUs.
+  With per-GPU containers + cross-container NVLink:
+    Scheduler preempts 4 of Job A's per-GPU containers.
+    Job A's remaining 4 containers reform NCCL communicator.
+    Job A reconfigures to TP=4 (NTP-style), continues training.
+    Serving job starts in 4 new per-GPU containers.
     Waste: zero idle GPUs. No full restart.</pre>
-
-    <h4>What breaks today</h4>
-    <ul>
-      <li><b>K8s has no partial GPU preemption.</b> The
-          <a href="https://www.cncf.io/blog/2026/01/20/reclaiming-underutilized-gpus-in-kubernetes-using-scheduler-plugins/">ReclaimIdleResource plugin</a>
-          (CNCF, 2026) and NVIDIA KAI Scheduler both reclaim GPUs by <b>killing entire pods</b>.
-          There is no mechanism to remove one GPU from a multi-GPU pod.</li>
-      <li><b>Training frameworks cannot shrink at runtime.</b> PyTorch Distributed Elastic
-          and Horovod Elastic support dynamic <b>data parallelism</b> only (add/remove replicas).
-          They cannot change tensor or pipeline parallelism without restart.
-          Tenplex (SOSP &rsquo;24) is the only system that supports runtime TP/PP changes,
-          but reconfiguration takes ~122 seconds for a 16&rarr;8 GPU resize.</li>
-      <li><b>NTP (2025) enables continued training on fewer GPUs</b> after failure, but assumes
-          the failure is detected and handled at the process level, not the container level.</li>
-    </ul>
 
     <h4>The challenges this creates</h4>
     <ol>
-      <li><b>Cross-container collective communication after group shrink.</b> After 4 of 8
-          per-GPU containers are preempted, the remaining 4 must reform the NCCL communicator
-          and continue training with a new parallelism configuration.</li>
-      <li><b>Rapid reconfiguration.</b> The preemption must be fast (&lt;10s) to be
-          practical. Full NCCL re-initialization takes seconds; can we do better?</li>
-      <li><b>Checkpoint integration.</b> The preempted GPUs&rsquo; state must be saved (or
-          the training algorithm must tolerate partial loss, as in NTP).</li>
+      <li><b>Cross-container collective communication.</b> Per-GPU containers on the same
+          NVLink mesh must communicate at native bandwidth. NCCL&rsquo;s three gates
+          (hostHash, shmDev, IPC socket) all fail under container isolation. This is the
+          foundational challenge (and what our exp1&ndash;2 work addresses for NVIDIA).</li>
+      <li><b>Dynamic group membership.</b> When GPUs join or leave (preemption, elasticity,
+          failure), the NCCL communicator must be resized or recreated <b>across container
+          boundaries</b>. <code>ncclCommSplit</code> (NCCL 2.27+) exists but was not designed
+          for cross-container use.</li>
+      <li><b>Topology virtualization.</b> Each per-GPU container sees only its own GPU. The
+          CCL cannot discover the full NVLink topology. The scheduler knows the topology, but
+          the CCL inside the container does not.</li>
+      <li><b>Rapid reconfiguration.</b> Preemption must be fast (&lt;10s). Full NCCL
+          re-initialization takes seconds. Can we do incremental reconfiguration?</li>
+      <li><b>Security model.</b> Cross-container GPU communication partially re-opens the
+          isolation boundary. What is the minimal exposure required?</li>
     </ol>
 
     <h4>Evidence and references</h4>
     <ul>
-      <li>CNCF: <a href="https://www.cncf.io/blog/2026/01/20/reclaiming-underutilized-gpus-in-kubernetes-using-scheduler-plugins/">ReclaimIdleResource: Reclaiming underutilized GPUs in K8s</a> (2026-01)</li>
-      <li>NVIDIA KAI Scheduler: reclamation + preemption, but pod-level only</li>
-      <li>NTP: <a href="https://arxiv.org/html/2504.06095v1">Nonuniform-Tensor-Parallelism</a> (arXiv 2025)</li>
-      <li>Tenplex: <a href="https://arxiv.org/html/2312.05181v2">SOSP &rsquo;24</a>, 122s reconfiguration for 16&rarr;8 GPU resize</li>
+      <li><b>Scheduling systems:</b> HiveD (OSDI &rsquo;20), Pollux (OSDI &rsquo;21), Sia (SOSP &rsquo;23),
+          CASSINI (NSDI &rsquo;24), Crux (SIGCOMM &rsquo;24) &mdash; all assume bare metal or one container per job</li>
+      <li><b>Elastic systems:</b> Tenplex (<a href="https://arxiv.org/html/2312.05181v2">SOSP &rsquo;24</a>),
+          Singularity (Microsoft &rsquo;22), ElasticFlow (ASPLOS &rsquo;23), Lyra (EuroSys &rsquo;23),
+          Kale (SoCC &rsquo;24) &mdash; all bare metal</li>
+      <li><b>Sub-GPU scheduling:</b> LithOS (SOSP &rsquo;25, TPC-level),
+          Tally (<a href="https://dl.acm.org/doi/10.1145/3669940.3707282">ASPLOS &rsquo;25</a>,
+          LD_PRELOAD across containers but single-GPU sharing only),
+          REEF (OSDI &rsquo;22, microsecond kernel preemption)</li>
+      <li><b>GPU preemption on K8s:</b>
+          <a href="https://www.cncf.io/blog/2026/01/20/reclaiming-underutilized-gpus-in-kubernetes-using-scheduler-plugins/">ReclaimIdleResource</a>
+          (CNCF 2026, pod-level), NVIDIA KAI Scheduler (pod-level)</li>
+      <li><b>Failure tolerance:</b> NTP (<a href="https://arxiv.org/html/2504.06095v1">arXiv &rsquo;25</a>,
+          nonuniform tensor parallelism after GPU failure)</li>
     </ul>
 
     <div class="highlight-box">
-      <p style="margin:0"><b>Why this setting is strong:</b> (1) GPU underutilization (20&ndash;30%)
-         is the industry&rsquo;s #1 infrastructure problem. (2) Preemption is the key mechanism for
-         improving utilization, but today it&rsquo;s too coarse. (3) The problem is confirmed by
-         CNCF and NVIDIA as unsolved at the K8s level. (4) Published systems (NTP, Tenplex) show
-         the framework-level support is emerging but the container-level support is missing.</p>
+      <p style="margin:0"><b>Why this setting is the strongest:</b> (1) It is the <b>broadest</b>
+         &mdash; every scheduling operation (allocation, preemption, elasticity, migration,
+         bin-packing) hits the same container wall. (2) It connects to the <b>richest body of
+         prior work</b> (HiveD, Pollux, Sia, Tenplex, KAI &mdash; all top venues). (3) The gap
+         is <b>confirmed by exhaustive search</b>: no system does per-GPU scheduling across
+         container boundaries with high-bandwidth communication. (4) The communication recovery
+         we&rsquo;ve already built (exp1&ndash;2, Exp A/A&prime;) is the <b>foundational
+         enabler</b> that makes all of these scheduling operations possible in per-GPU containers.
+         (5) Settings A (elastic EP) and B (disaggregated P/D) are <b>special cases</b> of this
+         general problem.</p>
     </div>
 
 
@@ -1086,44 +1358,44 @@
 
     <table>
       <thead>
-        <tr><th>Aspect</th><th>Setting A: Elastic EP</th><th>Setting B: Disaggregated P/D</th><th>Setting C: GPU Preemption</th></tr>
+        <tr><th>Aspect</th><th>Setting A: Elastic EP</th><th>Setting B: Disaggregated P/D</th><th>Setting C: GPU-Granular Scheduling</th></tr>
       </thead>
       <tbody>
         <tr>
           <td><b>Specificity</b></td>
           <td>Very specific: vLLM + DeepSeek MoE</td>
           <td>Specific: any disaggregated LLM serving</td>
-          <td>General: any shared GPU cluster</td>
+          <td>General: any containerized GPU cluster with per-GPU scheduling</td>
         </tr>
         <tr>
           <td><b>Timeliness</b></td>
           <td style="color:#2e7d32;">Hottest topic in 2026</td>
           <td style="color:#2e7d32;">Already standard practice</td>
-          <td style="color:#e65100;">Emerging (not yet standard)</td>
+          <td style="color:#2e7d32;">Fundamental: all scheduling systems hit this wall</td>
         </tr>
         <tr>
           <td><b>&ldquo;Must use per-GPU containers&rdquo; strength</b></td>
           <td style="color:#2e7d32;">Strong: cannot shrink a 32-GPU container</td>
           <td style="color:#2e7d32;">Strong: independent scaling needs separate containers</td>
-          <td style="color:#2e7d32;">Strong: K8s preemption is pod-level only</td>
+          <td style="color:#2e7d32;">Strongest: per-GPU is the natural K8s scheduling unit (DRA, KAI)</td>
         </tr>
         <tr>
           <td><b>End-to-end demo feasibility</b></td>
           <td style="color:#e65100;">Medium: requires MoE model (DeepSeek), 32+ GPUs</td>
           <td style="color:#2e7d32;">High: can demo with any model + KV cache transfer</td>
-          <td style="color:#e65100;">Medium: requires scheduler integration + training framework</td>
+          <td style="color:#2e7d32;">High: can demo preemption + elasticity on node192 (4 A100)</td>
         </tr>
         <tr>
           <td><b>Communication challenge</b></td>
           <td>All-to-all (expert routing) across containers</td>
           <td>Point-to-point (KV cache) between two container groups</td>
-          <td>Allreduce within dynamic container group</td>
+          <td>All collectives (allreduce, allgather, etc.) across dynamic container group</td>
         </tr>
         <tr>
           <td><b>Paper narrative</b></td>
           <td>&ldquo;Zero-downtime elastic MoE serving via per-GPU containers&rdquo;</td>
           <td>&ldquo;NVLink-speed disaggregated serving without sacrificing isolation&rdquo;</td>
-          <td>&ldquo;GPU-granular preemption for efficient cluster scheduling&rdquo;</td>
+          <td>&ldquo;Enabling GPU-granular scheduling across container boundaries on shared interconnect fabrics&rdquo;</td>
         </tr>
         <tr>
           <td><b>Hardware needed</b></td>
@@ -1135,12 +1407,13 @@
     </table>
 
     <div class="info-box">
-      <p style="margin:0"><b>Recommendation for mentor discussion:</b> All three settings are viable.
-         Setting B (disaggregated P/D) is the easiest to demo on our hardware (node192, 4&times;A100).
-         Setting A (elastic EP) is the most timely and impactful but requires more GPUs.
-         Setting C (preemption) has the broadest impact but requires the most system-building
-         (scheduler + framework integration). A strong paper could <b>use one as the primary
-         setting</b> and show that the same mechanisms also enable the other two.</p>
+      <p style="margin:0"><b>Recommendation for mentor discussion:</b> Setting C (GPU-Granular
+         Scheduling) is the <b>strongest research framing</b> because it is the most general &mdash;
+         Settings A and B are special cases of it. The story arc (scheduling got finer &rarr;
+         hardware got bigger &rarr; containers became mandatory &rarr; communication breaks) is
+         clean and connects to a rich body of top-venue prior work. The communication recovery
+         from our exp1&ndash;2 work is the foundational enabler. Demos of preemption, elasticity,
+         and allocation can all be shown on node192 (4&times;A100).</p>
     </div>
 
 
