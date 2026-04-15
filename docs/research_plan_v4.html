@@ -1,0 +1,1294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Research Plan v4: GPU-Granular Scheduling Across Container Boundaries</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: "Times New Roman", "Nimbus Roman", Times, serif;
+      background: #fff;
+      color: #111;
+      line-height: 1.6;
+    }
+    main {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 40px 32px 60px;
+    }
+    h1 {
+      font-size: 22px;
+      text-align: center;
+      margin: 0 0 4px;
+      line-height: 1.3;
+    }
+    .subtitle {
+      text-align: center;
+      font-size: 14px;
+      color: #444;
+      margin: 0 0 24px;
+    }
+    h2 {
+      font-size: 17px;
+      border-bottom: 1px solid #999;
+      padding-bottom: 4px;
+      margin: 28px 0 12px;
+    }
+    h3 {
+      font-size: 15px;
+      margin: 20px 0 8px;
+    }
+    h4 {
+      font-size: 14px;
+      margin: 16px 0 6px;
+    }
+    p, li {
+      font-size: 14px;
+      margin: 0 0 10px;
+    }
+    ul, ol {
+      padding-left: 24px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      margin: 12px 0;
+    }
+    th, td {
+      border: 1px solid #bbb;
+      padding: 5px 7px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #f0f0f0;
+      font-weight: bold;
+    }
+    td {
+      font-variant-numeric: tabular-nums;
+    }
+    code {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 13px;
+      background: #f5f5f5;
+      padding: 1px 4px;
+    }
+    pre {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 12px;
+      background: #f8f8f8;
+      border: 1px solid #ddd;
+      padding: 12px 16px;
+      margin: 12px 0;
+      overflow-x: auto;
+      line-height: 1.5;
+    }
+    .highlight-box {
+      background: #e8f5e9;
+      border: 2px solid #2e7d32;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .warning-box {
+      background: #fff3e0;
+      border: 2px solid #e65100;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .info-box {
+      background: #e3f2fd;
+      border: 2px solid #1565c0;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    a {
+      color: #1565c0;
+      text-decoration: none;
+    }
+    a:hover {
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+  <main>
+
+    <h1>Research Plan v4: GPU-Granular Scheduling Across Container Boundaries</h1>
+    <p class="subtitle">
+      2026-04-15
+    </p>
+
+    <div class="info-box">
+      <p style="margin:0"><b>What this document is:</b> A self-contained research plan for
+         studying what happens when GPU scheduling techniques &mdash; designed and validated on
+         bare metal &mdash; meet the containerized production environments where GPU workloads
+         increasingly run. We select concrete, open-source scheduling systems as baselines and
+         progressively containerize them, observing what challenges emerge at each stage.</p>
+    </div>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 1: MOTIVATION                                        -->
+    <!-- ============================================================ -->
+
+    <h2>1. Motivation</h2>
+
+    <p>Three independent trends are converging. Each is well-evidenced and individually
+       uncontroversial. Their intersection creates an under-explored problem space.</p>
+
+    <h3>1.1 GPU Scheduling Got Finer</h3>
+
+    <p>Over six years, GPU cluster scheduling research progressed from coarse to fine
+       granularity:</p>
+
+    <table>
+      <thead>
+        <tr><th>Era</th><th>Granularity</th><th>Key Systems</th><th>What Changed</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>2020</td>
+          <td>Node-level</td>
+          <td>HiveD (OSDI), Gavel (OSDI), Themis (NSDI)</td>
+          <td>Whole nodes allocated to jobs; topology affinity within cells</td>
+        </tr>
+        <tr>
+          <td>2021&ndash;22</td>
+          <td>GPU-group</td>
+          <td>Pollux (OSDI), Synergy (OSDI), AntMan (OSDI)</td>
+          <td>Dynamically adjust GPU count per job; co-adaptive batch size tuning</td>
+        </tr>
+        <tr>
+          <td>2023&ndash;24</td>
+          <td>Per-GPU</td>
+          <td>Sia (SOSP), CASSINI (NSDI), Crux (SIGCOMM)</td>
+          <td>Per-GPU allocation with topology and communication awareness</td>
+        </tr>
+        <tr>
+          <td>2024&ndash;25</td>
+          <td>Per-GPU elastic</td>
+          <td>Tenplex (SOSP &rsquo;24), NTP (arXiv &rsquo;25), Kale (SoCC &rsquo;24)</td>
+          <td>Add/remove individual GPUs from running jobs at runtime</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Two systems exemplify the frontier:</p>
+    <ul>
+      <li><b>Tenplex</b> (SOSP &rsquo;24): Changes tensor, pipeline, and data parallelism
+          dimensions at runtime via Parallelizable Tensor Collections (PTCs). A running training
+          job can absorb new GPUs or relinquish existing ones <b>without restart</b>. Evaluated
+          on up to 64 GPUs with ~122s reconfiguration for a 16&rarr;8 resize.</li>
+      <li><b>NTP</b> (arXiv &rsquo;25): When a GPU fails mid-training in a tensor-parallel
+          group of 8, the remaining 7 GPUs continue with non-uniform tensor parallelism &mdash;
+          redistributing the failed GPU&rsquo;s workload across survivors without
+          checkpoint-and-restart.</li>
+    </ul>
+
+    <div class="warning-box">
+      <p style="margin:0"><b>Critical assumption:</b> Both Tenplex and NTP &mdash; along with every
+         other system in the table &mdash; assume <b>bare metal</b>. All GPUs see each other
+         through shared OS namespaces. The collective communication library (NCCL) discovers
+         NVLink topology and communicates at full interconnect bandwidth without any container
+         boundary in the way.</p>
+    </div>
+
+    <h3>1.2 Hardware and Operations Demand Containers</h3>
+
+    <p><b>Hardware trajectory.</b> NVLink domains are growing from 8 GPUs (DGX A100) to
+       72 (GB200 NVL72) to 576 (NVL576). You cannot give 72 GPUs to every job. Multiple jobs
+       must share the NVLink domain. NVIDIA acknowledges this: their ComputeDomains RFC
+       (Nov 2025) envisions &ldquo;many single-GPU pods&rdquo; where &ldquo;the unit of
+       interest is the individual GPU, and not the individual node.&rdquo; But today,
+       ComputeDomains have severe limitations: <b>one pod per node, one ComputeDomain per
+       node</b> &mdash; falling far short of this vision.</p>
+
+    <p><b>Operational reality.</b> Kubernetes has 92% market share in orchestration. AI/ML
+       workloads on K8s at 54% and growing (CNCF survey: 90%+ expect increase). K8s Dynamic
+       Resource Allocation (DRA, GA in K8s 1.32) enables per-GPU device allocation. NVIDIA&rsquo;s
+       KAI Scheduler (open-sourced 2025, CNCF Sandbox) provides topology-aware GPU scheduling,
+       fractional allocation, and bin-packing. The orchestration layer is ready for per-GPU
+       scheduling.</p>
+
+    <p><b>Isolation requirements.</b> GPU failure rates of 9% annualized (Meta Llama&nbsp;3.1,
+       16K H100s) demand fault isolation. Multi-tenancy on shared GPU nodes demands security
+       isolation. Both require container boundaries.</p>
+
+    <h3>1.3 The Container Wall Breaks GPU-Granular Scheduling</h3>
+
+    <p>When containers meet GPU-granular scheduling, a fundamental tension appears.</p>
+
+    <p>Today, GPU workloads in production run in <b>monolithic multi-GPU containers</b>: one
+       container holds all GPUs for a job. This works for NCCL &mdash; all GPUs share
+       namespaces, NVLink is discovered, full bandwidth is achieved. But monolithic containers
+       are incompatible with fine-grained scheduling:</p>
+
+    <ul>
+      <li><b>Elasticity is trapped:</b> A framework like Tenplex can scale from 4 to 2 GPUs
+          internally, but the container still holds 4 GPUs. K8s cannot reclaim the freed GPUs
+          for other jobs (In-Place Pod Resize does not support GPU resources). To actually
+          release GPUs, you must kill the entire container and restart &mdash; negating
+          Tenplex&rsquo;s zero-downtime benefit.</li>
+      <li><b>Failures are amplified:</b> One GPU failure inside an 8-GPU container may crash
+          the entire container, killing all 8 GPUs. Even if the framework recovers internally
+          (Oobleck, NTP), the failed GPU remains allocated to the container. K8s cannot replace
+          it without restarting the entire pod.</li>
+      <li><b>Bin-packing is coarse:</b> If Job A needs 3 GPUs and Job B needs 5 GPUs on an
+          8-GPU node, they must be in separate containers for isolation. But each container sees
+          only its own GPUs &mdash; cross-container NVLink communication is not supported.</li>
+    </ul>
+
+    <p>The natural solution is <b>per-GPU containers</b>: each GPU in its own container,
+       independently schedulable. Scaling down means stopping containers (GPUs return to the
+       cluster). GPU failure kills only one container. K8s manages GPU lifecycle with
+       standard primitives (HPA, health checks, rolling updates).</p>
+
+    <p>But per-GPU containers introduce their own problems. NCCL assumes all GPUs on a node
+       share OS namespaces. When they don&rsquo;t, NCCL falls back from NVLink to TCP &mdash;
+       a 2&ndash;10&times; bandwidth loss. The scheduling operation that prompted the
+       containerization now faces degraded or broken communication.</p>
+
+    <div class="highlight-box">
+      <p style="margin:0"><b>The three-act gap:</b> GPU scheduling got finer (Act&nbsp;1).
+         Production demands containers (Act&nbsp;2). The container wall breaks GPU-granular
+         scheduling (Act&nbsp;3). <b>No system today bridges this gap.</b> The scheduling
+         community assumes bare metal; the container community does not consider GPU
+         collectives. We study the intersection.</p>
+    </div>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 2: RESEARCH GAP                                      -->
+    <!-- ============================================================ -->
+
+    <h2>2. The Research Gap</h2>
+
+    <p>A survey of GPU scheduling systems from 2020&ndash;2026 confirms the gap:</p>
+
+    <table>
+      <thead>
+        <tr><th>System</th><th>Venue</th><th>Scheduling Capability</th><th>Deployment Model</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Tenplex</b></td>
+          <td>SOSP &rsquo;24</td>
+          <td>Elastic GPU add/remove, runtime TP+PP+DP reconfiguration</td>
+          <td>Bare metal</td>
+        </tr>
+        <tr>
+          <td><b>Oobleck</b></td>
+          <td>SOSP &rsquo;23</td>
+          <td>Fault-tolerant pipeline training, pipeline template reconfiguration</td>
+          <td>Bare metal</td>
+        </tr>
+        <tr>
+          <td><b>NTP</b></td>
+          <td>arXiv &rsquo;25</td>
+          <td>Non-uniform tensor parallelism after GPU failure</td>
+          <td>Bare metal</td>
+        </tr>
+        <tr>
+          <td><b>Singularity</b></td>
+          <td>Microsoft &rsquo;22</td>
+          <td>Preemptible, migratable, dynamically resizable jobs</td>
+          <td>Internal (not K8s)</td>
+        </tr>
+        <tr>
+          <td><b>KAI Scheduler</b></td>
+          <td>NVIDIA &rsquo;25</td>
+          <td>Topology-aware GPU scheduling, fractional, bin-packing</td>
+          <td>K8s &mdash; but one pod per job (all GPUs together)</td>
+        </tr>
+        <tr>
+          <td><b>Pollux / AdaptDL</b></td>
+          <td>OSDI &rsquo;21</td>
+          <td>Dynamic GPU count + adaptive batch size tuning</td>
+          <td>Bare metal / one container per job</td>
+        </tr>
+        <tr>
+          <td><b>NVIDIA ComputeDomains</b></td>
+          <td>2025</td>
+          <td>Cross-container NVLink via IMEX</td>
+          <td>GB200-only; one pod per node; proprietary</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="warning-box">
+      <p style="margin:0"><b>The gap:</b> Every scheduling system assumes either bare metal or all
+         GPUs in one container. NVIDIA&rsquo;s ComputeDomains is the only system that addresses
+         cross-container GPU communication, but it is limited to GB200 hardware, one pod per node,
+         and proprietary. <b>Nobody has studied what happens when general-purpose GPU scheduling
+         techniques are deployed in standard containerized environments.</b></p>
+    </div>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 3: RESEARCH METHODOLOGY                              -->
+    <!-- ============================================================ -->
+
+    <h2>3. Research Methodology: Progressive Containerization</h2>
+
+    <h3>3.1 Philosophy</h3>
+
+    <p>We do <b>not</b> pre-imagine what challenges exist. Instead, we take existing, working,
+       bare-metal GPU scheduling techniques and progressively move them into containerized
+       environments. The challenges reveal themselves through this process.</p>
+
+    <p>This is a principled empirical methodology:</p>
+    <ul>
+      <li>The baseline techniques are published, peer-reviewed, and validated on bare metal.
+          Any failure in containers is a <b>genuine finding</b> about the container&ndash;scheduling
+          gap, not a bug in our setup.</li>
+      <li>The challenges we discover are <b>ground truth</b>, not speculation. They come with
+          concrete failure modes, error messages, and performance measurements.</li>
+      <li>Starting from the obvious production approach (multi-GPU containers) before
+          exploring alternatives (per-GPU containers) ensures that <b>each step is motivated
+          by the limitations of the previous step</b>.</li>
+    </ul>
+
+    <h3>3.2 Three-Phase Experiment Structure</h3>
+
+    <p>Each experiment follows the same three-phase progression:</p>
+
+    <table>
+      <thead>
+        <tr><th>Phase</th><th>Setup</th><th>Purpose</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Phase 1:<br>Bare Metal</b></td>
+          <td>Run the scheduling technique on bare metal, exactly as designed.
+              All GPUs visible in one process group, shared namespaces.</td>
+          <td>Confirm the technique works as documented on our hardware.
+              Establish baseline performance metrics.</td>
+        </tr>
+        <tr>
+          <td><b>Phase 2:<br>Multi-GPU Container</b></td>
+          <td>Put all GPUs into a single container &mdash; the standard production
+              approach today. Run the same scheduling technique inside.</td>
+          <td>Test the <b>obvious</b> containerization approach. Observe whether
+              the scheduling operation provides its intended benefit at the
+              <b>cluster level</b> (not just framework level). Record any
+              limitations that arise from the monolithic container model.</td>
+        </tr>
+        <tr>
+          <td><b>Phase 3:<br>Per-GPU Containers</b></td>
+          <td>Each GPU in its own isolated container. Containers communicate
+              over a Docker bridge network.</td>
+          <td><b>Only if Phase 2 reveals limitations</b> that per-GPU containers
+              would address. Attempt the same scheduling operation. Record
+              all new challenges that arise from container boundaries.
+              Attempt workarounds.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="highlight-box">
+      <p style="margin:0"><b>Key principle:</b> Phase 3 is <b>motivated by Phase 2</b>, not
+         assumed a priori. If multi-GPU containers work perfectly for a given scheduling
+         technique, there is no reason to try per-GPU containers. The experiments discover
+         whether and where the monolithic container model breaks down, and what new challenges
+         arise when you move to finer granularity.</p>
+    </div>
+
+    <h3>3.3 What We Record at Each Phase</h3>
+
+    <ul>
+      <li><b>Does the scheduling operation succeed?</b> (e.g., does elastic resize complete?
+          does fault recovery restore training?)</li>
+      <li><b>Does the benefit reach the cluster level?</b> (e.g., are freed GPUs actually
+          available to other jobs? can K8s replace a failed GPU?)</li>
+      <li><b>Performance metrics:</b> training throughput, reconfiguration/recovery time,
+          communication bandwidth.</li>
+      <li><b>Failure modes:</b> error messages, stack traces, NCCL logs, container events.
+          We record <i>everything</i> without filtering &mdash; the unexpected observations
+          are often the most valuable.</li>
+      <li><b>Workaround results:</b> for each challenge in Phase 3, what workarounds were
+          attempted, which succeeded, and at what cost (performance, isolation, complexity).</li>
+    </ul>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 4: BASELINE TECHNIQUE SELECTION                      -->
+    <!-- ============================================================ -->
+
+    <h2>4. Baseline Technique Selection</h2>
+
+    <h3>4.1 Selection Criteria</h3>
+
+    <p>We select scheduling techniques that are:</p>
+
+    <ol>
+      <li><b>Open-source</b> with available, runnable code (not paper-only).</li>
+      <li><b>Valuable:</b> implements a scheduling operation broadly needed in production
+          (elasticity, fault tolerance, etc.).</li>
+      <li><b>Bare-metal only:</b> designed without considering containerized environments,
+          so the migration genuinely tests what happens.</li>
+      <li><b>Feasible on our hardware:</b> can run on a 4&times;A100 node.</li>
+      <li><b>Challenging in containers:</b> the scheduling operation involves dynamic changes
+          to the GPU group &mdash; exactly where containers create friction.</li>
+    </ol>
+
+    <h3>4.2 Candidate Survey</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>System</th>
+          <th>Venue</th>
+          <th>Scheduling Operation</th>
+          <th>Open-Source?</th>
+          <th>4-GPU Feasible?</th>
+          <th>Selected?</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Tenplex</b></td>
+          <td>SOSP &rsquo;24</td>
+          <td>Elastic add/remove GPUs; reconfigure TP+PP+DP at runtime</td>
+          <td style="color:#2e7d32;">Yes
+              (<a href="https://github.com/kungfu-team/tenplex">GitHub</a>)</td>
+          <td style="color:#2e7d32;">Yes (evaluated on 4&times;4)</td>
+          <td style="color:#2e7d32;"><b>&#10003; Exp&nbsp;A1</b></td>
+        </tr>
+        <tr>
+          <td><b>Oobleck</b></td>
+          <td>SOSP &rsquo;23</td>
+          <td>Fault-tolerant pipeline training; reconfigure after GPU failure</td>
+          <td style="color:#2e7d32;">Yes
+              (<a href="https://github.com/SymbioticLab/Oobleck">GitHub</a>)</td>
+          <td style="color:#2e7d32;">Yes</td>
+          <td style="color:#2e7d32;"><b>&#10003; Exp&nbsp;A2</b></td>
+        </tr>
+        <tr>
+          <td><b>NTP</b></td>
+          <td>arXiv &rsquo;25</td>
+          <td>Non-uniform TP after GPU failure</td>
+          <td style="color:#c44e52;">No (paper only)</td>
+          <td>N/A</td>
+          <td style="color:#c44e52;">&#10007; No code</td>
+        </tr>
+        <tr>
+          <td><b>Bamboo</b></td>
+          <td>EuroSys &rsquo;22</td>
+          <td>Fault-tolerant pipeline training (redundant computation)</td>
+          <td style="color:#2e7d32;">Yes
+              (<a href="https://github.com/uclasystem/bamboo">GitHub</a>)</td>
+          <td style="color:#2e7d32;">Yes (DeepSpeed)</td>
+          <td style="color:#e65100;">Extension candidate</td>
+        </tr>
+        <tr>
+          <td><b>Varuna</b></td>
+          <td>EuroSys &rsquo;22</td>
+          <td>Fault-tolerant training on commodity hardware</td>
+          <td style="color:#2e7d32;">Yes
+              (<a href="https://github.com/microsoft/varuna">GitHub</a>)</td>
+          <td style="color:#2e7d32;">Yes</td>
+          <td style="color:#e65100;">Extension candidate</td>
+        </tr>
+        <tr>
+          <td><b>Pollux / AdaptDL</b></td>
+          <td>OSDI &rsquo;21</td>
+          <td>Dynamic GPU count + adaptive batch size tuning</td>
+          <td style="color:#2e7d32;">Yes
+              (<a href="https://github.com/petuum/adaptdl">GitHub</a>)</td>
+          <td style="color:#2e7d32;">Yes</td>
+          <td style="color:#e65100;">Extension candidate</td>
+        </tr>
+        <tr>
+          <td><b>PhoenixOS</b></td>
+          <td>SOSP &rsquo;24</td>
+          <td>OS-level GPU checkpoint/restore</td>
+          <td style="color:#e65100;">Partial
+              (<a href="https://github.com/SJTU-IPADS/PhoenixOS">GitHub</a>)</td>
+          <td style="color:#c44e52;">No (single-GPU only)</td>
+          <td style="color:#c44e52;">&#10007; Immature</td>
+        </tr>
+        <tr>
+          <td><b>KAI Scheduler</b></td>
+          <td>NVIDIA &rsquo;25</td>
+          <td>K8s GPU scheduling (gang, topology, fractional, bin-packing)</td>
+          <td style="color:#2e7d32;">Yes
+              (<a href="https://github.com/NVIDIA/KAI-Scheduler">GitHub</a>)</td>
+          <td style="color:#e65100;">Needs K8s cluster</td>
+          <td style="color:#e65100;">Extension candidate</td>
+        </tr>
+        <tr>
+          <td><b>Singularity</b></td>
+          <td>Microsoft &rsquo;22</td>
+          <td>Preemptible, migratable, dynamically resizable jobs</td>
+          <td style="color:#c44e52;">No (internal)</td>
+          <td>N/A</td>
+          <td style="color:#c44e52;">&#10007; No code</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>4.3 Selected Baselines</h3>
+
+    <table>
+      <thead>
+        <tr><th>Experiment</th><th>System</th><th>Scheduling Operation</th><th>Why This System</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Exp&nbsp;A1</b></td>
+          <td>Tenplex</td>
+          <td><b>Elastic GPU scaling</b></td>
+          <td>Most advanced open-source elastic GPU system. Changes TP+PP+DP at runtime.
+              Built on Megatron-LM. Evaluated on 4-GPU setups. Bare-metal only.</td>
+        </tr>
+        <tr>
+          <td><b>Exp&nbsp;A2</b></td>
+          <td>Oobleck</td>
+          <td><b>Fault-tolerant training</b></td>
+          <td>Most comprehensive open-source fault-tolerant training framework. Pipeline
+              templates with redundancy. Built on Colossal-AI/PyTorch. Bare-metal only.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>These cover the two most impactful scheduling operations:</p>
+    <ul>
+      <li><b>Elasticity</b> (Exp&nbsp;A1): the ability to add/remove GPUs at runtime is the
+          core reason per-GPU scheduling exists.</li>
+      <li><b>Fault tolerance</b> (Exp&nbsp;A2): with 9% annualized GPU failure rates (Meta),
+          continuing training after failure without restarting everything is critical at scale.</li>
+    </ul>
+
+    <div class="info-box">
+      <p style="margin:0"><b>Extension candidates:</b> Bamboo and Varuna provide simpler
+         fault-tolerance baselines. Pollux/AdaptDL provides cluster-scheduler-level elasticity.
+         KAI Scheduler provides the K8s-native perspective. These can be added as Exp&nbsp;A3+
+         based on A1/A2 findings.</p>
+    </div>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 5: HARDWARE                                          -->
+    <!-- ============================================================ -->
+
+    <h2>5. Experiment Infrastructure</h2>
+
+    <table>
+      <thead>
+        <tr><th>Component</th><th>Specification</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Machine</td><td>node192</td></tr>
+        <tr><td>GPUs</td><td>4&times; NVIDIA A100-SXM4-40GB</td></tr>
+        <tr><td>Interconnect</td><td>NVLink 3.0 (600 GB/s bidirectional per pair)</td></tr>
+        <tr><td>CUDA</td><td>12.4+</td></tr>
+        <tr><td>NCCL</td><td>2.21.5</td></tr>
+        <tr><td>Container runtime</td><td>Docker 27.3.1 with NVIDIA Container Toolkit</td></tr>
+      </tbody>
+    </table>
+
+    <p>Container configurations used across experiments:</p>
+
+    <table>
+      <thead>
+        <tr><th>Phase</th><th>Container Model</th><th>Configuration</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Phase 1</td>
+          <td>Bare metal (no containers)</td>
+          <td>All 4 GPUs visible. Standard <code>torchrun</code> or
+              framework-specific launcher.</td>
+        </tr>
+        <tr>
+          <td>Phase 2</td>
+          <td>Multi-GPU container</td>
+          <td>Single container with <code>nvidia.com/gpu: 4</code>.
+              Standard production configuration.</td>
+        </tr>
+        <tr>
+          <td>Phase 3</td>
+          <td>Per-GPU containers</td>
+          <td>4 containers, each with <code>NVIDIA_VISIBLE_DEVICES=N</code>.
+              Docker bridge network. Separate IPC/PID/NET namespaces.</td>
+        </tr>
+      </tbody>
+    </table>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 6: EXP A1 - TENPLEX                                  -->
+    <!-- ============================================================ -->
+
+    <h2>6. Exp A1: Elastic GPU Scaling (Tenplex)</h2>
+
+    <h3>6.1 Technique Overview</h3>
+
+    <p><b>Tenplex</b> (SOSP &rsquo;24) enables elastic GPU scaling for distributed training.
+       Its core innovation is <b>Parallelizable Tensor Collections (PTCs)</b>: a data structure
+       that represents model and optimizer state in a way that can be repartitioned across
+       different parallelism configurations at runtime. When the GPU count changes, Tenplex
+       recomputes the parallelism strategy (TP, PP, DP dimensions) and redistributes state
+       across the new set of GPUs.</p>
+
+    <table>
+      <thead>
+        <tr><th>Aspect</th><th>Detail</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Code</td>
+          <td><a href="https://github.com/kungfu-team/tenplex">github.com/kungfu-team/tenplex</a>
+              (Go + Python, Megatron-LM integration)</td>
+        </tr>
+        <tr>
+          <td>Capability</td>
+          <td>Change TP, PP, DP dimensions at runtime. Repartition model/optimizer state.
+              GPU add, remove, and redeployment without restart.</td>
+        </tr>
+        <tr>
+          <td>Performance</td>
+          <td>~122s reconfiguration for 16&rarr;8 GPU resize (dominated by state I/O)</td>
+        </tr>
+        <tr>
+          <td>Deployment assumption</td>
+          <td>Bare metal. All GPUs in shared namespace. NCCL communicators created
+              freely across all GPUs.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>6.2 Phase 1: Bare-Metal Baseline</h3>
+
+    <p>Confirm Tenplex works as documented on our hardware.</p>
+
+    <table>
+      <thead>
+        <tr><th>Step</th><th>Action</th><th>Record</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td>Build Tenplex + Megatron-LM on node192 (4 GPUs, bare metal)</td>
+          <td>Build success, dependency versions</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td>Start training (GPT-2 small, TP=2, DP=2)</td>
+          <td>Training throughput (tokens/s), NCCL transport used</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td>Trigger elastic scale-down: 4 GPUs &rarr; 2 GPUs</td>
+          <td>Reconfiguration time, new parallelism config, throughput after</td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td>Trigger elastic scale-up: 2 GPUs &rarr; 4 GPUs</td>
+          <td>Reconfiguration time, state redistribution, throughput after</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>6.3 Phase 2: Multi-GPU Container (Production Approach)</h3>
+
+    <p>Put all 4 GPUs in a single container &mdash; the standard production deployment.</p>
+
+    <pre>
+  +-----------------------------------------------+
+  |         Single Container (4 GPUs)              |
+  |   GPU 0   GPU 1   GPU 2   GPU 3               |
+  |   ============ NVLink mesh =============       |
+  |   Tenplex + Megatron-LM running inside         |
+  +-----------------------------------------------+</pre>
+
+    <table>
+      <thead>
+        <tr><th>Step</th><th>Action</th><th>Observe</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td>Create Docker image with Tenplex + Megatron-LM.
+              Start container with all 4 GPUs.</td>
+          <td>Does Tenplex build and train inside a container?
+              Any performance difference vs. bare metal?</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td>Trigger elastic scale-down: 4 &rarr; 2 GPUs (inside the container)</td>
+          <td>Does Tenplex reconfigure successfully?
+              <b>Are the 2 freed GPUs available to other workloads?</b>
+              Or do they remain allocated to the container?</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td>From outside the container: attempt to use the &ldquo;freed&rdquo; GPUs
+              (launch another container requesting 2 GPUs)</td>
+          <td>Can K8s / Docker allocate the freed GPUs to another job?
+              What does <code>nvidia-smi</code> show for the original container?</td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td>Trigger elastic scale-up: 2 &rarr; 4 GPUs (adding external GPUs)</td>
+          <td>Can the running container acquire <i>new</i> GPUs that weren&rsquo;t
+              in its original allocation? Or must the container be recreated?</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="info-box">
+      <p style="margin:0"><b>What Phase 2 tests:</b> Whether framework-level elasticity
+         (Tenplex can resize) translates into <b>cluster-level elasticity</b> (freed GPUs
+         are actually reusable by other jobs) when deployed in a standard multi-GPU container.
+         If it does not &mdash; if GPUs are trapped inside the container &mdash; this
+         motivates Phase&nbsp;3.</p>
+    </div>
+
+    <h3>6.4 Phase 3: Per-GPU Containers</h3>
+
+    <p>If Phase 2 reveals that the multi-GPU container model traps resources, we proceed
+       to per-GPU containers where scaling is expressed as container lifecycle:</p>
+
+    <pre>
+  Start:                          Scale down (4 &rarr; 2):
+  +----+ +----+ +----+ +----+     +----+ +----+
+  | C0 | | C1 | | C2 | | C3 |     | C0 | | C1 |    C2, C3 stopped
+  |GPU0| |GPU1| |GPU2| |GPU3|     |GPU0| |GPU1|    GPU 2,3 free
+  +----+ +----+ +----+ +----+     +----+ +----+
+
+  Scale up (2 &rarr; 4):
+  +----+ +----+ +----+ +----+
+  | C0 | | C1 | |C2' | |C3' |     C2', C3' are new containers
+  |GPU0| |GPU1| |GPU2| |GPU3|
+  +----+ +----+ +----+ +----+</pre>
+
+    <table>
+      <thead>
+        <tr><th>Step</th><th>Action</th><th>Observe</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td>Start 4 per-GPU containers. Launch Tenplex training across them.</td>
+          <td>Does distributed training start across container boundaries?
+              Does NCCL establish NVLink P2P or fall back to TCP?
+              Throughput vs. Phase 1 and Phase 2?</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td>Trigger elastic scale-down: stop containers C2 and C3</td>
+          <td>Does Tenplex detect that C2/C3 are gone?
+              Can remaining containers (C0, C1) reform NCCL communicators?
+              Does PTC state repartitioning complete?
+              Are GPUs 2 and 3 returned to the cluster?</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td>Trigger elastic scale-up: start new containers C2&prime;, C3&prime;</td>
+          <td>Can Tenplex discover the new containers?
+              Can a new NCCL communicator be created spanning old + new containers?
+              Does state redistribute to the new containers?</td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td>Record all observations, errors, metrics, NCCL debug logs</td>
+          <td>Full characterization of what worked, what broke, what degraded</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>6.5 Workarounds (Phase 3 only)</h3>
+
+    <p>For each challenge observed in Phase 3, attempt progressively more invasive
+       workarounds:</p>
+
+    <table>
+      <thead>
+        <tr><th>Level</th><th>Workaround</th><th>What It Tests</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>0</td>
+          <td>Default container config &mdash; no special measures</td>
+          <td>Baseline: how far do things work out of the box?</td>
+        </tr>
+        <tr>
+          <td>1</td>
+          <td>Configuration: shared volumes for state transfer, environment
+              variables for peer discovery, custom network setup</td>
+          <td>Whether minor configuration changes resolve the issues</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td>Framework patches: modify Tenplex process discovery, NCCL
+              communicator lifecycle, peer management</td>
+          <td>Whether the problem is at the framework level</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td>System-level intervention: LD_PRELOAD interception of NCCL&rsquo;s
+              namespace checks, custom IPC channel setup, UDS-based GPU memory
+              handle passing</td>
+          <td>Whether a system-level shim can make containers transparent
+              to the framework</td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td>Relaxed isolation: shared /dev/shm, shared network namespace,
+              shared IPC namespace (progressively weaker)</td>
+          <td>The isolation&ndash;functionality spectrum: how much isolation
+              must be sacrificed?</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>6.6 Measurements</h3>
+
+    <table>
+      <thead>
+        <tr><th>Metric</th><th>Measured At</th><th>Why</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Training throughput</td>
+          <td>All phases, before/during/after reconfiguration</td>
+          <td>End-to-end performance comparison</td>
+        </tr>
+        <tr>
+          <td>Reconfiguration time</td>
+          <td>All phases, for both scale-up and scale-down</td>
+          <td>Overhead of elastic resize at each containerization level</td>
+        </tr>
+        <tr>
+          <td>GPU resource visibility</td>
+          <td>Phase 2: after internal scale-down</td>
+          <td>Whether freed GPUs are reclaimable by the cluster</td>
+        </tr>
+        <tr>
+          <td>NCCL transport and bandwidth</td>
+          <td>Phase 3: during training</td>
+          <td>Whether NVLink or TCP is used across containers</td>
+        </tr>
+        <tr>
+          <td>Failure modes</td>
+          <td>Phase 3: all steps</td>
+          <td>Exact errors, which layer they occur at (NCCL, framework, container)</td>
+        </tr>
+      </tbody>
+    </table>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 7: EXP A2 - OOBLECK                                  -->
+    <!-- ============================================================ -->
+
+    <h2>7. Exp A2: Fault-Tolerant Training (Oobleck)</h2>
+
+    <h3>7.1 Technique Overview</h3>
+
+    <p><b>Oobleck</b> (SOSP &rsquo;23) enables resilient distributed training that tolerates
+       GPU failures without full checkpoint-and-restart. Its core innovation is
+       <b>pipeline templates</b>: pre-computed pipeline parallelism configurations for
+       different numbers of surviving GPUs. When a GPU fails, Oobleck selects the appropriate
+       template and redistributes pipeline stages to the remaining GPUs.</p>
+
+    <table>
+      <thead>
+        <tr><th>Aspect</th><th>Detail</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Code</td>
+          <td><a href="https://github.com/SymbioticLab/Oobleck">github.com/SymbioticLab/Oobleck</a>
+              (Python + Rust, Colossal-AI / PyTorch)</td>
+        </tr>
+        <tr>
+          <td>Capability</td>
+          <td>Tolerate <i>f</i> simultaneous GPU failures using <i>f</i>+1 heterogeneous
+              pipeline replicas. Up to 13.9&times; faster recovery than Bamboo/Varuna.</td>
+        </tr>
+        <tr>
+          <td>Recovery mechanism</td>
+          <td>Pre-computed templates &rarr; detect failure &rarr; select template &rarr;
+              redistribute stages &rarr; resume training</td>
+        </tr>
+        <tr>
+          <td>Deployment assumption</td>
+          <td>Bare metal. Detects failures via process exit / NCCL timeout.
+              All GPUs in shared namespace.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>7.2 Phase 1: Bare-Metal Baseline</h3>
+
+    <table>
+      <thead>
+        <tr><th>Step</th><th>Action</th><th>Record</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td>Build Oobleck on node192 (4 GPUs, bare metal)</td>
+          <td>Build success, dependency versions</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td>Start pipeline training (GPT-2 or similar).
+              Configure templates for 4, 3, and 2 GPUs.</td>
+          <td>Training throughput, pipeline configuration</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td>Kill one process (simulate GPU 3 failure: 4 &rarr; 3)</td>
+          <td>Detection time, recovery time, throughput after recovery</td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td>Kill another process (GPU 2 failure: 3 &rarr; 2)</td>
+          <td>Cascading recovery behavior, throughput with 2 GPUs</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>7.3 Phase 2: Multi-GPU Container (Production Approach)</h3>
+
+    <pre>
+  +-----------------------------------------------+
+  |         Single Container (4 GPUs)              |
+  |   GPU 0   GPU 1   GPU 2   GPU 3               |
+  |   Oobleck pipeline training                    |
+  |   GPU 3 experiences hardware error...          |
+  +-----------------------------------------------+</pre>
+
+    <table>
+      <thead>
+        <tr><th>Step</th><th>Action</th><th>Observe</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td>Start Oobleck inside a single container with 4 GPUs</td>
+          <td>Does training work inside a container? Performance vs. bare metal?</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td>Kill one training process (simulate GPU 3 failure)</td>
+          <td>Does Oobleck detect the failure and recover with 3 GPUs?
+              <b>Does the container stay healthy</b> or does K8s kill
+              the entire pod (liveness probe failure)?</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td>After recovery: check GPU resource state</td>
+          <td>Is the failed GPU still allocated to the container?
+              Can K8s replace GPU 3 without restarting the entire pod?
+              Or is the container permanently degraded (4 GPUs allocated,
+              only 3 usable)?</td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td>Simulate a more severe failure: kill the container entirely
+              (as a real GPU hardware error might cause)</td>
+          <td>All 4 GPUs lost. Full restart required.
+              How long until training resumes? What is the blast radius?</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="info-box">
+      <p style="margin:0"><b>What Phase 2 tests:</b> Whether Oobleck&rsquo;s fault tolerance
+         provides its intended benefit in a standard container deployment. Key questions:
+         (1) Does the container health model interact badly with framework-level recovery?
+         (2) Can the cluster replace failed GPUs without killing the entire pod?
+         If the answer to either is &ldquo;no,&rdquo; this motivates Phase&nbsp;3.</p>
+    </div>
+
+    <h3>7.4 Phase 3: Per-GPU Containers</h3>
+
+    <p>If Phase 2 shows that multi-GPU containers amplify failures or trap degraded GPUs,
+       per-GPU containers offer an alternative: each GPU failure kills only its container.</p>
+
+    <pre>
+  Start:                            After GPU 3 failure:
+  +----+ +----+ +----+ +----+       +----+ +----+ +----+
+  | C0 | | C1 | | C2 | | C3 |       | C0 | | C1 | | C2 |   C3 dead
+  |GPU0| |GPU1| |GPU2| |GPU3|       |GPU0| |GPU1| |GPU2|   GPU 3 free
+  +----+ +----+ +----+ +----+       +----+ +----+ +----+
+
+  Recovery:
+  +----+ +----+ +----+ +----+
+  | C0 | | C1 | | C2 | |C3' |       C3' = new container on healthy GPU
+  |GPU0| |GPU1| |GPU2| |GPU3|       (or GPU replaced by K8s)
+  +----+ +----+ +----+ +----+</pre>
+
+    <table>
+      <thead>
+        <tr><th>Step</th><th>Action</th><th>Observe</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td>Start 4 per-GPU containers. Launch Oobleck pipeline training.</td>
+          <td>Does pipeline training work across container boundaries?
+              NCCL transport? Throughput?</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td>Kill container C3 (<code>docker kill</code>)</td>
+          <td>Do surviving containers (C0&ndash;C2) detect C3&rsquo;s death?
+              How does detection work (NCCL timeout? TCP reset?)?
+              Can Oobleck trigger template transition across containers?
+              Can the surviving containers reform their NCCL communicator?</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td>After recovery: start replacement container C3&prime;</td>
+          <td>Can Oobleck incorporate the new container?
+              Can NCCL create a communicator spanning old + new containers?</td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td>Kill C2 (second failure: 3 &rarr; 2 containers)</td>
+          <td>Does cascading recovery work across containers?</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>7.5 Workarounds (Phase 3 only)</h3>
+
+    <table>
+      <thead>
+        <tr><th>Level</th><th>Workaround</th><th>What It Tests</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>0</td>
+          <td>Default container config</td>
+          <td>How far does Oobleck work out of the box in per-GPU containers?</td>
+        </tr>
+        <tr>
+          <td>1</td>
+          <td>Configuration: container health checks for failure detection,
+              Docker event monitoring as external failure oracle, shared
+              coordination volume</td>
+          <td>Whether container-level failure signals can feed into
+              Oobleck&rsquo;s recovery logic</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td>Framework patches: modify failure detection to handle
+              container-level events; adjust communicator recreation logic</td>
+          <td>Whether the problem is at the framework level</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td>System-level intervention: LD_PRELOAD interception to make
+              NCCL&rsquo;s namespace checks pass across containers;
+              custom IPC setup for GPU memory handle passing</td>
+          <td>Whether a transparent system-level layer can bridge containers</td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td>Relaxed isolation: progressively weaker namespace separation</td>
+          <td>Minimum isolation level for fault recovery to work</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>7.6 Measurements</h3>
+
+    <table>
+      <thead>
+        <tr><th>Metric</th><th>Measured At</th><th>Why</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Failure detection time</td>
+          <td>All phases</td>
+          <td>Time from GPU/process/container death to framework awareness.
+              May differ across phases.</td>
+        </tr>
+        <tr>
+          <td>Recovery time (total)</td>
+          <td>All phases</td>
+          <td>Detection + template selection + communicator reformation +
+              state redistribution</td>
+        </tr>
+        <tr>
+          <td>Training throughput</td>
+          <td>All phases, before/during/after failure</td>
+          <td>Performance comparison across containerization levels</td>
+        </tr>
+        <tr>
+          <td>Failure blast radius</td>
+          <td>Phase 2 vs. Phase 3</td>
+          <td>How many GPUs are lost per failure event</td>
+        </tr>
+        <tr>
+          <td>GPU replaceability</td>
+          <td>Phase 2 vs. Phase 3</td>
+          <td>Can the cluster replace the failed GPU without killing others?</td>
+        </tr>
+        <tr>
+          <td>Container health interaction</td>
+          <td>Phase 2</td>
+          <td>Does K8s health model conflict with framework recovery?</td>
+        </tr>
+      </tbody>
+    </table>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 8: DECISION POINTS                                   -->
+    <!-- ============================================================ -->
+
+    <h2>8. Decision Points and Extensions</h2>
+
+    <h3>8.1 After Phase 2 of Each Experiment</h3>
+
+    <p>Phase 2 determines whether we proceed to Phase 3:</p>
+
+    <table>
+      <thead>
+        <tr><th>Phase 2 Outcome</th><th>Implication</th><th>Next Step</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td style="color:#2e7d32;">Multi-GPU containers work well</td>
+          <td>The scheduling technique provides its intended benefit within
+              standard production containers</td>
+          <td>Document this as a finding (the container wall doesn&rsquo;t affect
+              this technique). Move to the next experiment.</td>
+        </tr>
+        <tr>
+          <td style="color:#e65100;">Multi-GPU containers have limitations</td>
+          <td>The framework works internally, but the container model prevents
+              the benefit from reaching the cluster (trapped GPUs, amplified
+              failures, etc.)</td>
+          <td>Proceed to Phase 3. The limitations motivate per-GPU containers.</td>
+        </tr>
+        <tr>
+          <td style="color:#c44e52;">Multi-GPU containers break the technique</td>
+          <td>The technique does not work at all in containers</td>
+          <td>Investigate why. Is it a container-specific issue (fixable) or a
+              fundamental assumption mismatch?</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>8.2 After Phase 3</h3>
+
+    <table>
+      <thead>
+        <tr><th>Phase 3 Outcome</th><th>What It Means</th><th>Next Step</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td style="color:#2e7d32;">Works with minor workarounds</td>
+          <td>The container wall is thinner than expected for this operation</td>
+          <td>Document exactly which workarounds are needed. Expand to more
+              techniques (Bamboo, Pollux). Begin cross-vendor testing.</td>
+        </tr>
+        <tr>
+          <td style="color:#e65100;">Works with significant effort</td>
+          <td>Real but surmountable challenges exist</td>
+          <td>Characterize the challenges. Generalize workarounds. Design
+              systematic solutions.</td>
+        </tr>
+        <tr>
+          <td style="color:#c44e52;">Fails fundamentally</td>
+          <td>New system-level mechanisms are needed</td>
+          <td>This is the strongest research finding. Characterize exactly what
+              mechanisms are missing. Design and build them.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="highlight-box">
+      <p style="margin:0"><b>Every outcome is a research finding.</b> Phase 2 success means
+         multi-GPU containers suffice. Phase 2 failure motivates per-GPU containers. Phase 3
+         success maps the feasibility frontier. Phase 3 failure reveals fundamental challenges.
+         The experiments are designed so there is no wasted outcome.</p>
+    </div>
+
+    <h3>8.3 Potential Extensions</h3>
+
+    <table>
+      <thead>
+        <tr><th>Extension</th><th>System</th><th>What It Adds</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Exp A3</b></td>
+          <td>Bamboo or Varuna</td>
+          <td>Simpler fault-tolerance mechanisms. Tests whether Oobleck&rsquo;s
+              findings generalize to other fault-tolerant training approaches.</td>
+        </tr>
+        <tr>
+          <td><b>Exp A4</b></td>
+          <td>Pollux / AdaptDL</td>
+          <td>Cluster-scheduler-level elasticity. Complements Tenplex&rsquo;s
+              framework-level approach.</td>
+        </tr>
+        <tr>
+          <td><b>Exp A5</b></td>
+          <td>KAI Scheduler + per-GPU pods</td>
+          <td>Full K8s integration with topology-aware per-GPU scheduling.
+              Requires K8s cluster.</td>
+        </tr>
+        <tr>
+          <td><b>Cross-vendor</b></td>
+          <td>AMD RCCL + selected technique</td>
+          <td>Test whether the same challenges apply on AMD MI250X/MI300X.</td>
+        </tr>
+      </tbody>
+    </table>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 9: SUMMARY                                           -->
+    <!-- ============================================================ -->
+
+    <h2>9. Summary</h2>
+
+    <div class="highlight-box">
+      <p style="margin:0"><b>Research question:</b> What happens when GPU scheduling techniques
+         &mdash; designed for bare metal &mdash; are deployed in containerized production
+         environments?</p>
+    </div>
+
+    <p><b>Motivation.</b> GPU scheduling evolved toward per-GPU granularity (Tenplex, NTP).
+       Production demands containers. Nobody has studied what happens when these two
+       realities collide.</p>
+
+    <p><b>Methodology.</b> Progressive containerization. For each scheduling technique:
+       bare metal (baseline) &rarr; multi-GPU container (production approach) &rarr;
+       per-GPU containers (if motivated by limitations). Challenges are discovered
+       empirically, not imagined.</p>
+
+    <p><b>Experiments.</b></p>
+    <ul>
+      <li><b>Exp A1 (Tenplex):</b> Elastic GPU add/remove. Does framework-level elasticity
+          translate to cluster-level elasticity in containers?</li>
+      <li><b>Exp A2 (Oobleck):</b> Fault-tolerant training. Does framework-level recovery
+          work when the failure unit is a container, not a process?</li>
+    </ul>
+
+    <p><b>Design principle.</b> Every phase is motivated by the previous. Every outcome
+       is a finding. The experiments discover the problem space; solutions follow.</p>
+
+
+    <hr style="margin:32px 0;">
+    <p style="font-size:12px;color:#666;text-align:center;">
+      Research Plan v4 &middot; 2026-04-15
+    </p>
+
+  </main>
+</body>
+</html>
