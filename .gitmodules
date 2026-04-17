@@ -1,0 +1,6 @@
+[submodule "exp_a1_tenplex/tenplex"]
+	path = exp_a1_tenplex/tenplex
+	url = https://github.com/kungfu-team/tenplex.git
+[submodule "exp_a3_vllm_ep/vllm"]
+	path = exp_a3_vllm_ep/vllm
+	url = https://github.com/vllm-project/vllm.git

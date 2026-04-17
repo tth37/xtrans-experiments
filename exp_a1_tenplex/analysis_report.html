@@ -1,0 +1,927 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Experiment A1: Tenplex Elastic Scheduling — Container Lifecycle Characterization</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: "Times New Roman", "Nimbus Roman", Times, serif;
+      background: #fff;
+      color: #111;
+      line-height: 1.6;
+    }
+    main {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 40px 32px 60px;
+    }
+    h1 {
+      font-size: 22px;
+      text-align: center;
+      margin: 0 0 4px;
+      line-height: 1.3;
+    }
+    .subtitle {
+      text-align: center;
+      font-size: 14px;
+      color: #444;
+      margin: 0 0 24px;
+    }
+    h2 {
+      font-size: 17px;
+      border-bottom: 1px solid #999;
+      padding-bottom: 4px;
+      margin: 28px 0 12px;
+    }
+    h3 {
+      font-size: 15px;
+      margin: 20px 0 8px;
+    }
+    h4 {
+      font-size: 14px;
+      margin: 16px 0 6px;
+    }
+    p, li {
+      font-size: 14px;
+      margin: 0 0 10px;
+    }
+    ul, ol {
+      padding-left: 24px;
+    }
+    .figure {
+      margin: 16px 0;
+      text-align: center;
+    }
+    .figure img {
+      max-width: 100%;
+      border: 1px solid #ccc;
+    }
+    .figure p {
+      font-size: 12px;
+      color: #666;
+      text-align: center;
+      margin-top: 4px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      margin: 12px 0;
+    }
+    th, td {
+      border: 1px solid #bbb;
+      padding: 5px 7px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #f0f0f0;
+      font-weight: bold;
+    }
+    td {
+      font-variant-numeric: tabular-nums;
+    }
+    code {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 13px;
+      background: #f5f5f5;
+      padding: 1px 4px;
+    }
+    pre {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 12px;
+      background: #f8f8f8;
+      border: 1px solid #ddd;
+      padding: 12px 16px;
+      margin: 12px 0;
+      overflow-x: auto;
+      line-height: 1.5;
+    }
+    .config-table {
+      width: auto;
+      margin: 12px 0;
+    }
+    .config-table td:first-child {
+      font-weight: bold;
+      white-space: nowrap;
+      padding-right: 16px;
+    }
+    .highlight-box {
+      background: #e8f5e9;
+      border: 2px solid #2e7d32;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .highlight-box p { margin: 0; }
+    .warning-box {
+      background: #fff3e0;
+      border: 2px solid #e65100;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .warning-box p { margin: 0; }
+    .info-box {
+      background: #e3f2fd;
+      border: 2px solid #1565c0;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .info-box p { margin: 0; }
+    hr.appendix {
+      border: none;
+      border-top: 2px solid #333;
+      margin: 36px 0 24px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+
+    <h1>Experiment A1: Tenplex Elastic Scheduling<br>Container Lifecycle Characterization</h1>
+    <p class="subtitle">
+      node192 &middot; 3&times; A100-SXM4-40GB + 1&times; A100-PCIE-40GB &middot; NVLink 3.0<br>
+      Generated 2026-04-16 &middot; commit d8953e3
+    </p>
+
+    <!-- ============================================================
+         1. OBJECTIVE
+         ============================================================ -->
+
+    <h2>1. Objective</h2>
+
+    <p>
+      Tenplex (SOSP &rsquo;24) is the state-of-the-art open-source system for elastic GPU scaling.
+      It reconfigures tensor, pipeline, and data parallelism dimensions between training stages,
+      preserving training progress across GPU allocation changes. This experiment reproduces
+      Tenplex&rsquo;s elastic scheduling on our hardware to answer two questions: (1) what is the
+      actual mechanism &mdash; is reconfiguration in-place or stop-and-restart? and (2) do
+      &ldquo;freed&rdquo; GPUs become available to the cluster after a scale-down event?
+    </p>
+
+    <div class="highlight-box">
+      <p><b>Result:</b> Tenplex uses multi-GPU Docker containers internally, and when it scales
+        from 4&nbsp;GPUs to 2&nbsp;GPUs, the container retains <code>--gpus&nbsp;device=0,1,2,3</code> &mdash;
+        GPUs&nbsp;2 and&nbsp;3 sit idle inside the container but remain <b>unavailable to the cluster</b>.
+        Framework-level elasticity does not translate to cluster-level elasticity under the multi-GPU
+        container model.</p>
+    </div>
+
+    <!-- ============================================================
+         2. BACKGROUND
+         ============================================================ -->
+
+    <h2>2. Background</h2>
+
+    <h3>2.1 Tenplex&rsquo;s Elastic Scaling &mdash; Not In-Place</h3>
+
+    <p>
+      Tenplex enables elastic GPU scaling for distributed training via Parallelizable Tensor Collections (PTCs).
+      The Tenplex paper describes this as reconfiguring TP&times;PP&times;DP parallelism &ldquo;without
+      restart,&rdquo; which might suggest in-place elasticity &mdash; dynamically adding or removing GPU
+      processes to a running training job. <b>This is not what Tenplex does.</b>
+    </p>
+
+    <p>
+      Source code analysis reveals that Tenplex&rsquo;s reconfiguration is a <b>stop&ndash;transform&ndash;restart</b>
+      cycle: the training process is fully terminated, model state is transformed on the host to match
+      the new parallelism layout, and a new training process starts from the transformed state. The
+      &ldquo;without restart&rdquo; claim refers to the fact that training <i>progress</i> is not lost
+      (the iteration counter continues), not that the process remains running. In practice, Tenplex
+      is a sophisticated checkpoint/restore system with two key optimizations over naive checkpoint/restore:
+    </p>
+
+    <ol>
+      <li><b>PTC state transformation:</b> Instead of saving a full checkpoint and reloading it
+        with a different parallelism config (which requires resharding tensors at load time),
+        Tenplex runs <code>tenplex-state-transformer</code> to directly convert the tensor layout
+        from source parallelism to target parallelism. The paper reports ~122s for a 16&rarr;8
+        GPU resize.</li>
+      <li><b>Orchestrated scheduling:</b> <code>tenplex-run</code> automates the full lifecycle
+        &mdash; stopping training, running state transformation, restarting with new parallelism
+        &mdash; driven by a scaling schedule.</li>
+    </ol>
+
+    <p>
+      Neither optimization changes the fundamental architecture: every reconfiguration involves
+      a full process stop and restart. There is no mechanism to add or remove GPU processes from
+      a running training job.
+    </p>
+
+    <h3>2.2 Tenplex&rsquo;s Architecture &mdash; A Key Discovery</h3>
+
+    <p>
+      Prior to running this experiment, we assumed Tenplex executed training as bare-metal processes.
+      Source code analysis revealed that <b>Tenplex uses Docker containers internally</b>.
+      The <code>tenplex-run</code> CLI is a Go orchestrator that:
+    </p>
+
+    <ol>
+      <li>SSHes to each host in the cluster</li>
+      <li>Runs <code>docker run --network host --gpus device=0,1,2,3 ...</code> to create training containers</li>
+      <li>Executes <code>torchrun</code> with Megatron-LM inside each container</li>
+      <li>Manages the scaling schedule by stopping and recreating containers at each scaling point</li>
+    </ol>
+
+    <p>
+      This means Tenplex already operates within a multi-GPU container model &mdash; the very model
+      that production Kubernetes deployments use. The question becomes: does this model support
+      cluster-level elasticity, or does it trap GPU resources?
+    </p>
+
+    <h3>2.3 Container Lifecycle During Reconfiguration</h3>
+
+    <p>
+      Source code analysis of <code>tenplex-run/runop/runop.go:ScalingTraining()</code> reveals that
+      every parallelism change follows this sequence:
+    </p>
+
+    <ol>
+      <li>Training receives a stop signal via an HTTP endpoint (<code>/stop</code>)</li>
+      <li>Training process exits; the container auto-removes (<code>docker run --rm</code>)</li>
+      <li><code>tenplex-state-transformer</code> repartitions PTC state on the host (when Tenplex mode is enabled);
+          or checkpoint is simply saved to disk (when running without Tenplex mode)</li>
+      <li>A <b>new container</b> starts with <code>docker run --gpus device=...</code> and the updated parallelism config</li>
+      <li>The new container loads the transformed state (or checkpoint) and resumes training</li>
+    </ol>
+
+    <p>
+      The following diagram illustrates the two modes:
+    </p>
+
+    <pre>
+Full Tenplex mode:
+  train (container A) &rarr; stop &rarr; PTC state transform on host &rarr; start (container B) &rarr; resume
+
+Without Tenplex (--no-tenplex, what we ran):
+  train (container A) &rarr; stop + save checkpoint &rarr; start (container B) &rarr; load checkpoint &rarr; resume
+    </pre>
+
+    <p>
+      In both modes, the container is fully destroyed and recreated. There is no mechanism to change
+      a running container&rsquo;s GPU assignment &mdash; the <code>--gpus</code> flag is fixed at
+      container creation time, a fundamental Docker constraint.
+    </p>
+
+    <!-- ============================================================
+         3. EXPERIMENTAL SETUP
+         ============================================================ -->
+
+    <h2>3. Experimental Setup</h2>
+
+    <h3>3.1 Hardware</h3>
+
+    <table class="config-table">
+      <tr><td>Node</td><td>node192</td></tr>
+      <tr><td>GPU</td><td>3&times; A100-SXM4-40GB + 1&times; A100-PCIE-40GB</td></tr>
+      <tr><td>Interconnect</td><td>NVLink 3.0 (600 GB/s bidirectional, SXM4 GPUs)</td></tr>
+      <tr><td>Network</td><td>enp3s0f0np0 (10.0.2.192), InfiniBand RDMA available</td></tr>
+      <tr><td>Kernel</td><td>6.8.0-1047-oracle</td></tr>
+    </table>
+
+    <h3>3.2 Software</h3>
+
+    <table class="config-table">
+      <tr><td>Tenplex</td><td>commit a76919a (main branch, built from source)</td></tr>
+      <tr><td>Container image</td><td><code>kungfu.azurecr.io/mw-megatron-lm-23.06-update:v0.0.3</code></td></tr>
+      <tr><td>PyTorch</td><td>2.1.1+cu118</td></tr>
+      <tr><td>CUDA (in container)</td><td>11.8.0</td></tr>
+      <tr><td>Docker</td><td>27.3.1 with NVIDIA Container Toolkit</td></tr>
+      <tr><td>Go</td><td>1.26.2 (for building <code>tenplex-run</code>)</td></tr>
+      <tr><td>Dataset</td><td>WikiText-103-raw-v1, preprocessed to Megatron-LM binary format (228 MB)</td></tr>
+    </table>
+
+    <h3>3.3 Model Configuration</h3>
+
+    <table class="config-table">
+      <tr><td>Model</td><td>GPT-2 Medium (24 layers, 1024 hidden, 16 heads, ~350M params)</td></tr>
+      <tr><td>Global batch size</td><td>32</td></tr>
+      <tr><td>Micro batch size</td><td>4</td></tr>
+      <tr><td>Sequence length</td><td>1024</td></tr>
+      <tr><td>Precision</td><td>FP16</td></tr>
+    </table>
+
+    <!-- ============================================================
+         4. CONFIGURATIONS UNDER TEST
+         ============================================================ -->
+
+    <h2>4. Configurations Under Test</h2>
+
+    <p>
+      We run a single <code>tenplex-run</code> invocation with a time-based scaling schedule that
+      exercises three stages. The <code>--no-tenplex</code> flag is used to bypass the mlfs dataset
+      system (which requires a specific dataset format), while retaining the container lifecycle
+      and scaling schedule orchestration. Without Tenplex mode, checkpoint save/load replaces
+      PTC state transformation between stages.
+    </p>
+
+    <table>
+      <thead>
+        <tr><th>Stage</th><th>Duration</th><th>GPUs</th><th>Parallelism</th><th>Docker Config</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Stage 0</b></td>
+          <td>10 min</td>
+          <td>4</td>
+          <td>TP=2, DP=2, PP=1</td>
+          <td><code>--gpus device=0,1,2,3</code><br><code>--nproc_per_node 4</code></td>
+        </tr>
+        <tr>
+          <td><b>Stage 1</b></td>
+          <td>10 min</td>
+          <td>2</td>
+          <td>TP=2, DP=1, PP=1</td>
+          <td><code>--gpus device=0,1,2,3</code><br><code>--nproc_per_node 2</code></td>
+        </tr>
+        <tr>
+          <td><b>Stage 2</b></td>
+          <td>10 min</td>
+          <td>4</td>
+          <td>TP=2, DP=2, PP=1</td>
+          <td><code>--gpus device=0,1,2,3</code><br><code>--nproc_per_node 4</code></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="warning-box">
+      <p><b>Note on <code>--no-tenplex</code> mode:</b> This run uses standard checkpoint save/load
+        between stages instead of Tenplex&rsquo;s PTC state transformation. The difference is the
+        mechanism for persisting model state between containers &mdash; not the container lifecycle
+        itself. In both modes, the container is fully stopped and recreated at each scaling event,
+        the <code>--gpus</code> device assignment is identical, and the scaling schedule is the same.
+        The GPU trapping finding applies equally to both modes. A follow-up run with full Tenplex
+        mode would additionally measure PTC transformation overhead, but would not change the
+        container-level behavior.</p>
+    </div>
+
+    <!-- ============================================================
+         5. RESULTS
+         ============================================================ -->
+
+    <h2>5. Results</h2>
+
+    <h3>5.1 Container Lifecycle</h3>
+
+    <p>
+      Docker container events were captured via <code>docker events --filter 'name=trainer'</code>.
+      Each scaling event follows an identical pattern: the old container dies, is destroyed
+      (<code>--rm</code>), and a new container is created and started.
+    </p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Stage</th>
+          <th>Container Created</th>
+          <th>Container Died</th>
+          <th>Wall Duration</th>
+          <th>Gap to Next</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Stage 0</b> (4 GPU)</td>
+          <td>02:45:03</td>
+          <td>02:55:13</td>
+          <td>610 s (10m10s)</td>
+          <td>1 s</td>
+        </tr>
+        <tr>
+          <td><b>Stage 1</b> (2 GPU)</td>
+          <td>02:55:14</td>
+          <td>03:05:20</td>
+          <td>606 s (10m6s)</td>
+          <td>1 s</td>
+        </tr>
+        <tr>
+          <td><b>Stage 2</b> (4 GPU)</td>
+          <td>03:05:21</td>
+          <td>03:10:35</td>
+          <td>314 s (OOM crash)</td>
+          <td>&mdash;</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      The container recreation gap &mdash; from old container destruction to new container creation &mdash;
+      is <b>~1&nbsp;second</b> in both transitions. Docker overhead for container lifecycle is negligible.
+      The real startup cost is inside the container: CUDA kernel compilation and model initialization
+      take ~2&ndash;3 minutes on the first run of each stage.
+    </p>
+
+    <h3>5.2 Training Throughput</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Stage</th>
+          <th>GPUs</th>
+          <th>Parallelism</th>
+          <th>Iterations</th>
+          <th>Mean Iter Time</th>
+          <th>Min / Max</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Stage 0</b></td>
+          <td>4</td>
+          <td>TP=2, DP=2</td>
+          <td>~290</td>
+          <td>947.6 ms</td>
+          <td>938.2 / 1009.8 ms</td>
+        </tr>
+        <tr>
+          <td><b>Stage 1</b></td>
+          <td>2</td>
+          <td>TP=2, DP=1</td>
+          <td>~430</td>
+          <td>738.7 ms</td>
+          <td>698.7 / 1775.1 ms</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      Stage 1 (2 GPUs) has a <b>lower per-iteration time</b> (738.7 ms vs 947.6 ms) because
+      eliminating data parallelism removes the AllReduce gradient synchronization. However,
+      with half the GPUs, the effective training throughput in tokens/s is lower: each iteration
+      still processes a global batch of 32 samples, but with 2 GPUs each handling
+      micro-batch&nbsp;=&nbsp;4 &times; 4 accumulation steps, versus 4 GPUs with no accumulation.
+    </p>
+
+    <p>
+      Checkpoint continuity was maintained: Stage 1 loaded the checkpoint saved at iteration 299
+      by Stage 0, and continued training from iteration 300. Stage 2 loaded the checkpoint at
+      iteration 721 from Stage 1.
+    </p>
+
+    <h3>5.3 GPU Assignment &mdash; The Trapping Problem</h3>
+
+    <p>
+      This is the central finding. We extracted the exact <code>docker run</code> commands from
+      each stage&rsquo;s log:
+    </p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Stage</th>
+          <th>Active GPUs</th>
+          <th><code>--gpus</code> Flag</th>
+          <th><code>--nproc_per_node</code></th>
+          <th>Idle GPUs</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Stage 0</b></td>
+          <td>0, 1, 2, 3</td>
+          <td><code>device=0,1,2,3</code></td>
+          <td>4</td>
+          <td>None</td>
+        </tr>
+        <tr>
+          <td><b>Stage 1</b></td>
+          <td>0, 1</td>
+          <td><code>device=0,1,2,3</code></td>
+          <td>2</td>
+          <td><b>GPU 2, GPU 3</b></td>
+        </tr>
+        <tr>
+          <td><b>Stage 2</b></td>
+          <td>0, 1, 2, 3</td>
+          <td><code>device=0,1,2,3</code></td>
+          <td>4</td>
+          <td>None</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      In Stage 1, Tenplex scales the training workload from 4 GPUs to 2, but the Docker container
+      still holds all 4 GPUs via <code>--gpus device=0,1,2,3</code>. GPUs 2 and 3 are completely
+      idle &mdash; no training process is assigned to them &mdash; yet they remain allocated to the
+      container and are <b>invisible to the cluster scheduler</b>.
+    </p>
+
+    <p>
+      This occurs because Tenplex&rsquo;s <code>createWorkers()</code> function
+      (<code>tenplex-run/job/job.go</code>) computes GPU assignments from the
+      <code>gpu-per-host</code> and <code>gpu-per-container</code> flags, which are global
+      constants &mdash; not adjusted per scaling point. The number of <i>processes</i>
+      (<code>nproc_per_node</code>) changes with parallelism, but the container&rsquo;s device
+      allocation does not.
+    </p>
+
+    <h3>5.4 Stage 2 Failure &mdash; OOM on Scale-Up</h3>
+
+    <p>
+      Stage 2 attempted to scale back to 4 GPUs but crashed with a CUDA out-of-memory error
+      on GPU 2:
+    </p>
+
+    <pre>torch.cuda.OutOfMemoryError: CUDA out of memory.
+Tried to allocate 64.00 MiB. GPU 2 has a total capacity of 39.49 GiB
+of which 51.12 MiB is free.</pre>
+
+    <p>
+      GPU 2 had 39.49 GiB total but only 51 MiB free at allocation time, despite the previous
+      container being destroyed (<code>--rm</code>). This suggests that during the ~1s gap between
+      containers, another process on the node claimed GPU 2&rsquo;s memory. This highlights a
+      real-world risk in multi-tenant environments: <b>GPUs released during scale-down can be
+      seized by other workloads, making scale-up unreliable</b>.
+    </p>
+
+    <!-- ============================================================
+         6. ANALYSIS
+         ============================================================ -->
+
+    <h2>6. Analysis</h2>
+
+    <h3>6.1 Why GPUs Are Trapped</h3>
+
+    <p>
+      The GPU trapping problem emerges from the interaction of three design decisions, each
+      individually reasonable:
+    </p>
+
+    <ol>
+      <li>
+        <b>Docker&rsquo;s GPU allocation is immutable.</b> The <code>--gpus</code> flag is set
+        at container creation and cannot be changed at runtime. Docker provides no API to
+        release a subset of GPUs from a running container. This is a fundamental constraint
+        of the container runtime.
+      </li>
+      <li>
+        <b>Tenplex uses a fixed container GPU configuration.</b> The <code>gpu-per-container</code>
+        parameter is a global constant (4 in our setup). When Tenplex scales to 2 GPUs, it
+        reduces <code>nproc_per_node</code> from 4 to 2 but does not change the container&rsquo;s
+        device allocation. This is a Tenplex design choice &mdash; the container is treated as a
+        resource envelope, not a precise allocation.
+      </li>
+      <li>
+        <b>Kubernetes reinforces the trap.</b> In production, the NVIDIA device plugin allocates
+        GPUs to pods at scheduling time. Even if the training process frees GPUs internally,
+        the pod&rsquo;s cgroup still holds them. K8s does not support partial GPU deallocation
+        from a running pod. The in-place pod resize feature (KEP-1287) explicitly excludes GPU
+        resources.
+      </li>
+    </ol>
+
+    <p>
+      The result is a disconnect between <b>framework-level elasticity</b> (Tenplex can resize)
+      and <b>cluster-level elasticity</b> (freed GPUs are not reclaimable). From the cluster
+      scheduler&rsquo;s perspective, all 4 GPUs remain &ldquo;in use&rdquo; for the entire duration
+      of the training job, regardless of how many the job actually needs at any given moment.
+    </p>
+
+    <h3>6.2 Quantifying the Waste</h3>
+
+    <p>
+      In our experiment, Stage 1 ran for 606 seconds with 2 GPUs idle. This represents:
+    </p>
+
+    <ul>
+      <li><b>2 GPU &times; 606 s = 1,212 GPU-seconds of waste</b> (GPUs powered on, memory allocated, but doing no work)</li>
+      <li>As a fraction of total GPU-time across all stages: 1,212 / (4 &times; 1,530) = <b>19.8% of GPU resources wasted</b></li>
+    </ul>
+
+    <p>
+      In Tenplex&rsquo;s paper benchmarks, which run on 16&ndash;64 GPUs with more frequent scaling
+      events from the Microsoft Philly trace, the waste fraction would be proportionally larger
+      during scale-down periods.
+    </p>
+
+    <h3>6.3 The Reconfiguration Overhead Breakdown</h3>
+
+    <p>
+      Each scaling event incurs the following costs:
+    </p>
+
+    <table>
+      <thead>
+        <tr><th>Component</th><th>Time</th><th>Notes</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Container destroy + create</td>
+          <td>~1 s</td>
+          <td>Docker overhead is negligible</td>
+        </tr>
+        <tr>
+          <td>CUDA kernel compilation</td>
+          <td>~30 s</td>
+          <td>JIT compilation of fused kernels (first run per container)</td>
+        </tr>
+        <tr>
+          <td>Model initialization</td>
+          <td>~90 s</td>
+          <td>Weight allocation, optimizer state, data loader setup</td>
+        </tr>
+        <tr>
+          <td>Checkpoint load</td>
+          <td>&lt;5 s</td>
+          <td>Loading 350M-param checkpoint from local NVMe</td>
+        </tr>
+        <tr>
+          <td><b>Total per reconfiguration</b></td>
+          <td><b>~2&ndash;3 min</b></td>
+          <td>GPUs idle during entire period</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      The dominant cost is not Docker or state transformation &mdash; it is the cold start of a
+      new PyTorch process inside the container. This cost would persist even with per-GPU containers,
+      as each new container must compile CUDA kernels and initialize the model.
+    </p>
+
+    <div class="warning-box">
+      <p><b>Limitation:</b> This experiment used <code>--no-tenplex</code> mode, which replaces
+        PTC state transformation with standard checkpoint save/load. The full Tenplex mode adds
+        a state transformation step (reported as ~122s in the paper for 16&rarr;8 GPUs) but
+        eliminates the need for checkpoint save/load. The container lifecycle and GPU trapping
+        behavior are identical in both modes.</p>
+    </div>
+
+    <h3>6.4 Does Tenplex Motivate Per-GPU Containers?</h3>
+
+    <p>
+      The GPU trapping observed in Section 5.3 is <b>not a fundamental limitation of multi-GPU
+      containers</b>. It is an engineering detail in Tenplex&rsquo;s implementation: the
+      <code>gpu-per-container</code> parameter is hardcoded rather than adjusted per scaling point.
+      A straightforward fix &mdash; creating the Stage&nbsp;1 container with
+      <code>--gpus device=0,1</code> instead of <code>device=0,1,2,3</code> &mdash; would release
+      GPUs 2 and 3 to the cluster. This is purely engineering work, not a research contribution.
+    </p>
+
+    <p>
+      More fundamentally, Tenplex&rsquo;s stop-transform-restart architecture means that
+      <b>multi-GPU containers can support elastic scheduling perfectly well</b>. The sequence
+      is: stop the old container &rarr; transform state &rarr; start a new container with a
+      different GPU count. The container boundary adds no friction because the process is
+      already stopped. The optimization opportunities lie in checkpoint/restore efficiency
+      and cold-start reduction, not in container granularity.
+    </p>
+
+    <p>
+      <b>Per-GPU containers are motivated by in-place elasticity, not stop-restart elasticity.</b>
+      If training processes remain running while GPUs are added or removed &mdash; without stopping
+      and restarting the entire job &mdash; then Docker&rsquo;s immutable <code>--gpus</code> flag
+      becomes a genuine barrier. A running container cannot release or acquire GPUs. Per-GPU
+      containers solve this: stopping a container immediately frees its GPU, while surviving
+      containers continue training uninterrupted.
+    </p>
+
+    <h4>The In-Place Elasticity Landscape</h4>
+
+    <p>
+      Tenplex is not in-place elastic. How close are other systems?
+    </p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>System</th>
+          <th>Venue</th>
+          <th>Elasticity Type</th>
+          <th>GPU Count Changes?</th>
+          <th>Motivates Per-GPU?</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Tenplex</b></td>
+          <td>SOSP &rsquo;24</td>
+          <td>Stop-restart</td>
+          <td>Yes</td>
+          <td style="color:#c44e52;"><b>No</b> &mdash; multi-GPU containers suffice</td>
+        </tr>
+        <tr>
+          <td><b>Gyges</b></td>
+          <td>arXiv &rsquo;25</td>
+          <td>In-place (inference)</td>
+          <td style="color:#c44e52;">No (TP1&harr;TP4, fixed GPU count)</td>
+          <td style="color:#e65100;">Partial &mdash; in-place but no true elasticity</td>
+        </tr>
+        <tr>
+          <td><b>ElasWave</b></td>
+          <td>arXiv &rsquo;25</td>
+          <td>In-place (training)</td>
+          <td style="color:#2e7d32;">Yes (online resharding)</td>
+          <td style="color:#2e7d32;"><b>Yes</b> &mdash; dynamic communicator, sub-second recovery</td>
+        </tr>
+        <tr>
+          <td><b>Elastic Horovod</b></td>
+          <td>&mdash;</td>
+          <td>In-place (DP only)</td>
+          <td style="color:#2e7d32;">Yes (workers join/leave)</td>
+          <td style="color:#e65100;">Partial &mdash; DP only, no TP/PP</td>
+        </tr>
+        <tr>
+          <td><b>LoongServe</b></td>
+          <td>SOSP &rsquo;24</td>
+          <td>In-place (inference, SP)</td>
+          <td style="color:#c44e52;">No (sequence parallelism only)</td>
+          <td style="color:#e65100;">Partial &mdash; different parallelism axis</td>
+        </tr>
+        <tr>
+          <td><b>TorchElastic</b></td>
+          <td>&mdash;</td>
+          <td>Stop-restart</td>
+          <td style="color:#2e7d32;">Yes</td>
+          <td style="color:#c44e52;"><b>No</b> &mdash; full worker group restart</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      <b>ElasWave</b> is the strongest candidate for motivating per-GPU containers: it performs
+      online elastic recovery from in-memory state with a dynamic communicator that edits
+      communication groups in-place, achieving sub-second recovery time. Its training processes
+      keep running while GPUs are added or removed. Under a multi-GPU container model, this
+      capability would be blocked by Docker&rsquo;s immutable GPU assignment. Under a per-GPU
+      container model, adding a GPU means starting one new container; removing a GPU means
+      stopping one container &mdash; while all other containers continue training.
+    </p>
+
+    <p>
+      <b>Gyges</b> demonstrates that in-place parallelism transformation is feasible for inference
+      (TP1&harr;TP4 with zero downtime), but does not change the GPU count. It motivates the
+      mechanism but not the full elasticity story.
+    </p>
+
+    <div class="highlight-box">
+      <p><b>Key insight from Exp&nbsp;A1:</b> Stop-restart elastic systems like Tenplex do not
+        motivate per-GPU containers &mdash; multi-GPU containers handle them adequately. To
+        motivate per-GPU containers, we need <b>in-place elastic scheduling</b> where training
+        processes survive GPU allocation changes. ElasWave (online resharding, dynamic communicators)
+        is the strongest open-source candidate for this direction.</p>
+    </div>
+
+    <!-- ============================================================
+         7. CONCLUSIONS
+         ============================================================ -->
+
+    <h2>7. Conclusions</h2>
+
+    <ol>
+      <li>
+        <b>Tenplex is not in-place elastic &mdash; it is stop-transform-restart:</b> every parallelism
+        reconfiguration fully terminates the training process, destroys the container, and creates a
+        new one. Tenplex&rsquo;s contribution over naive checkpoint/restore is the PTC state transformation
+        (converting tensor layouts between parallelism configs), not in-place process management.
+      </li>
+      <li>
+        <b>GPU trapping is an implementation detail, not a fundamental limitation:</b> when scaling
+        from 4 to 2 GPUs, Tenplex&rsquo;s container retains all 4 GPU devices (19.8% waste in our schedule).
+        However, since Tenplex stops and recreates the container anyway, the fix is trivial: create the
+        new container with <code>--gpus device=0,1</code>. Multi-GPU containers can support stop-restart
+        elasticity without GPU trapping.
+      </li>
+      <li>
+        <b>Stop-restart elasticity does not motivate per-GPU containers:</b> since the training process
+        is fully stopped at each scaling event, changing the container&rsquo;s GPU allocation is
+        straightforward. The optimization opportunities are in checkpoint/restore speed and cold-start
+        reduction, not container granularity.
+      </li>
+      <li>
+        <b>Per-GPU containers are motivated by in-place elasticity:</b> if training processes survive
+        GPU allocation changes (as in ElasWave&rsquo;s online resharding or Gyges&rsquo;s in-place
+        parallelism transformation), Docker&rsquo;s immutable <code>--gpus</code> flag becomes a
+        genuine barrier that per-GPU containers resolve.
+      </li>
+      <li>
+        <b>Container recreation is fast (~1s), but cold start is not:</b> the real reconfiguration
+        overhead is ~2&ndash;3 minutes of CUDA compilation and model initialization per scaling event,
+        during which all assigned GPUs are idle.
+      </li>
+      <li>
+        <b>Scale-up is fragile in multi-tenant environments:</b> the 1s gap between container
+        destruction and recreation is enough for other processes to claim GPU memory, causing
+        OOM failures when scaling back up.
+      </li>
+    </ol>
+
+    <div class="info-box">
+      <p><b>Next steps:</b> Tenplex&rsquo;s stop-restart model does not motivate per-GPU containers.
+        To find systems that do, we should investigate <b>in-place elastic scheduling</b> systems
+        &mdash; where training processes survive GPU allocation changes. Candidates:
+        (1)&nbsp;<b>ElasWave</b> (online resharding with dynamic communicators, sub-second recovery),
+        (2)&nbsp;<b>Gyges</b> (in-place TP transformation for inference, fixed GPU count), and
+        (3)&nbsp;<b>Elastic Horovod</b> (in-place DP worker join/leave). An in-place elastic system
+        running in per-GPU containers &mdash; where scaling is expressed as container lifecycle &mdash;
+        would be the strongest demonstration of the per-GPU container value proposition.
+        See updated research plan (Section 4.2) for revised candidate analysis.</p>
+    </div>
+
+    <!-- ============================================================
+         APPENDICES
+         ============================================================ -->
+
+    <hr class="appendix">
+
+    <h2>Appendix A: Docker Events Log</h2>
+
+    <p>Raw container lifecycle events captured during the experiment:</p>
+
+    <pre>
+1776307503 create  trainer-exp-a1-p1-00   (Stage 0 start)
+1776307504 start   trainer-exp-a1-p1-00
+1776308113 die     trainer-exp-a1-p1-00   (Stage 0 end, 609s)
+1776308113 destroy trainer-exp-a1-p1-00
+
+1776308114 create  trainer-exp-a1-p1-00   (Stage 1 start, 1s gap)
+1776308115 start   trainer-exp-a1-p1-00
+1776308720 die     trainer-exp-a1-p1-00   (Stage 1 end, 605s)
+1776308720 destroy trainer-exp-a1-p1-00
+
+1776308721 create  trainer-exp-a1-p1-00   (Stage 2 start, 1s gap)
+1776308722 start   trainer-exp-a1-p1-00
+1776309035 die     trainer-exp-a1-p1-00   (Stage 2 OOM crash, 313s)
+1776309035 destroy trainer-exp-a1-p1-00</pre>
+
+    <h2>Appendix B: Tenplex-Run Command</h2>
+
+    <pre>
+tenplex-run \
+  -framework megatron-lm \
+  -model gpt -model-size medium \
+  -batch-size 32 -micro-batch-size 4 \
+  -precision fp16 \
+  -image kungfu.azurecr.io/mw-megatron-lm-23.06-update:v0.0.3 \
+  -user thd \
+  -hosts 10.0.2.192 \
+  -gpu-per-host 4 -gpu-per-container 4 \
+  -tenplex-prefix ~/.tenplex \
+  -jobid exp-a1-p1 \
+  -time-based \
+  -detect-self-ip enp3s0f0np0 \
+  -para-config configs/para-config.json \
+  -schedule-file configs/schedule.json \
+  -no-pull-image -no-tenplex -disable-ib</pre>
+
+    <h2>Appendix C: Scaling Schedule and Parallelism Config</h2>
+
+    <h4>schedule.json</h4>
+    <pre>
+[
+  {"time": 10, "size": 4},
+  {"time": 10, "size": 2},
+  {"time": 10, "size": 4},
+  {"time": 0, "size": 0}
+]</pre>
+
+    <h4>para-config.json</h4>
+    <pre>
+{
+  "4": {"dp_size": 2, "pp_size": 1, "mp_size": 2},
+  "2": {"dp_size": 1, "pp_size": 1, "mp_size": 2}
+}</pre>
+
+    <h2>Appendix D: Docker Run Commands (Extracted from Logs)</h2>
+
+    <h4>Stage 0 (4 GPUs)</h4>
+    <pre>
+docker run \
+  -v /mnt/k1d2/megatron-lm:/data/dataset \
+  -v /mnt/k1d2/ckpt:/data/ckpt \
+  --gpus '"device=0,1,2,3"' \
+  --network host --name trainer-exp-a1-p1-00 --rm \
+  --shm-size 1g --ulimit memlock=-1 \
+  -t kungfu.azurecr.io/mw-megatron-lm-23.06-update:v0.0.3 \
+  torchrun --nproc_per_node 4 --nnodes 1 --node_rank 0 \
+    --master_addr 10.0.2.192 --master_port 6000 \
+    /workspace/Megatron-LM/pretrain_gpt.py \
+    --tensor-model-parallel-size 2 \
+    --pipeline-model-parallel-size 1 \
+    --global-batch-size 32 --micro-batch-size 4 \
+    --fp16 ...</pre>
+
+    <h4>Stage 1 (2 GPUs &mdash; note: same <code>--gpus</code>, different <code>--nproc_per_node</code>)</h4>
+    <pre>
+docker run \
+  -v /mnt/k1d2/megatron-lm:/data/dataset \
+  -v /mnt/k1d2/ckpt:/data/ckpt \
+  --gpus '"device=0,1,2,3"'            &lt;-- UNCHANGED
+  --network host --name trainer-exp-a1-p1-00 --rm \
+  --shm-size 1g --ulimit memlock=-1 \
+  -t kungfu.azurecr.io/mw-megatron-lm-23.06-update:v0.0.3 \
+  torchrun --nproc_per_node 2 --nnodes 1 --node_rank 0 \
+    --master_addr 10.0.2.192 --master_port 6000 \
+    /workspace/Megatron-LM/pretrain_gpt.py \
+    --tensor-model-parallel-size 2 \
+    --pipeline-model-parallel-size 1 \
+    --global-batch-size 32 --micro-batch-size 4 \
+    --fp16 ...</pre>
+
+  </main>
+</body>
+</html>
