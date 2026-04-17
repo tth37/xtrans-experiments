@@ -1,0 +1,230 @@
+# Exp A3: In-Place Elastic Expert Parallelism with vLLM
+
+## Overview
+
+**System under test:** [vLLM](https://github.com/vllm-project/vllm) Elastic EP (v0.17+, using v0.19.0)
+**Scheduling operation:** In-place live rescaling of expert parallelism for MoE models
+**Research plan:** `docs/research_plan_v4.html` Section 8
+**vLLM source:** `vllm/` (git submodule)
+
+vLLM's Elastic EP enables live rescaling of expert parallel workers — adding or removing
+GPUs for MoE inference without restarting the serving process. This is **in-place elasticity**:
+the process survives GPU allocation changes.
+
+## Why This Experiment
+
+Exp A1 (Tenplex) showed that **stop-restart elastic systems do not motivate per-GPU containers**
+— multi-GPU containers handle them fine. Per-GPU containers are motivated by **in-place
+elasticity**, where the serving process stays running while GPUs are added/removed. Docker
+cannot change GPU assignment of a running container, so in-place elasticity is fundamentally
+blocked by multi-GPU containers. Per-GPU containers resolve this: each expert worker lives
+in its own container, and scaling is expressed as container lifecycle.
+
+## Model Selection
+
+**Chosen model: Qwen3-30B-A3B** — a modern MoE model with 128 experts, ideal for EP.
+
+| Model | Total Params | Active | Experts | EP=4 per GPU | Fits 4x A100-40GB? |
+|-------|-------------|--------|---------|--------------|---------------------|
+| **Qwen3-30B-A3B** | 30.5B | 3.3B | 128 (8 active) | 32 experts/GPU, ~15GB | **Yes (selected)** |
+| Qwen3.5-35B-A3B | ~35B | ~3.5B | TBD | TBD | Yes but tighter |
+| DeepSeek-V2-Lite | 15.7B | 2.4B | 64 (6 active) | 16 experts/GPU | Yes (too small for EP) |
+| Qwen1.5-MoE-A2.7B | 14.3B | 2.7B | 60 | 15 experts/GPU | Yes (too small for EP) |
+
+**Why Qwen3-30B-A3B:**
+- 128 experts makes EP=4 meaningful (32 experts/GPU vs. just 15-16 for smaller models)
+- BF16 weights ≈ 61GB → ~15.25GB/GPU with EP=4, leaving ~25GB for KV cache
+- Well-supported by vLLM (explicitly listed in docs for EPLB)
+- Qwen3 is current-generation (2025), not Qwen1.5 (2024)
+
+**Download:** `Qwen/Qwen3-30B-A3B` via HF mirror → `/data/models--Qwen--Qwen3-30B-A3B/`
+
+## Setup
+
+### 1. vLLM Installation (Done)
+
+```bash
+cd /home/thd/repositories/xtrans-experiments
+source .venv/bin/activate
+uv pip install vllm         # installed v0.19.0
+uv pip install "ray[default]"  # installed v2.55.0 (required for elastic EP)
+
+python -c "import vllm; print(vllm.__version__)"  # 0.19.0
+```
+
+### 2. Model Download
+
+```bash
+# Create cache dir (requires sudo on node192)
+sudo mkdir -p /data/models--Qwen--Qwen3-30B-A3B
+sudo chmod 777 /data/models--Qwen--Qwen3-30B-A3B
+
+# Download in tmux (16 safetensor shards, ~60GB total)
+tmux new-session -d -s model-download \
+    'source .venv/bin/activate && \
+     HF_ENDPOINT=https://hf-mirror.com huggingface-cli download \
+        Qwen/Qwen3-30B-A3B --cache-dir /data \
+        > /tmp/qwen3-moe-download.log 2>&1; \
+     echo "EXIT_CODE=$?" >> /tmp/qwen3-moe-download.log'
+
+# Check progress:
+tail -f /tmp/qwen3-moe-download.log
+```
+
+### 3. Start Serving with Elastic EP
+
+```bash
+# Resolve model path from HF cache
+MODEL=/data/models--Qwen--Qwen3-30B-A3B/snapshots/<hash>
+
+# Start with DP=4, TP=1, EP=4 (auto), elastic EP enabled
+export CUDA_DEVICE_ORDER=PCI_BUS_ID  # mixed SXM4 + PCIe GPUs
+vllm serve "$MODEL" \
+    --tensor-parallel-size 1 \
+    --data-parallel-size 4 \
+    --data-parallel-backend ray \
+    --enable-expert-parallel \
+    --enable-elastic-ep \
+    --enable-eplb \
+    --all2all-backend allgather_reducescatter \
+    --max-model-len 4096 \
+    --max-num-seqs 32 \
+    --gpu-memory-utilization 0.85 \
+    --enforce-eager \
+    --trust-remote-code \
+    --port 8000
+
+# Or use the script:
+./scripts/phase1_native.sh serve
+```
+
+### 4. Trigger Live Rescaling
+
+```bash
+# Scale down: 4→2 DP workers
+curl -X POST http://localhost:8000/scale_elastic_ep \
+    -H "Content-Type: application/json" \
+    -d '{"new_data_parallel_size": 2, "drain_timeout": 120}'
+
+# Scale up: 2→4 DP workers
+curl -X POST http://localhost:8000/scale_elastic_ep \
+    -H "Content-Type: application/json" \
+    -d '{"new_data_parallel_size": 4, "drain_timeout": 120}'
+
+# Check if currently scaling
+curl http://localhost:8000/is_scaling_elastic_ep
+```
+
+## Experiment Phases
+
+### Phase 1: vLLM Elastic EP Native (Baseline)
+
+Run vLLM with EP on 4 GPUs natively. Confirm live rescaling works.
+
+**Procedure:**
+1. `./scripts/phase1_native.sh serve` — start serving with DP=4 (EP=4)
+2. `./scripts/phase1_native.sh bench 4` — baseline throughput at DP=4
+3. `./scripts/phase1_native.sh scale-down 2` — trigger 4→2 rescaling
+4. `./scripts/phase1_native.sh bench 2` — throughput at DP=2
+5. `./scripts/phase1_native.sh scale-up 4` — trigger 2→4 rescaling
+6. `./scripts/phase1_native.sh bench 4` — throughput after re-scaling
+
+**Record:** throughput (tok/s), rescaling time (ms), expert redistribution, request continuity (503s during scaling?)
+
+**Script:** `scripts/phase1_native.sh`
+**Results:** `results/phase1/`
+
+### Phase 2: Multi-GPU Container (The In-Place Barrier)
+
+Run vLLM inside a single container with all 4 GPUs.
+- Scale-down works internally, but GPUs are **trapped** (Docker can't release them)
+- Scale-up impossible (Docker can't hot-add GPUs)
+- This is the **fundamental limitation** for in-place systems (unlike Tenplex where it was just engineering)
+
+**Script:** `scripts/phase2_container.sh`
+
+### Phase 3: Per-GPU Containers (The Solution)
+
+Each EP worker in its own container. Scaling = container lifecycle.
+- Scale-down: stop containers → GPUs **immediately free**
+- Scale-up: start new containers → new workers join
+- Key challenges: cross-container NCCL All-to-All, dynamic communicator creation
+
+**Script:** `scripts/phase3_per_gpu.sh`
+
+## Elastic EP Investigation Findings
+
+### Architecture (from vLLM v0.19.0 source)
+
+**How Elastic EP works:**
+1. **Endpoint:** `POST /scale_elastic_ep` accepts `{"new_data_parallel_size": N, "drain_timeout": 120}`
+2. **Middleware:** `ScalingMiddleware` returns 503 to all requests during rescaling
+3. **Scale-down flow:** Engines at ranks >= N get `SHUTDOWN_CURRENT_RANK`, remaining engines reinitialize NCCL groups
+4. **Scale-up flow:** Existing engines get `ReconfigureDistributedRequest`, new Ray actors spawned, expert weights transferred P2P, EPLB reshuffles expert placement
+5. **Stateless NCCL groups:** Key innovation — uses `StatelessGroupCoordinator` instead of global process groups, enabling dynamic communicator creation/destruction
+
+**Key constraints:**
+- Ray backend mandatory (`--data-parallel-backend ray`)
+- EPLB required (`--enable-eplb`)
+- No pipeline parallelism
+- Single API server (`--api-server-count 1`)
+- EP size = TP × DP (no explicit `--expert-parallel-size` flag)
+
+**Key source files (in `vllm/` submodule):**
+- `vllm/entrypoints/serve/elastic_ep/api_router.py` — HTTP endpoint
+- `vllm/entrypoints/serve/elastic_ep/middleware.py` — 503 during scaling
+- `vllm/v1/engine/core_client.py` — `AsyncMPClient._scale_{up,down}_elastic_ep()`
+- `vllm/distributed/elastic_ep/elastic_state.py` — state machine for scaling
+- `vllm/distributed/elastic_ep/elastic_execute.py` — weight transfer logic
+- `vllm/config/parallel.py` — `enable_elastic_ep` flag definition
+- `examples/online_serving/elastic_ep/scale.py` — example client
+
+### Scale-Up State Machine
+```
+WAIT_NEW_CORE_ENGINES_INIT → CREATE_STANDBY_GROUPS → TRANSFER_EXPERT_MAPPING
+→ WAIT_NEW_CORE_ENGINES_WEIGHTS_INIT → TRANSFER_WEIGHTS → SYNC_KV_CACHE_MEMORY_SIZE
+→ SWITCH_AND_PREPARE → EPLB_RESHUFFLE → COMPLETE
+```
+
+## Dependencies
+
+| Dependency | Status | Notes |
+|-----------|--------|-------|
+| vLLM v0.19.0 | Installed | `.venv/`, `uv pip install vllm` |
+| Ray v2.55.0 | Installed | `.venv/`, `uv pip install "ray[default]"` |
+| Qwen3-30B-A3B | Downloading | `/data/models--Qwen--Qwen3-30B-A3B/`, ~60GB |
+| NCCL shim | Available | `common/shim/` (may be needed for Phase 3) |
+| Docker | Available | 27.3.1 with NVIDIA Container Toolkit |
+
+## Hardware
+
+- **Machine:** node192
+- **GPUs:** 3x NVIDIA A100-SXM4-40GB + 1x NVIDIA A100-PCIE-40GB
+- **Driver:** 590.44.01, CUDA 12.4–13.1 available
+- **Network:** enp3s0f0np0 (10.0.2.192)
+
+**GPU Topology** (heterogeneous):
+```
+        GPU0    GPU1    GPU2    GPU3
+GPU0     X      NV12    SYS     SYS     ← NUMA 0
+GPU1    NV12     X      SYS     SYS     ← NUMA 0
+GPU2    SYS     SYS      X      PIX     ← NUMA 1
+GPU3    SYS     SYS     PIX      X      ← NUMA 1
+```
+- GPU0 ↔ GPU1: NVLink 3.0 (12 links, full bandwidth)
+- GPU2 ↔ GPU3: PIX (single PCIe bridge)
+- Cross-group: SYS (cross-NUMA via QPI, slowest)
+
+**Impact on EP:** All-to-All communication for expert dispatch will have mixed
+bandwidth. GPU0-1 experts can communicate fast (NVLink), but cross-group
+communication (expert on GPU0 routing to GPU3) traverses QPI. This is the
+baseline topology constraint — same for all phases.
+
+## References
+
+- vLLM Elastic EP RFC: https://github.com/vllm-project/vllm/issues/20323
+- vLLM source: https://github.com/vllm-project/vllm
+- Expert-as-a-Service: https://arxiv.org/abs/2509.17863
+- ElasticMoE: https://arxiv.org/abs/2510.02613
+- Lazarus (elastic MoE training): https://arxiv.org/abs/2407.04656
+- Research plan: `docs/research_plan_v4.html` Section 8

@@ -41,6 +41,15 @@ Challenges are discovered empirically, not imagined a priori.
 - **Key question:** Does framework-level recovery work when the failure unit
   is a container, not a process? What is the blast radius?
 
+### Exp A3 (`exp_a3_vllm_ep/`) — In-Place Elastic Expert Parallelism
+- **System:** [vLLM](https://github.com/vllm-project/vllm) Elastic EP (v0.17+)
+- **Operation:** Live rescaling of expert parallel workers for MoE inference
+- **Key question:** Does per-GPU-container deployment enable cluster-level
+  in-place elasticity that multi-GPU containers fundamentally cannot?
+- **Why:** Exp A1 showed stop-restart systems don't need per-GPU containers.
+  In-place systems (like vLLM Elastic EP) do — Docker can't change GPU
+  assignment of a running container.
+
 ### Archived (v1-v3 experiments in `archived/`)
 - `exp_a_nccl_gates/` — NCCL gate taxonomy + LD_PRELOAD shim (completed)
 - `exp_a_prime_dmabuf/` — DMA-BUF feasibility spike (completed)
@@ -106,4 +115,5 @@ Analysis, Conclusions, Appendices.
 - Phase comparison: `common/harness/compare_phases.py`
 - Exp A1 (Tenplex): `exp_a1_tenplex/`
 - Exp A2 (Oobleck): `exp_a2_oobleck/`
+- Exp A3 (vLLM EP): `exp_a3_vllm_ep/`
 - Archived experiments: `archived/`

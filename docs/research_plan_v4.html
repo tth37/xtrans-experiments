@@ -119,7 +119,7 @@
 
     <h1>Research Plan v4: GPU-Granular Scheduling Across Container Boundaries</h1>
     <p class="subtitle">
-      2026-04-15
+      2026-04-15 (updated 2026-04-16 with Exp&nbsp;A1 findings)
     </p>
 
     <div class="info-box">
@@ -180,9 +180,10 @@
     <p>Two systems exemplify the frontier:</p>
     <ul>
       <li><b>Tenplex</b> (SOSP &rsquo;24): Changes tensor, pipeline, and data parallelism
-          dimensions at runtime via Parallelizable Tensor Collections (PTCs). A running training
-          job can absorb new GPUs or relinquish existing ones <b>without restart</b>. Evaluated
-          on up to 64 GPUs with ~122s reconfiguration for a 16&rarr;8 resize.</li>
+          dimensions via Parallelizable Tensor Collections (PTCs). Described as &ldquo;without
+          restart,&rdquo; but <b>Exp&nbsp;A1 revealed this is stop-transform-restart</b>: the
+          training process fully terminates, state is transformed on the host, and a new process
+          starts. Evaluated on up to 64 GPUs with ~122s reconfiguration for a 16&rarr;8 resize.</li>
       <li><b>NTP</b> (arXiv &rsquo;25): When a GPU fails mid-training in a tensor-parallel
           group of 8, the remaining 7 GPUs continue with non-uniform tensor parallelism &mdash;
           redistributing the failed GPU&rsquo;s workload across survivors without
@@ -228,11 +229,12 @@
        are incompatible with fine-grained scheduling:</p>
 
     <ul>
-      <li><b>Elasticity is trapped:</b> A framework like Tenplex can scale from 4 to 2 GPUs
-          internally, but the container still holds 4 GPUs. K8s cannot reclaim the freed GPUs
-          for other jobs (In-Place Pod Resize does not support GPU resources). To actually
-          release GPUs, you must kill the entire container and restart &mdash; negating
-          Tenplex&rsquo;s zero-downtime benefit.</li>
+      <li><b>Elasticity is trapped (for in-place systems):</b> If a framework scales from 4 to
+          2 GPUs <b>while training continues running</b>, the container still holds 4 GPUs.
+          K8s cannot reclaim the freed GPUs for other jobs (In-Place Pod Resize does not support
+          GPU resources). Note: for stop-restart systems like Tenplex, this is solvable by
+          simply creating the new container with fewer GPUs. The trap is only fundamental when
+          the training process survives the scaling event.</li>
       <li><b>Failures are amplified:</b> One GPU failure inside an 8-GPU container may crash
           the entire container, killing all 8 GPUs. Even if the framework recovers internally
           (Oobleck, NTP), the failed GPU remains allocated to the container. K8s cannot replace
@@ -437,137 +439,261 @@
 
     <h3>4.2 Candidate Survey</h3>
 
+    <div class="info-box">
+      <p style="margin:0"><b>Exp A1 finding (Tenplex):</b> Tenplex&rsquo;s elasticity is
+         <b>stop-restart</b>, not in-place &mdash; training fully stops at each reconfiguration.
+         Multi-GPU containers handle stop-restart elasticity adequately (just restart with a
+         different GPU count). <b>Per-GPU containers are only motivated by in-place elasticity</b>,
+         where training processes survive GPU allocation changes and Docker&rsquo;s immutable
+         <code>--gpus</code> flag becomes a genuine barrier. This insight reshapes candidate
+         selection: we now distinguish stop-restart vs. in-place systems.</p>
+    </div>
+
     <table>
       <thead>
         <tr>
           <th>System</th>
           <th>Venue</th>
           <th>Scheduling Operation</th>
+          <th>Elasticity Type</th>
           <th>Open-Source?</th>
-          <th>4-GPU Feasible?</th>
-          <th>Selected?</th>
+          <th>Status</th>
         </tr>
       </thead>
       <tbody>
+        <tr style="background:#f8f8f8;">
+          <td colspan="6"><i>Stop-restart systems (multi-GPU containers suffice)</i></td>
+        </tr>
         <tr>
           <td><b>Tenplex</b></td>
           <td>SOSP &rsquo;24</td>
-          <td>Elastic add/remove GPUs; reconfigure TP+PP+DP at runtime</td>
+          <td>Elastic add/remove GPUs; reconfigure TP+PP+DP</td>
+          <td style="color:#e65100;"><b>Stop-restart</b></td>
           <td style="color:#2e7d32;">Yes
               (<a href="https://github.com/kungfu-team/tenplex">GitHub</a>)</td>
-          <td style="color:#2e7d32;">Yes (evaluated on 4&times;4)</td>
-          <td style="color:#2e7d32;"><b>&#10003; Exp&nbsp;A1</b></td>
+          <td><b>Exp&nbsp;A1 done.</b> Stop-restart confirmed.
+              Does not motivate per-GPU containers.</td>
+        </tr>
+        <tr>
+          <td><b>TorchElastic</b></td>
+          <td>&mdash;</td>
+          <td>Restart worker groups on membership change</td>
+          <td style="color:#e65100;"><b>Stop-restart</b></td>
+          <td style="color:#2e7d32;">Yes (PyTorch built-in)</td>
+          <td style="color:#c44e52;">&#10007; Same class as Tenplex</td>
+        </tr>
+        <tr>
+          <td><b>Pollux / AdaptDL</b></td>
+          <td>OSDI &rsquo;21</td>
+          <td>Dynamic GPU count + adaptive batch size</td>
+          <td style="color:#e65100;"><b>Stop-restart</b></td>
+          <td style="color:#2e7d32;">Yes
+              (<a href="https://github.com/petuum/adaptdl">GitHub</a>)</td>
+          <td style="color:#c44e52;">&#10007; Same class as Tenplex</td>
+        </tr>
+        <tr style="background:#f8f8f8;">
+          <td colspan="6"><i>In-place systems &mdash; elastic expert/tensor parallelism (strongly motivate per-GPU containers)</i></td>
+        </tr>
+        <tr>
+          <td><b>vLLM Elastic EP</b></td>
+          <td>vLLM v0.17<br>(2026)</td>
+          <td>Live rescaling of expert parallelism: add/remove GPU nodes,
+              reinitialize EP/DP/TP/PP communicators, rebalance expert loads.
+              <b>Shipped in production.</b></td>
+          <td style="color:#2e7d32;"><b>In-place</b><br>(GPU count changes)</td>
+          <td style="color:#2e7d32;">Yes
+              (<a href="https://github.com/vllm-project/vllm">GitHub</a>,
+               <a href="https://github.com/vllm-project/vllm/issues/20323">RFC</a>)</td>
+          <td style="color:#2e7d32;"><b>Strongest Exp&nbsp;A3 candidate.</b> Open source, production-ready,
+              in-place EP scaling on real MoE models (DeepSeek, Qwen, Llama&nbsp;4).</td>
+        </tr>
+        <tr>
+          <td><b>Expert-as-a-Service</b></td>
+          <td>arXiv &rsquo;25</td>
+          <td>Disaggregated MoE: experts as independent services with async
+              P2P communication. Single device failure &ne; group restart.</td>
+          <td style="color:#2e7d32;"><b>In-place</b><br>(GPU count changes)</td>
+          <td style="color:#e65100;">Paper only
+              (<a href="https://arxiv.org/abs/2509.17863">arXiv</a>);
+              code availability TBD</td>
+          <td style="color:#2e7d32;">Expert &asymp; container is the ideal per-GPU mapping.
+              Strong conceptual motivation but no code yet.</td>
+        </tr>
+        <tr>
+          <td><b>ElasticMoE</b></td>
+          <td>arXiv &rsquo;25</td>
+          <td>Zero-downtime MoE scaling via zero-copy expert redistribution
+              and virtual memory remapping</td>
+          <td style="color:#2e7d32;"><b>In-place</b><br>(GPU count changes)</td>
+          <td style="color:#e65100;">Paper only
+              (<a href="https://arxiv.org/abs/2510.02613">arXiv</a>);
+              code availability TBD</td>
+          <td style="color:#e65100;">9&times; lower scale-up latency, but Ascend NPU specific.</td>
+        </tr>
+        <tr>
+          <td><b>Lazarus</b></td>
+          <td>arXiv &rsquo;24</td>
+          <td>Resilient + elastic MoE training: adaptive expert placement,
+              no idle GPUs after failure, optimal recovery</td>
+          <td style="color:#2e7d32;"><b>In-place</b><br>(GPU count changes)</td>
+          <td style="color:#e65100;">Planned open source
+              (<a href="https://arxiv.org/abs/2407.04656">arXiv</a>)</td>
+          <td style="color:#e65100;">5.7&times; faster under failures. Training (not inference).
+              Code release pending.</td>
+        </tr>
+        <tr style="background:#f8f8f8;">
+          <td colspan="6"><i>In-place systems &mdash; non-MoE (partial motivation)</i></td>
+        </tr>
+        <tr>
+          <td><b>ElasWave</b></td>
+          <td>arXiv &rsquo;25</td>
+          <td>Online elastic recovery; dynamic communicators;
+              in-memory resharding of DP+PP</td>
+          <td style="color:#2e7d32;"><b>In-place</b><br>(GPU count changes)</td>
+          <td style="color:#e65100;">Paper only
+              (<a href="https://arxiv.org/abs/2510.00606">arXiv</a>);
+              no code released</td>
+          <td style="color:#e65100;">Sub-second recovery, but no code. Ascend-specific.</td>
+        </tr>
+        <tr>
+          <td><b>Gyges</b></td>
+          <td>arXiv &rsquo;25</td>
+          <td>In-place TP1&harr;TP4 transformation for LLM inference</td>
+          <td style="color:#e65100;"><b>In-place</b><br>(fixed GPU count)</td>
+          <td style="color:#e65100;">Paper only
+              (<a href="https://arxiv.org/abs/2509.19729">arXiv</a>)</td>
+          <td style="color:#e65100;">Demonstrates in-place mechanism but not true elasticity.</td>
+        </tr>
+        <tr>
+          <td><b>Elastic Horovod</b></td>
+          <td>&mdash;</td>
+          <td>Workers join/leave at epoch boundaries (DP only)</td>
+          <td style="color:#2e7d32;"><b>In-place</b><br>(GPU count changes)</td>
+          <td style="color:#2e7d32;">Yes (Horovod built-in)</td>
+          <td style="color:#e65100;">In-place but DP-only; no TP/PP/EP reconfiguration.</td>
+        </tr>
+        <tr>
+          <td><b>LoongServe</b></td>
+          <td>SOSP &rsquo;24</td>
+          <td>Elastic sequence parallelism for LLM inference</td>
+          <td style="color:#e65100;"><b>In-place</b><br>(fixed GPU count)</td>
+          <td style="color:#2e7d32;">Yes
+              (<a href="https://github.com/LoongServe/LoongServe">GitHub</a>)</td>
+          <td style="color:#e65100;">Inference only; sequence parallelism axis.</td>
+        </tr>
+        <tr style="background:#f8f8f8;">
+          <td colspan="6"><i>Fault tolerance (separate motivation &mdash; blast radius)</i></td>
         </tr>
         <tr>
           <td><b>Oobleck</b></td>
           <td>SOSP &rsquo;23</td>
-          <td>Fault-tolerant pipeline training; reconfigure after GPU failure</td>
+          <td>Fault-tolerant pipeline training; pipeline template reconfiguration</td>
+          <td style="color:#e65100;"><b>Restart-based</b></td>
           <td style="color:#2e7d32;">Yes
               (<a href="https://github.com/SymbioticLab/Oobleck">GitHub</a>)</td>
-          <td style="color:#2e7d32;">Yes</td>
-          <td style="color:#2e7d32;"><b>&#10003; Exp&nbsp;A2</b></td>
+          <td style="color:#2e7d32;"><b>&#10003; Exp&nbsp;A2</b> (blast radius motivation,
+              not elasticity)</td>
         </tr>
         <tr>
           <td><b>NTP</b></td>
           <td>arXiv &rsquo;25</td>
-          <td>Non-uniform TP after GPU failure</td>
+          <td>Non-uniform TP after GPU failure (in-place)</td>
+          <td style="color:#2e7d32;"><b>In-place</b> (fault tolerance)</td>
           <td style="color:#c44e52;">No (paper only)</td>
-          <td>N/A</td>
           <td style="color:#c44e52;">&#10007; No code</td>
         </tr>
         <tr>
           <td><b>Bamboo</b></td>
           <td>EuroSys &rsquo;22</td>
-          <td>Fault-tolerant pipeline training (redundant computation)</td>
+          <td>Redundant pipeline computation for fault tolerance</td>
+          <td style="color:#e65100;"><b>Partially in-place</b></td>
           <td style="color:#2e7d32;">Yes
               (<a href="https://github.com/uclasystem/bamboo">GitHub</a>)</td>
-          <td style="color:#2e7d32;">Yes (DeepSpeed)</td>
           <td style="color:#e65100;">Extension candidate</td>
         </tr>
-        <tr>
-          <td><b>Varuna</b></td>
-          <td>EuroSys &rsquo;22</td>
-          <td>Fault-tolerant training on commodity hardware</td>
-          <td style="color:#2e7d32;">Yes
-              (<a href="https://github.com/microsoft/varuna">GitHub</a>)</td>
-          <td style="color:#2e7d32;">Yes</td>
-          <td style="color:#e65100;">Extension candidate</td>
-        </tr>
-        <tr>
-          <td><b>Pollux / AdaptDL</b></td>
-          <td>OSDI &rsquo;21</td>
-          <td>Dynamic GPU count + adaptive batch size tuning</td>
-          <td style="color:#2e7d32;">Yes
-              (<a href="https://github.com/petuum/adaptdl">GitHub</a>)</td>
-          <td style="color:#2e7d32;">Yes</td>
-          <td style="color:#e65100;">Extension candidate</td>
-        </tr>
-        <tr>
-          <td><b>PhoenixOS</b></td>
-          <td>SOSP &rsquo;24</td>
-          <td>OS-level GPU checkpoint/restore</td>
-          <td style="color:#e65100;">Partial
-              (<a href="https://github.com/SJTU-IPADS/PhoenixOS">GitHub</a>)</td>
-          <td style="color:#c44e52;">No (single-GPU only)</td>
-          <td style="color:#c44e52;">&#10007; Immature</td>
+        <tr style="background:#f8f8f8;">
+          <td colspan="6"><i>Other</i></td>
         </tr>
         <tr>
           <td><b>KAI Scheduler</b></td>
           <td>NVIDIA &rsquo;25</td>
           <td>K8s GPU scheduling (gang, topology, fractional, bin-packing)</td>
+          <td>&mdash;</td>
           <td style="color:#2e7d32;">Yes
               (<a href="https://github.com/NVIDIA/KAI-Scheduler">GitHub</a>)</td>
-          <td style="color:#e65100;">Needs K8s cluster</td>
-          <td style="color:#e65100;">Extension candidate</td>
+          <td style="color:#e65100;">Extension candidate (needs K8s cluster)</td>
         </tr>
         <tr>
           <td><b>Singularity</b></td>
           <td>Microsoft &rsquo;22</td>
           <td>Preemptible, migratable, dynamically resizable jobs</td>
+          <td>Unknown (internal)</td>
           <td style="color:#c44e52;">No (internal)</td>
-          <td>N/A</td>
           <td style="color:#c44e52;">&#10007; No code</td>
         </tr>
       </tbody>
     </table>
 
-    <h3>4.3 Selected Baselines</h3>
+    <h3>4.3 Selected and Planned Experiments</h3>
 
     <table>
       <thead>
-        <tr><th>Experiment</th><th>System</th><th>Scheduling Operation</th><th>Why This System</th></tr>
+        <tr><th>Experiment</th><th>System</th><th>Scheduling Operation</th><th>Why / Status</th></tr>
       </thead>
       <tbody>
         <tr>
           <td><b>Exp&nbsp;A1</b></td>
           <td>Tenplex</td>
-          <td><b>Elastic GPU scaling</b></td>
-          <td>Most advanced open-source elastic GPU system. Changes TP+PP+DP at runtime.
-              Built on Megatron-LM. Evaluated on 4-GPU setups. Bare-metal only.</td>
+          <td><b>Stop-restart elastic scaling</b></td>
+          <td><b>Done.</b> Confirmed Tenplex is stop-restart, not in-place.
+              GPU trapping observed but fixable with engineering.
+              Multi-GPU containers suffice for this class of system.
+              <b>Does not motivate per-GPU containers.</b></td>
         </tr>
         <tr>
           <td><b>Exp&nbsp;A2</b></td>
           <td>Oobleck</td>
           <td><b>Fault-tolerant training</b></td>
-          <td>Most comprehensive open-source fault-tolerant training framework. Pipeline
-              templates with redundancy. Built on Colossal-AI/PyTorch. Bare-metal only.</td>
+          <td>Planned. Tests blast radius: does one GPU failure kill the whole
+              container? Per-GPU containers motivated by <b>fault isolation</b>,
+              independent of elasticity type.</td>
+        </tr>
+        <tr>
+          <td><b>Exp&nbsp;A3</b><br>(new)</td>
+          <td>ElasWave<br>or similar</td>
+          <td><b>In-place elastic scaling</b></td>
+          <td>To be evaluated. In-place elastic systems &mdash; where training
+              processes survive GPU changes &mdash; <b>strongly motivate per-GPU
+              containers</b> because Docker cannot change GPU assignment of a
+              running container. ElasWave&rsquo;s code availability needs
+              investigation. Elastic Horovod (DP-only) is a fallback.</td>
         </tr>
       </tbody>
     </table>
 
-    <p>These cover the two most impactful scheduling operations:</p>
+    <p>The experiments now cover three distinct motivations for per-GPU containers:</p>
     <ul>
-      <li><b>Elasticity</b> (Exp&nbsp;A1): the ability to add/remove GPUs at runtime is the
-          core reason per-GPU scheduling exists.</li>
-      <li><b>Fault tolerance</b> (Exp&nbsp;A2): with 9% annualized GPU failure rates (Meta),
-          continuing training after failure without restarting everything is critical at scale.</li>
+      <li><b>Elasticity (stop-restart)</b> (Exp&nbsp;A1, done): Multi-GPU containers suffice.
+          Per-GPU containers not needed. This is a <b>negative result</b> that sharpens the argument.</li>
+      <li><b>Fault isolation</b> (Exp&nbsp;A2): One GPU failure in a multi-GPU container may
+          kill all GPUs. Per-GPU containers limit blast radius.</li>
+      <li><b>In-place elasticity</b> (Exp&nbsp;A3, new): Training processes survive GPU allocation
+          changes. Per-GPU containers are the <b>only way</b> to express this in Docker/K8s,
+          because running containers cannot change GPU assignments.</li>
     </ul>
 
     <div class="info-box">
-      <p style="margin:0"><b>Extension candidates:</b> Bamboo and Varuna provide simpler
-         fault-tolerance baselines. Pollux/AdaptDL provides cluster-scheduler-level elasticity.
-         KAI Scheduler provides the K8s-native perspective. These can be added as Exp&nbsp;A3+
-         based on A1/A2 findings.</p>
+      <p style="margin:0"><b>Why MoE/Expert Parallelism is the strongest direction for Exp&nbsp;A3:</b>
+         Experts are naturally independent computation units. Each expert maps to a GPU (or container).
+         Adding/removing experts is a natural elastic operation. The &ldquo;Expert-as-a-Service&rdquo;
+         paradigm literally disaggregates the model into independently deployable services &mdash;
+         which is exactly what per-GPU containers provide. The strongest candidate is
+         <b>vLLM&rsquo;s Elastic EP</b>
+         (<a href="https://github.com/vllm-project/vllm/issues/20323">RFC</a>): open source,
+         production-deployed, in-place scaling on real MoE models (DeepSeek-V3/R1, Qwen3.5, Llama&nbsp;4).
+         If vLLM&rsquo;s Elastic EP currently requires all EP workers in the same process group (one container),
+         demonstrating it across per-GPU containers would be a direct proof-of-concept for the per-GPU
+         container value proposition.</p>
     </div>
 
 
@@ -1145,12 +1271,329 @@
 
 
 <!-- ============================================================ -->
-    <!-- SECTION 8: DECISION POINTS                                   -->
+    <!-- SECTION 8: EXP A3 - VLLM ELASTIC EP                         -->
     <!-- ============================================================ -->
 
-    <h2>8. Decision Points and Extensions</h2>
+    <h2>8. Exp A3: In-Place Elastic Expert Parallelism (vLLM)</h2>
 
-    <h3>8.1 After Phase 2 of Each Experiment</h3>
+    <h3>8.1 Technique Overview</h3>
+
+    <p><b>vLLM Elastic EP</b> (shipped in vLLM v0.17, 2026) enables live rescaling of expert
+       parallelism for Mixture-of-Experts (MoE) models. When GPU resources change &mdash;
+       added during a traffic spike, removed when utilization drops &mdash; vLLM brings up or
+       tears down engine-cores, reinitializes EP/DP/TP/PP communicators, and rebalances expert
+       loads across the new set of GPUs. <b>This happens in-place</b>: the serving process
+       survives the scaling event without restart.</p>
+
+    <table>
+      <thead>
+        <tr><th>Aspect</th><th>Detail</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Code</td>
+          <td><a href="https://github.com/vllm-project/vllm">github.com/vllm-project/vllm</a>
+              (Python, v0.17+);
+              <a href="https://github.com/vllm-project/vllm/issues/20323">RFC #20323</a></td>
+        </tr>
+        <tr>
+          <td>Capability</td>
+          <td>In-place scale-up/down of expert parallel workers. Reinitialize NCCL communicators.
+              Rebalance expert placement via EPLB algorithms. Zero-downtime for live serving.</td>
+        </tr>
+        <tr>
+          <td>Models</td>
+          <td>DeepSeek-V3/R1, Qwen3.5-MoE, Llama&nbsp;4 Maverick, and other MoE architectures</td>
+        </tr>
+        <tr>
+          <td>Deployment assumption</td>
+          <td>All EP workers in the same process group, typically within a single container
+              or set of containers with shared network. NCCL All-to-All for expert dispatch.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="highlight-box">
+      <p style="margin:0"><b>Why this experiment matters:</b> Exp&nbsp;A1 showed that stop-restart
+         elastic systems (Tenplex) do not need per-GPU containers. vLLM Elastic EP is
+         <b>in-place</b>: the serving process keeps running while GPUs are added or removed. Under
+         the multi-GPU container model, Docker&rsquo;s immutable <code>--gpus</code> flag prevents
+         the running container from releasing or acquiring GPUs. Per-GPU containers resolve this:
+         each expert worker lives in its own container, and scaling is expressed as container
+         lifecycle. This experiment directly tests whether per-GPU containers enable in-place
+         elasticity that multi-GPU containers cannot.</p>
+    </div>
+
+    <h3>8.2 Why MoE + Expert Parallelism Is the Ideal Test Case</h3>
+
+    <p>Experts are naturally independent computation units that map directly to containers:</p>
+
+    <ul>
+      <li><b>Each expert &asymp; one GPU &asymp; one container.</b> Unlike tensor parallelism
+          (which shards a single tensor across GPUs, requiring tight coupling), expert parallelism
+          routes tokens to independent expert modules on separate GPUs. Each expert is a
+          self-contained computation unit.</li>
+      <li><b>Scaling = adding/removing experts.</b> Scale-up means starting a new container
+          with a new expert. Scale-down means stopping a container. The remaining experts
+          continue serving without interruption.</li>
+      <li><b>Fault isolation is natural.</b> If one expert&rsquo;s GPU fails, only that
+          container dies. Other experts continue serving (with load rebalancing).</li>
+      <li><b>The &ldquo;Expert-as-a-Service&rdquo; paradigm</b>
+          (<a href="https://arxiv.org/abs/2509.17863">arXiv &rsquo;25</a>) already proposes
+          disaggregating experts into independent services &mdash; which is precisely what
+          per-GPU containers provide at the infrastructure level.</li>
+    </ul>
+
+    <h3>8.3 Phase 1: vLLM Elastic EP Native (Baseline)</h3>
+
+    <p>Run vLLM with a MoE model using expert parallelism on 4 GPUs. Confirm that live
+       rescaling works as designed.</p>
+
+    <table>
+      <thead>
+        <tr><th>Step</th><th>Action</th><th>Record</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td>Start vLLM with a MoE model (e.g., Qwen3.5-MoE or a smaller MoE model
+              that fits on 4&times;A100). Configure EP across 4 GPUs.</td>
+          <td>Serving throughput (tokens/s), latency, expert placement, NCCL
+              transport for All-to-All.</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td>Trigger live scale-down: 4 &rarr; 2 EP workers</td>
+          <td>Rescaling time, communicator reinitialization, expert rebalancing,
+              serving continuity (are in-flight requests dropped?).</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td>Trigger live scale-up: 2 &rarr; 4 EP workers</td>
+          <td>New worker join time, expert redistribution, throughput recovery.</td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td>Record NCCL communicator lifecycle</td>
+          <td>How are communicators destroyed and recreated? What is the All-to-All
+              downtime during rescaling?</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>8.4 Phase 2: Multi-GPU Container &mdash; The In-Place Barrier</h3>
+
+    <p>Run vLLM Elastic EP inside a single container with all 4 GPUs. This is where
+       in-place elasticity hits the container wall.</p>
+
+    <pre>
+  +-----------------------------------------------+
+  |     Single Container (4 GPUs, --gpus all)      |
+  |  Expert0  Expert1  Expert2  Expert3            |
+  |  (GPU 0)  (GPU 1)  (GPU 2)  (GPU 3)           |
+  |                                                |
+  |  vLLM scales 4 &rarr; 2 EP workers...              |
+  |  Expert0  Expert1  [idle]   [idle]             |
+  |  (GPU 0)  (GPU 1)  (GPU 2)  (GPU 3)           |
+  |                                                |
+  |  GPU 2, 3: idle but TRAPPED in container       |
+  +-----------------------------------------------+</pre>
+
+    <table>
+      <thead>
+        <tr><th>Step</th><th>Action</th><th>Observe</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td>Start vLLM in a single container with all 4 GPUs</td>
+          <td>Does Elastic EP work inside a container? Performance vs. Phase 1?</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td>Trigger live scale-down: 4 &rarr; 2 EP workers</td>
+          <td>vLLM successfully scales internally &mdash; but <b>can the cluster reclaim
+              GPUs 2 and 3?</b> Docker cannot remove GPUs from a running container.
+              Unlike Tenplex (stop-restart), the process is still running &mdash; you
+              cannot recreate the container with fewer GPUs without killing the service.</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td>From outside: attempt to use the &ldquo;freed&rdquo; GPUs</td>
+          <td>GPUs trapped. This is the <b>fundamental</b> limitation for in-place
+              systems (unlike Tenplex where it was merely an engineering detail).</td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td>Trigger live scale-up: attempt to add GPUs from outside</td>
+          <td>Docker cannot hot-add GPUs to a running container. Scale-up is
+              impossible without restarting &mdash; negating the in-place benefit.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="warning-box">
+      <p style="margin:0"><b>The critical difference from Exp&nbsp;A1:</b> Tenplex&rsquo;s
+         GPU trapping was a fixable engineering detail because Tenplex stops the process anyway.
+         For vLLM Elastic EP, the process <b>stays running</b>. There is no opportunity to
+         recreate the container with different GPUs. The multi-GPU container model
+         <b>fundamentally</b> prevents in-place elasticity from reaching the cluster level.</p>
+    </div>
+
+    <h3>8.5 Phase 3: Per-GPU Containers &mdash; Enabling In-Place Elasticity</h3>
+
+    <p>Each EP worker in its own container. Scaling = container lifecycle. This is the
+       direct proof-of-concept for the per-GPU container value proposition.</p>
+
+    <pre>
+  Start (4 EP workers):                Scale down (4 &rarr; 2):
+  +----+ +----+ +----+ +----+          +----+ +----+
+  | C0 | | C1 | | C2 | | C3 |          | C0 | | C1 |    C2, C3 stopped
+  | E0 | | E1 | | E2 | | E3 |          | E0 | | E1 |    GPU 2,3 FREE
+  |GPU0| |GPU1| |GPU2| |GPU3|          |GPU0| |GPU1|    (cluster-reclaimable)
+  +----+ +----+ +----+ +----+          +----+ +----+
+
+  Scale up (2 &rarr; 4):
+  +----+ +----+ +----+ +----+
+  | C0 | | C1 | |C2' | |C3' |          C2', C3' = new containers
+  | E0 | | E1 | | E2 | | E3 |          New experts loaded
+  |GPU0| |GPU1| |GPU2| |GPU3|          Communicators re-formed
+  +----+ +----+ +----+ +----+</pre>
+
+    <table>
+      <thead>
+        <tr><th>Step</th><th>Action</th><th>Observe</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td>Start 4 per-GPU containers, each running one EP worker.
+              Establish cross-container NCCL All-to-All for expert dispatch.</td>
+          <td>Does expert parallelism work across container boundaries?
+              NCCL transport (NVLink P2P or TCP fallback)?
+              Throughput vs. Phase 1 and Phase 2?
+              Is the LD_PRELOAD shim (<code>common/shim/</code>) needed?</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td>Trigger live scale-down: stop containers C2 and C3</td>
+          <td>Do surviving containers (C0, C1) continue serving?
+              Can vLLM&rsquo;s Elastic EP reinitialize communicators with
+              only 2 containers?
+              Are GPUs 2, 3 <b>immediately free</b> at the cluster level?
+              Serving latency during rescaling?</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td>Trigger live scale-up: start new containers C2&prime;, C3&prime;</td>
+          <td>Can new EP workers join the existing serving group?
+              Can NCCL All-to-All communicator expand to include new containers?
+              Expert rebalancing across old + new containers?</td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td>Fault tolerance: kill container C3 unexpectedly</td>
+          <td>Do surviving containers detect the failure?
+              Can vLLM continue serving with 3 EP workers?
+              Is the failed GPU immediately reclaimable?
+              Contrast with multi-GPU container (all 4 GPUs lost).</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>8.6 Challenges to Investigate</h3>
+
+    <p>Per-GPU containers introduce specific challenges for cross-container expert dispatch:</p>
+
+    <table>
+      <thead>
+        <tr><th>Challenge</th><th>Description</th><th>Potential Workaround</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>NCCL All-to-All across containers</td>
+          <td>Expert dispatch uses All-to-All to route tokens to the correct expert.
+              NCCL may fall back to TCP when GPUs are in separate containers
+              (different network/IPC namespaces).</td>
+          <td>LD_PRELOAD shim (<code>common/shim/</code>) to make NCCL&rsquo;s
+              namespace checks pass; or use <code>--network host</code> with
+              relaxed isolation.</td>
+        </tr>
+        <tr>
+          <td>Dynamic communicator creation</td>
+          <td>vLLM creates NCCL communicators at initialization. Adding/removing
+              containers requires creating new communicators spanning a different
+              set of processes across containers.</td>
+          <td>Investigate vLLM&rsquo;s communicator reinitialization path.
+              May need framework patches to support cross-container NCCL init.</td>
+        </tr>
+        <tr>
+          <td>Expert state migration</td>
+          <td>When experts are redistributed during scaling, expert weights must
+              move between containers (potentially across GPU memory boundaries
+              that cross container namespaces).</td>
+          <td>Shared volume for expert weights; or P2P GPU memory transfer
+              with IPC handle passing across containers.</td>
+        </tr>
+        <tr>
+          <td>Service discovery</td>
+          <td>New EP worker containers must discover existing workers and
+              vice versa. Standard container orchestration (Docker Compose,
+              K8s DNS) should handle this.</td>
+          <td>Docker Compose service names; environment variables for
+              peer addresses.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>8.7 Measurements</h3>
+
+    <table>
+      <thead>
+        <tr><th>Metric</th><th>Measured At</th><th>Why</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Serving throughput (tokens/s)</td>
+          <td>All phases, before/during/after rescaling</td>
+          <td>End-to-end performance comparison</td>
+        </tr>
+        <tr>
+          <td>Rescaling latency</td>
+          <td>All phases, for both scale-up and scale-down</td>
+          <td>Time from trigger to full serving capacity at new scale</td>
+        </tr>
+        <tr>
+          <td>Request continuity</td>
+          <td>All phases, during rescaling</td>
+          <td>Are in-flight requests dropped, queued, or served uninterrupted?</td>
+        </tr>
+        <tr>
+          <td>GPU cluster-level availability</td>
+          <td>Phase 2 vs. Phase 3, after scale-down</td>
+          <td><b>The key metric:</b> are freed GPUs reclaimable by other jobs?</td>
+        </tr>
+        <tr>
+          <td>All-to-All bandwidth</td>
+          <td>Phase 3: during serving</td>
+          <td>Whether NVLink or TCP is used for expert dispatch across containers</td>
+        </tr>
+        <tr>
+          <td>Fault blast radius</td>
+          <td>Phase 2 vs. Phase 3</td>
+          <td>How many GPUs/experts are lost per single failure event?</td>
+        </tr>
+      </tbody>
+    </table>
+
+
+<!-- ============================================================ -->
+    <!-- SECTION 9: DECISION POINTS                                   -->
+    <!-- ============================================================ -->
+
+    <h2>9. Decision Points and Extensions</h2>
+
+    <h3>9.1 After Phase 2 of Each Experiment</h3>
 
     <p>Phase 2 determines whether we proceed to Phase 3:</p>
 
@@ -1182,7 +1625,7 @@
       </tbody>
     </table>
 
-    <h3>8.2 After Phase 3</h3>
+    <h3>9.2 After Phase 3</h3>
 
     <table>
       <thead>
@@ -1217,7 +1660,7 @@
          The experiments are designed so there is no wasted outcome.</p>
     </div>
 
-    <h3>8.3 Potential Extensions</h3>
+    <h3>9.3 Potential Extensions</h3>
 
     <table>
       <thead>
@@ -1252,10 +1695,10 @@
 
 
 <!-- ============================================================ -->
-    <!-- SECTION 9: SUMMARY                                           -->
+    <!-- SECTION 10: SUMMARY                                          -->
     <!-- ============================================================ -->
 
-    <h2>9. Summary</h2>
+    <h2>10. Summary</h2>
 
     <div class="highlight-box">
       <p style="margin:0"><b>Research question:</b> What happens when GPU scheduling techniques
@@ -1274,10 +1717,14 @@
 
     <p><b>Experiments.</b></p>
     <ul>
-      <li><b>Exp A1 (Tenplex):</b> Elastic GPU add/remove. Does framework-level elasticity
-          translate to cluster-level elasticity in containers?</li>
+      <li><b>Exp A1 (Tenplex):</b> Stop-restart elastic scaling. <b>Done.</b> Found that
+          multi-GPU containers suffice for stop-restart systems. Does not motivate per-GPU
+          containers.</li>
       <li><b>Exp A2 (Oobleck):</b> Fault-tolerant training. Does framework-level recovery
           work when the failure unit is a container, not a process?</li>
+      <li><b>Exp A3 (vLLM Elastic EP):</b> In-place elastic expert parallelism. The strongest
+          test: does per-GPU-container deployment enable cluster-level elasticity that multi-GPU
+          containers fundamentally cannot?</li>
     </ul>
 
     <p><b>Design principle.</b> Every phase is motivated by the previous. Every outcome
