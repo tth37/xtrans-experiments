@@ -5,7 +5,7 @@
 **System under test:** [vLLM](https://github.com/vllm-project/vllm) Elastic EP (v0.17+, using v0.19.0)
 **Scheduling operation:** In-place live rescaling of expert parallelism for MoE models
 **Research plan:** `docs/research_plan_v4.html` Section 8
-**vLLM source:** `vllm/` (git submodule)
+**vLLM source:** `3rdparty/vllm/` (git submodule, project root)
 
 vLLM's Elastic EP enables live rescaling of expert parallel workers — adding or removing
 GPUs for MoE inference without restarting the serving process. This is **in-place elasticity**:
@@ -345,7 +345,7 @@ more headroom. **Phase 1 at DP=4 should be comfortable.**
 - Single API server (`--api-server-count 1`)
 - EP size = TP × DP (no explicit `--expert-parallel-size` flag)
 
-**Key source files (in `vllm/` submodule):**
+**Key source files (in `3rdparty/vllm/` submodule):**
 - `vllm/entrypoints/serve/elastic_ep/api_router.py` — HTTP endpoint
 - `vllm/entrypoints/serve/elastic_ep/middleware.py` — 503 during scaling
 - `vllm/v1/engine/core_client.py` — `AsyncMPClient._scale_{up,down}_elastic_ep()`
