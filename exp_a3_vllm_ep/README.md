@@ -117,22 +117,48 @@ curl http://localhost:8000/is_scaling_elastic_ep
 
 ## Experiment Phases
 
-### Phase 1: vLLM Elastic EP Native (Baseline)
+### Phase 1: vLLM Elastic EP Native (Baseline) — COMPLETE
 
-Run vLLM with EP on 4 GPUs natively. Confirm live rescaling works.
+Ran 2026-04-19 on node192 with Qwen3-30B-A3B, vLLM 0.19.0, Ray 2.55.0.
 
-**Procedure:**
-1. `./scripts/phase1_native.sh serve` — start serving with DP=4 (EP=4)
-2. `./scripts/phase1_native.sh bench 4` — baseline throughput at DP=4
-3. `./scripts/phase1_native.sh scale-down 2` — trigger 4→2 rescaling
-4. `./scripts/phase1_native.sh bench 2` — throughput at DP=2
-5. `./scripts/phase1_native.sh scale-up 4` — trigger 2→4 rescaling
-6. `./scripts/phase1_native.sh bench 4` — throughput after re-scaling
+**Revised procedure** (must start at DP=2 and scale up first — scale-down
+from a cold DP=4 start hits an EPLB assertion with `num_redundant_experts=0`):
 
-**Record:** throughput (tok/s), rescaling time (ms), expert redistribution, request continuity (503s during scaling?)
+1. Start Ray head at `10.0.2.192:26379` (avoids conflict with unrelated
+   Ray at `172.17.0.2:6379` inside Docker on the host).
+2. `vllm serve ... --data-parallel-size 2 --enable-elastic-ep ...`
+3. Benchmark at DP=2 (baseline).
+4. `POST /scale_elastic_ep {"new_data_parallel_size": 4}`.
+5. Benchmark at DP=4.
+6. `POST /scale_elastic_ep {"new_data_parallel_size": 2}`.
+7. Benchmark at DP=2 post-scale-down.
+8. Repeat (round 2) + 503 probing.
+
+**Results:**
+
+| Config | Throughput | vs DP=2 initial |
+|--------|-----------|-----------------|
+| DP=2 initial | 87.4 tok/s | 100% |
+| DP=4 post-scale-up | **166.6 tok/s** | **190.6%** (1.91×) |
+| DP=2 post-scale-down | 91.6 tok/s | 104.8% |
+
+| Operation | Duration | Notes |
+|-----------|---------|-------|
+| Scale-up 2→4 (round 1) | 25.81 s | Ray actor spawn + weight transfer + EPLB |
+| Scale-up 2→4 (round 2) | 22.97 s | Slight speedup (cached) |
+| Scale-down 4→2 (round 1) | 4.05 s + 10 s async teardown | HTTP 200 before GPU release |
+| Scale-down 4→2 (round 2) | 9.64 s | Longer due to drain-wait |
+| **503 window during scale-down** | **3.53 s** | Middleware flag clears before teardown |
+
+**Key findings:**
+- Near-linear scaling efficiency (95%)
+- Freed GPUs on bare metal: memory drops to 4 MiB within ~10s of HTTP 200
+- No request migration — 503 is instant reject, client must retry
+- Round-trip (2→4→2) is repeatable
 
 **Script:** `scripts/phase1_native.sh`
-**Results:** `results/phase1/`
+**Results:** `results/phase1/` (including `phase1_results.json`, `round2.json`, `serve.log`)
+**Analysis:** `analysis_report.html` sections 5.0–5.4
 
 ### Phase 2: Multi-GPU Container (The In-Place Barrier)
 
@@ -151,6 +177,47 @@ Each EP worker in its own container. Scaling = container lifecycle.
 - Key challenges: cross-container NCCL All-to-All, dynamic communicator creation
 
 **Script:** `scripts/phase3_per_gpu.sh`
+
+## Smoke Test Findings (2026-04-17, on GPUs 0-1 only)
+
+While waiting for GPUs 2-3 to free up (occupied by sglang), we ran a smoke
+test with DP=2 on GPUs 0-1 to validate the toolchain end-to-end.
+
+### What worked
+- vLLM v0.19.0 starts cleanly with `--enable-elastic-ep --enable-eplb --enable-expert-parallel --data-parallel-backend ray`
+- Model loads in ~60s (weights), full startup ~75s to first token
+- Expert assignment is linear as expected: Rank 0 → experts 0-63, Rank 1 → experts 64-127 (64 experts/GPU at EP=2)
+- All-to-All backend: `AgRsAll2AllManager` (as configured)
+- NCCL version: 2.27.5
+- Endpoints `POST /scale_elastic_ep` and `POST /is_scaling_elastic_ep` both register correctly
+- Inference works (16 concurrent requests × 64 tokens each = 1024 tokens in 12.1s → **84.7 tok/s**)
+
+### Key findings (bugs / limitations discovered)
+
+**1. Scale-down to DP=1 is broken.** Calling
+`POST /scale_elastic_ep {"new_data_parallel_size": 1}` crashes with:
+```
+File ".../vllm/distributed/eplb/policy/default.py", line 93, in replicate_experts
+    assert num_redundant >= 0
+AssertionError
+```
+The EPLB policy assumes multi-rank EP; with `num_redundant_experts=0` and EP=1,
+the invariant `num_phy >= num_log` doesn't hold. After the error, the server
+is stuck in "scaling" state (middleware returns 503 indefinitely) and must be
+killed. **Scale targets must be ≥2 for the default EPLB config.** vLLM's own
+test suite (`tests/distributed/test_elastic_ep.py::test_elastic_ep_scaling`)
+exercises 2→4 and 4→2 with `num_redundant_experts=0` and passes, so our
+Phase 1 plan (4→2→4) should work.
+
+**2. Memory is tight with EP=2 on A100-40GB.** Qwen3-30B-A3B is ~61GB in BF16
+→ ~30.5GB/GPU at EP=2. With `--gpu-memory-utilization 0.85` (34GB budget),
+only ~4GB remains for KV cache per GPU → max concurrency ~2x for 4K-token
+requests. With EP=4, each GPU has ~15.25GB weights + ~19GB KV cache → much
+more headroom. **Phase 1 at DP=4 should be comfortable.**
+
+### Smoke-test artifacts
+- Log: `results/smoke/serve.log` (successful DP=2 startup and inference)
+- Benchmark: 84.7 tok/s at DP=2 (16 concurrent, 64-token completions)
 
 ## Elastic EP Investigation Findings
 

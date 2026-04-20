@@ -152,7 +152,7 @@
     <h1>Experiment A3: In-Place Elastic Expert Parallelism<br>with vLLM</h1>
     <p class="subtitle">
       node192 &middot; 3&times; A100-SXM4-40GB + 1&times; A100-PCIE-40GB<br>
-      Generated 2026-04-16 &middot; <b>Phase 1 results pending</b>
+      Generated 2026-04-19 &middot; <b>Phase 1 complete</b>
     </p>
 
     <!-- ============================================================
@@ -171,12 +171,14 @@
        create friction.</p>
 
     <div class="highlight-box">
-      <p><b>Result (preliminary):</b> Source-level investigation reveals that
-         Elastic EP uses a sophisticated state machine with stateless NCCL groups,
-         GPU-to-GPU P2P weight transfer, and EPLB expert reshuffling. The
-         architecture is fundamentally amenable to per-GPU containers because
-         stateless groups use TCP-based coordination with no shared-memory
-         assumptions. Phase 1 performance numbers pending.</p>
+      <p><b>Result:</b> Live rescaling works. Scale-up 2&rarr;4 takes
+         <b>25.8&nbsp;s</b>, scale-down 4&rarr;2 takes <b>4.1&nbsp;s</b>. Throughput
+         scales near-linearly (87&nbsp;&rarr;&nbsp;167&nbsp;tok/s, 1.91&times;).
+         During rescaling, the middleware returns 503 for a ~3.5&nbsp;s window.
+         <b>After scale-down, GPU memory on released ranks drops to zero within
+         ~10&nbsp;s</b> &mdash; freed GPUs are physically reclaimable by the
+         OS/scheduler on bare metal. Phases 2&ndash;3 (containerized) will test
+         whether this reclamation survives container boundaries.</p>
     </div>
 
 
@@ -398,65 +400,243 @@ GPU3    SYS     SYS     PIX      X      NUMA 1</pre>
 
     <h2>5. Results</h2>
 
-    <div class="tbd-box">
-      <p><b>Phase 1 results pending:</b> GPUs not yet available for experiment
-         execution. The sections below will be populated with actual measurements
-         when Phase&nbsp;1 runs complete.</p>
+    <p>Phase&nbsp;1 ran in the following sequence: start at DP=2, benchmark,
+       scale up to DP=4, benchmark, scale down to DP=2, benchmark. A second
+       round (2&rarr;4, then 4&rarr;2 with a 503-window probe) was added to
+       test repeatability and capture the service-interruption window.</p>
+
+    <div class="warning-box">
+      <p><b>Note on starting config:</b> Our initial attempt started at DP=4
+         and tried to scale down to DP=2. This crashed with
+         <code>AssertionError: num_redundant &ge; 0</code> in the default EPLB
+         policy. The bug: during scale-down, the rebalance code computes
+         <code>num_phy = num_phy // ep_group.size() * num_gpus</code>, which
+         reduces physical experts below logical count when
+         <code>num_redundant_experts=0</code>. <b>Starting at DP=2 and scaling
+         up first</b> creates physical redundancy (num_phy &gt; num_log), after
+         which scale-down back to DP=2 works because redundancy is consumed
+         rather than turning negative. This matches vLLM&rsquo;s own CI test
+         (<code>test_elastic_ep.py::test_elastic_ep_scaling</code>).</p>
     </div>
 
-    <h3>5.1 Baseline Serving (P1-4EP)</h3>
+    <h3>5.0 Smoke Test (GPUs 0-1, DP=2)</h3>
+
+    <p>While GPUs 2&ndash;3 were occupied by an unrelated sglang process, we
+       ran a smoke test with DP=2 on GPUs 0&ndash;1 to validate the toolchain
+       end-to-end and uncover any issues before Phase&nbsp;1 proper.</p>
+
+    <table>
+      <thead>
+        <tr><th>Check</th><th>Outcome</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>vLLM starts with elastic-EP flags</td><td>&check; ~75&nbsp;s to first token</td></tr>
+        <tr><td><code>/scale_elastic_ep</code> endpoint registered</td><td>&check; Confirmed in route table</td></tr>
+        <tr><td><code>/is_scaling_elastic_ep</code> endpoint registered</td><td>&check; Returns <code>{"is_scaling_elastic_ep": false}</code> when idle</td></tr>
+        <tr><td>Expert assignment (linear, EP=2)</td><td>&check; Rank&nbsp;0: experts&nbsp;0&ndash;63; Rank&nbsp;1: experts&nbsp;64&ndash;127</td></tr>
+        <tr><td>All-to-All backend</td><td>&check; <code>AgRsAll2AllManager</code></td></tr>
+        <tr><td>NCCL version</td><td>2.27.5</td></tr>
+        <tr><td>Throughput (DP=2, 16 concurrent, 64-tok)</td><td>84.7&nbsp;tokens/s</td></tr>
+        <tr><td>Scale-down 2&rarr;1</td><td><b>Failed</b> &mdash; see below</td></tr>
+      </tbody>
+    </table>
+
+    <div class="warning-box">
+      <p><b>Bug discovered: scale-down to DP=1 crashes.</b> Calling
+         <code>POST /scale_elastic_ep {"new_data_parallel_size": 1}</code>
+         with default EPLB config triggers an assertion failure in
+         <code>vllm/distributed/eplb/policy/default.py:93</code>:</p>
+    </div>
+
+    <pre>
+File ".../vllm/distributed/eplb/policy/default.py", line 93, in replicate_experts
+    assert num_redundant >= 0
+AssertionError</pre>
+
+    <p>The EPLB policy assumes multi-rank EP. With <code>num_redundant_experts=0</code>
+       and EP=1, the invariant <code>num_phy &ge; num_log</code> does not hold.
+       After the error, the server remains stuck in the &ldquo;scaling&rdquo;
+       state (middleware returns 503 indefinitely) and must be killed.
+       <b>Scale targets must be &ge;&nbsp;2 under the default EPLB configuration.</b>
+       Our Phase 1 plan (4&rarr;2&rarr;4) stays above this floor.</p>
+
+    <div class="info-box">
+      <p><b>Memory characterization at EP=2:</b> Qwen3-30B-A3B weights take
+         &asymp;&nbsp;30.5&nbsp;GB per GPU at EP=2. With
+         <code>--gpu-memory-utilization 0.85</code> (34&nbsp;GB budget per
+         40&nbsp;GB GPU), only ~4&nbsp;GB remains for KV cache. Max concurrency
+         with 4096-token context is limited to ~2&times;. At EP=4, each GPU
+         holds only ~15.25&nbsp;GB of weights, leaving ~19&nbsp;GB for KV cache
+         &mdash; much more comfortable for throughput testing.</p>
+    </div>
+
+    <h3>5.1 Phase 1 Execution Plan (Revised)</h3>
+
+    <p>Our initial plan was to start at DP=4 and scale down to DP=2. That
+       crashed with <code>AssertionError: num_redundant &ge; 0</code> in the
+       EPLB rebalance policy:</p>
+
+    <pre>
+File ".../vllm/distributed/eplb/policy/default.py", line 93, in replicate_experts
+    assert num_redundant &gt;= 0
+AssertionError</pre>
+
+    <p>The cause is in <code>eplb_state.py:rearrange()</code>:</p>
+
+    <pre>
+num_replicas = num_replicas // ep_group.size() * num_gpus  # scale-down</pre>
+
+    <p>With <code>num_redundant_experts=0</code>, starting at DP=4 means
+       <code>num_phy = num_log = 128</code>. Scaling down to DP=2 computes
+       <code>num_phy = 128 // 4 * 2 = 64</code>, but
+       <code>num_log = 128</code>, so <code>num_redundant = -64</code>.
+       The assertion fires. <b>Scale-down-first from a zero-redundancy
+       start is fundamentally broken</b>: it would have to silently drop
+       experts.</p>
+
+    <p><b>Working plan: start at DP=2, scale up first.</b> Scale-up creates
+       physical redundancy (<code>num_phy = 128 // 2 * 4 = 256 &gt; 128</code>),
+       after which scale-down back to DP=2 consumes the redundancy and the
+       assertion holds. This matches vLLM&rsquo;s own CI test
+       (<code>tests/distributed/test_elastic_ep.py::test_elastic_ep_scaling</code>).</p>
+
+    <p>Final Phase&nbsp;1 sequence:
+       DP=2 (bench) &rarr; scale-up &rarr; DP=4 (bench) &rarr; scale-down
+       &rarr; DP=2 (bench) &rarr; scale-up again (round 2) &rarr; scale-down
+       again (round 2, with 503-window probing).</p>
+
+    <h3>5.2 Throughput Across Configurations</h3>
 
     <table>
       <thead>
         <tr>
-          <th>Metric</th>
-          <th>Value</th>
+          <th>Config</th>
+          <th>Requests</th>
+          <th>Total time</th>
+          <th>Throughput</th>
+          <th>Avg latency</th>
+          <th>vs DP=2 initial</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>DP=2 initial</b></td>
+          <td>16</td>
+          <td>23.4&nbsp;s</td>
+          <td>87.4&nbsp;tok/s</td>
+          <td>11.70&nbsp;s</td>
+          <td>100%</td>
+        </tr>
+        <tr>
+          <td><b>DP=4 after scale-up</b></td>
+          <td>32</td>
+          <td>24.6&nbsp;s</td>
+          <td><b>166.6&nbsp;tok/s</b></td>
+          <td>12.27&nbsp;s</td>
+          <td><b>190.6%</b> (1.91&times;)</td>
+        </tr>
+        <tr>
+          <td><b>DP=2 after scale-down</b></td>
+          <td>16</td>
+          <td>22.4&nbsp;s</td>
+          <td>91.6&nbsp;tok/s</td>
+          <td>11.17&nbsp;s</td>
+          <td>104.8%</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Scale-up gives a <b>1.91&times; throughput improvement on 2&times; the
+       GPU count</b> &mdash; 95% scaling efficiency. The post-scale-down
+       throughput (91.6&nbsp;tok/s) is slightly higher than the initial
+       baseline (87.4&nbsp;tok/s); likely because EPLB has observed load
+       statistics and rebalanced expert placement, producing a marginally
+       more favorable layout than cold-start.</p>
+
+    <h3>5.3 Rescaling Duration and GPU Memory Dynamics</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Operation</th>
+          <th>Duration (s)</th>
+          <th>GPU memory (MiB)</th>
           <th>Notes</th>
         </tr>
       </thead>
       <tbody>
-        <tr><td>Throughput</td><td><i>TBD</i></td><td>tokens/s at DP=4</td></tr>
-        <tr><td>Avg latency</td><td><i>TBD</i></td><td>Per-request, 128 output tokens</td></tr>
-        <tr><td>Model load time</td><td><i>TBD</i></td><td>Cold start to first token</td></tr>
-        <tr><td>GPU memory per rank</td><td><i>TBD</i></td><td>Weights + KV cache</td></tr>
+        <tr>
+          <td><b>Scale-up 2&rarr;4</b> (round 1)</td>
+          <td>25.81</td>
+          <td>Before: 37,877 &times;2; 4 &times;2<br>After: 35,761 &times;2; 35,015 &times;2</td>
+          <td>New Ray actors spawn, model load with dummy weights,
+              P2P weight transfer, EPLB reshuffle.</td>
+        </tr>
+        <tr>
+          <td><b>Scale-up 2&rarr;4</b> (round 2)</td>
+          <td>22.97</td>
+          <td>Similar to round 1</td>
+          <td>Slight speedup &mdash; probably from Ray actor startup caching.</td>
+        </tr>
+        <tr>
+          <td><b>Scale-down 4&rarr;2</b> (round 1)</td>
+          <td>4.05</td>
+          <td>Before: ~36,000 &times;4<br>Immediately after: 37,445, 37,445, 34,857, 4<br>After +10&nbsp;s: 37,445, 37,445, 4, 4</td>
+          <td>HTTP 200 returns before actor teardown completes. Freed GPUs
+              are fully reclaimed ~10&nbsp;s later.</td>
+        </tr>
+        <tr>
+          <td><b>Scale-down 4&rarr;2</b> (round 2)</td>
+          <td>9.64</td>
+          <td>Similar to round 1</td>
+          <td>Longer due to drain-wait for in-flight requests before scaling.</td>
+        </tr>
       </tbody>
     </table>
 
-    <h3>5.2 Live Scale-Down: 4 &rarr; 2 EP Workers</h3>
+    <div class="highlight-box">
+      <p><b>GPU reclamation on bare metal:</b> Within ~10&nbsp;s of scale-down
+         4&rarr;2, GPU 2 and GPU 3 drop from ~35&nbsp;GB used to 4&nbsp;MiB
+         (idle). The freed GPUs are <b>genuinely reclaimable</b> by the OS
+         and can be scheduled to other workloads. This is the cluster-level
+         benefit of in-place elasticity &mdash; and the precise capability that
+         Phase&nbsp;2 (multi-GPU container) is predicted to block: Docker
+         cannot release GPUs from a running container, so these same GPUs
+         would remain trapped even after vLLM finished using them.</p>
+    </div>
+
+    <h3>5.4 Service Interruption: the 503 Window</h3>
+
+    <p>During the round-2 scale-down 4&rarr;2, we issued a completion probe
+       every 0.5&nbsp;s to characterize the service-interruption window.</p>
 
     <table>
       <thead>
-        <tr>
-          <th>Metric</th>
-          <th>Value</th>
-          <th>vs Baseline</th>
-        </tr>
+        <tr><th>Metric</th><th>Value</th></tr>
       </thead>
       <tbody>
-        <tr><td>Rescaling duration</td><td><i>TBD</i></td><td>&mdash;</td></tr>
-        <tr><td>Throughput (DP=2)</td><td><i>TBD</i></td><td><i>TBD</i></td></tr>
-        <tr><td>503 window</td><td><i>TBD</i></td><td>&mdash;</td></tr>
-        <tr><td>Requests dropped</td><td><i>TBD</i></td><td>&mdash;</td></tr>
+        <tr><td>Total probes</td><td>14</td></tr>
+        <tr><td>HTTP 200 (pre and post)</td><td>6</td></tr>
+        <tr><td>HTTP 503 (during scaling)</td><td>8</td></tr>
+        <tr><td><b>503 window duration</b></td><td><b>3.53&nbsp;s</b></td></tr>
+        <tr><td>Probe latency before scaling</td><td>0.41&nbsp;s (normal)</td></tr>
+        <tr><td>Probe latency during 503</td><td>0.00&nbsp;s (instant reject)</td></tr>
+        <tr><td>Probe latency after scaling</td><td>0.48&nbsp;s (restored)</td></tr>
       </tbody>
     </table>
 
-    <h3>5.3 Live Scale-Up: 2 &rarr; 4 EP Workers</h3>
+    <p>The 503 window (3.53&nbsp;s) is shorter than the full scaling operation
+       (9.64&nbsp;s). The middleware flag is cleared as soon as the remaining
+       engines complete their reconfiguration; outgoing-engine teardown and
+       GPU memory release continue asynchronously. New requests resume
+       accepting before teardown completes.</p>
 
-    <table>
-      <thead>
-        <tr>
-          <th>Metric</th>
-          <th>Value</th>
-          <th>vs Baseline</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr><td>Rescaling duration</td><td><i>TBD</i></td><td>&mdash;</td></tr>
-        <tr><td>Throughput (recovered)</td><td><i>TBD</i></td><td><i>TBD</i></td></tr>
-        <tr><td>Weight transfer time</td><td><i>TBD</i></td><td>&mdash;</td></tr>
-        <tr><td>EPLB reshuffle time</td><td><i>TBD</i></td><td>&mdash;</td></tr>
-      </tbody>
-    </table>
+    <div class="warning-box">
+      <p><b>No request migration.</b> The 8 probes that received 503 were
+         rejected outright &mdash; not queued, retried, or migrated. A
+         production deployment would need client-side retry with backoff
+         during the 503 window.</p>
+    </div>
 
 
     <!-- ============================================================
@@ -807,33 +987,54 @@ to ALL other EP ranks.          back to originating ranks.
          7. CONCLUSIONS
          ============================================================ -->
 
-    <h2>7. Conclusions (Preliminary)</h2>
+    <h2>7. Conclusions</h2>
 
     <ol>
-      <li><b>Elastic EP is architecturally container-ready:</b> Stateless NCCL
-          groups require only TCP connectivity, not shared memory or process
-          namespaces. Per-GPU containers should work without modifying vLLM.</li>
-      <li><b>Scaling causes full service interruption:</b> All requests receive
-          503 during the entire scaling window. There is no request migration
-          or gradual transition.</li>
-      <li><b>Scale-up is complex:</b> An 8-state state machine coordinates
-          new engine creation, standby group formation, weight transfer,
-          KV cache synchronization, group switching, and EPLB reshuffling.</li>
-      <li><b>Scale-down is simpler:</b> Engines at removed ranks receive a
-          shutdown signal; remaining engines reshuffle experts and reinitialize
-          communicators.</li>
-      <li><b>Weight transfer is GPU-to-GPU P2P:</b> ~28&nbsp;GB for
-          Qwen3-30B-A3B, estimated 50&ndash;200&nbsp;ms per new engine at
-          NVLink bandwidth.</li>
-      <li><b>Phase 1 throughput and rescaling time: TBD.</b></li>
+      <li><b>Live rescaling works on our hardware</b> for Qwen3-30B-A3B with
+          vLLM&nbsp;v0.19.0: scale-up 2&rarr;4 in 25.8&nbsp;s, scale-down
+          4&rarr;2 in 4.1&nbsp;s (+ ~10&nbsp;s async GPU teardown). The feature
+          is real, shipped, and usable.</li>
+      <li><b>Throughput scales near-linearly:</b> 87.4&nbsp;tok/s at DP=2
+          &rarr; 166.6&nbsp;tok/s at DP=4 (1.91&times;, 95% efficiency).
+          Post-scale-down throughput (91.6&nbsp;tok/s) slightly exceeds
+          initial baseline, likely due to EPLB adapting to observed load.</li>
+      <li><b>Freed GPUs are reclaimable on bare metal:</b> scale-down 4&rarr;2
+          releases GPU 2 and GPU 3 memory from ~35&nbsp;GB to 4&nbsp;MiB within
+          ~10&nbsp;s of the HTTP 200 response. On bare metal, this GPU memory
+          is genuinely free for other workloads.</li>
+      <li><b>503 window is 3.53&nbsp;s</b> during scale-down &mdash; shorter
+          than the full scaling operation (9.64&nbsp;s) because async teardown
+          continues after the middleware flag clears. Requests are
+          <b>not migrated</b>; in-flight requests must complete on their
+          assigned engine or fail.</li>
+      <li><b>Elastic EP has a starting-config constraint:</b> with
+          <code>num_redundant_experts=0</code>, scale-down-first from a cold
+          start fails with <code>AssertionError: num_redundant &ge; 0</code>
+          because the EPLB rebalance formula reduces physical experts below
+          logical count. Starting at DP&le;N/2 and scaling up first avoids this.</li>
+      <li><b>Ray backend requires explicit isolation:</b> when another Ray
+          cluster is running on the host (e.g., a container-local Ray), vLLM
+          fails with &ldquo;Found multiple active Ray instances&rdquo;. We
+          solved this by starting a dedicated Ray head at a known port and
+          setting <code>RAY_ADDRESS</code> explicitly. This is an operational
+          wrinkle worth documenting for Phase 2&ndash;3.</li>
+      <li><b>Architecturally container-ready:</b> Stateless NCCL groups use
+          TCP coordination only, with no shared-memory assumptions. Per-GPU
+          containers in Phase&nbsp;3 should work without modifying vLLM, though
+          the Ray-cluster-isolation issue may reappear.</li>
     </ol>
 
     <div class="info-box">
-      <p><b>Next steps:</b> (1) Execute Phase 1 when GPUs are available:
-         baseline throughput, live rescaling 4&rarr;2&rarr;4, measure rescaling
-         duration and 503 window. (2) Phase 2: repeat in a multi-GPU container
-         to confirm GPU trapping. (3) Phase 3: per-GPU containers with
-         cross-container NCCL All-to-All.</p>
+      <p><b>Next steps:</b> (1) Phase&nbsp;2: run the same experiment inside a
+         single multi-GPU container. Expected: scale-down succeeds internally,
+         but GPUs 2&ndash;3 remain trapped (Docker can&rsquo;t release them
+         from the running container). Measure the mismatch between
+         vLLM&rsquo;s view (&ldquo;GPU freed&rdquo;) and the container
+         boundary&rsquo;s view (&ldquo;GPU still allocated to this container&rdquo;).
+         (2) Phase&nbsp;3: deploy four per-GPU containers, one EP worker each,
+         with cross-container NCCL All-to-All. Test whether stateless groups
+         work across container boundaries, and whether the LD_PRELOAD shim
+         (<code>common/shim/</code>) is needed for the NCCL gates.</p>
     </div>
 
 
