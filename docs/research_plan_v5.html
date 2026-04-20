@@ -1,0 +1,904 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Research Plan v5: Per-GPU Containers for In-Place Elastic MoE Serving</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: "Times New Roman", "Nimbus Roman", Times, serif;
+      background: #fff;
+      color: #111;
+      line-height: 1.6;
+    }
+    main {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 40px 32px 60px;
+    }
+    h1 {
+      font-size: 22px;
+      text-align: center;
+      margin: 0 0 4px;
+      line-height: 1.3;
+    }
+    .subtitle {
+      text-align: center;
+      font-size: 14px;
+      color: #444;
+      margin: 0 0 24px;
+    }
+    h2 {
+      font-size: 17px;
+      border-bottom: 1px solid #999;
+      padding-bottom: 4px;
+      margin: 28px 0 12px;
+    }
+    h3 {
+      font-size: 15px;
+      margin: 20px 0 8px;
+    }
+    h4 {
+      font-size: 14px;
+      margin: 16px 0 6px;
+    }
+    p, li {
+      font-size: 14px;
+      margin: 0 0 10px;
+    }
+    ul, ol {
+      padding-left: 24px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      margin: 12px 0;
+    }
+    th, td {
+      border: 1px solid #bbb;
+      padding: 5px 7px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #f0f0f0;
+      font-weight: bold;
+    }
+    td {
+      font-variant-numeric: tabular-nums;
+    }
+    code {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 13px;
+      background: #f5f5f5;
+      padding: 1px 4px;
+    }
+    pre {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 12px;
+      background: #f8f8f8;
+      border: 1px solid #ddd;
+      padding: 12px 16px;
+      margin: 12px 0;
+      overflow-x: auto;
+      line-height: 1.5;
+    }
+    .highlight-box {
+      background: #e8f5e9;
+      border: 2px solid #2e7d32;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .highlight-box p { margin: 0; }
+    .warning-box {
+      background: #fff3e0;
+      border: 2px solid #e65100;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .warning-box p { margin: 0; }
+    .info-box {
+      background: #e3f2fd;
+      border: 2px solid #1565c0;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .info-box p { margin: 0; }
+    a {
+      color: #1565c0;
+      text-decoration: none;
+    }
+    a:hover {
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+  <main>
+
+    <h1>Research Plan v5: Per-GPU Containers<br>for In-Place Elastic MoE Serving</h1>
+    <p class="subtitle">
+      Refinement of v4: narrowing to the per-GPU-container + vLLM Elastic EP direction<br>
+      2026-04-20
+    </p>
+
+    <div class="info-box">
+      <p><b>What this document is.</b> A focused follow-up to
+         <a href="research_plan_v4.html">research plan v4</a>. v4 proposed
+         three experiments (Tenplex, Oobleck, vLLM Elastic EP) to empirically
+         discover where the container boundary breaks GPU-granular scheduling.
+         We ran v4&rsquo;s Exp&nbsp;A1 and Exp&nbsp;A3 to completion. The
+         results clarified which direction is worth pursuing further. This v5
+         plan commits to that direction: <b>per-GPU containers as the
+         substrate for in-place elastic Mixture-of-Experts serving, built on
+         vLLM&rsquo;s Elastic Expert Parallelism</b>. v5 is not a system
+         design. It lists exploration fields and workaround plans so that a
+         system design can emerge from the investigation.</p>
+    </div>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 1: ULTIMATE GOAL                                     -->
+    <!-- ============================================================ -->
+
+    <h2>1. Ultimate Goal</h2>
+
+    <p>The ultimate goal is unchanged from v4:</p>
+
+    <div class="highlight-box">
+      <p><b>Enable true elasticity of LLM serving on shared GPU clusters.</b>
+         &ldquo;True&rdquo; elasticity means a serving deployment can
+         acquire or release individual GPUs during operation, <i>without</i>
+         restarting the serving process, <i>without</i> dropping requests, and
+         in a way that the cluster scheduler actually sees &mdash; so that
+         freed GPUs become available to other tenants, and new GPUs can be
+         added to meet demand, both at second-to-minute granularity.</p>
+    </div>
+
+    <p>Three conditions implicit in this goal:</p>
+
+    <ul>
+      <li><b>Process survives scaling.</b> No checkpoint-and-restart. The
+          inference endpoint stays up while the resource set changes.</li>
+      <li><b>Cluster sees the scaling.</b> After scale-down, the freed GPUs
+          must be re-allocatable to other jobs &mdash; not just idle inside
+          the container they came from.</li>
+      <li><b>Serving quality is preserved.</b> Throughput and latency at the
+          new size should be close to what a statically-provisioned deployment
+          of that size would achieve. Brief interruption during the scale
+          event itself is acceptable; a permanent 10&times; slowdown is not.</li>
+    </ul>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 2: MOTIVATION                                        -->
+    <!-- ============================================================ -->
+
+    <h2>2. Motivation</h2>
+
+    <p>v4 established the general gap between fine-grained GPU scheduling and
+       containerised production. v5 sharpens this into a concrete deployment
+       pattern and argues why the <i>per-GPU container + in-place elastic
+       MoE</i> combination is the specific scenario worth pursuing.</p>
+
+    <h3>2.1 Why containers at all?</h3>
+
+    <p>The research question could, in principle, be pursued on bare metal.
+       It is not, for two reasons:</p>
+
+    <table>
+      <thead>
+        <tr><th>Reason</th><th>Evidence</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Containers are the production deployment format.</b>
+              Kubernetes has ~92% orchestration market share; AI/ML workloads
+              on K8s are at ~54% and rising. GPU resource accounting in K8s
+              is via <code>nvidia.com/gpu</code> on Pods &mdash; a container
+              primitive. AWS EKS, Azure AKS, GCP GKE all ship GPU support
+              through containers.</td>
+          <td>CNCF surveys 2024&ndash;2025; v4 Section 1.2.</td>
+        </tr>
+        <tr>
+          <td><b>Containers deliver isolation that shared GPU nodes require.</b>
+              Multi-tenant GPU clusters need fault isolation (9%
+              annualised GPU failure rate observed in Meta Llama 3.1
+              training on 16K H100s) and security isolation. Both require
+              process / namespace boundaries. The container is the standard
+              mechanism.</td>
+          <td>Meta Llama 3.1 paper; industry deployment norms.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Studying elasticity without containers produces a result that does
+       not transfer to the environments where LLM serving actually runs.
+       The NCCL gates, the cgroup pinning, the namespace isolation &mdash;
+       these are production realities, not research-added noise.</p>
+
+    <h3>2.2 Why multi-GPU containers cannot dynamically adjust GPU count</h3>
+
+    <p>A single container with multiple GPUs is the dominant deployment
+       pattern today (<code>--gpus all</code>, one Pod per node). This
+       pattern cannot implement the &ldquo;Cluster sees the scaling&rdquo;
+       requirement from Section 1, for a reason rooted in how GPU access is
+       granted to a Linux container:</p>
+
+    <ul>
+      <li><b>NVIDIA Container Toolkit binds devices at launch time.</b> When
+          a container starts with <code>--gpus</code>, the toolkit
+          (<code>nvidia-container-cli</code>) configures the container&rsquo;s
+          <code>devices</code> cgroup v2 allowlist to permit exactly the
+          requested <code>/dev/nvidia&lt;N&gt;</code> character devices,
+          bind-mounts the NVIDIA driver libraries, and sets
+          <code>NVIDIA_VISIBLE_DEVICES</code>. This configuration is applied
+          by the OCI runtime hook at container creation.</li>
+      <li><b>Docker has no API to modify device allocations on a running
+          container.</b> <code>docker update</code> can change memory, CPU
+          shares, and a few other runtime limits, but not
+          <code>--device</code> or <code>--gpus</code>. Nor does the OCI
+          runtime spec allow device modification after creation.</li>
+      <li><b>Kubernetes In-Place Pod Resize (1.27+) does not cover
+          <code>nvidia.com/gpu</code>.</b> In-Place Resize is limited to
+          CPU and memory. Adjusting a Pod&rsquo;s GPU allocation requires
+          deleting and recreating the Pod.</li>
+      <li><b>Cgroup v2 device controllers could theoretically be
+          mutated,</b> but this is a privileged operation on the host, not
+          something the container runtime exposes, and it does not update
+          the container&rsquo;s CUDA visibility (<code>CUDA_VISIBLE_DEVICES</code>
+          and the userspace driver state).</li>
+    </ul>
+
+    <p>Exp&nbsp;A3 Phase&nbsp;2 confirmed this experimentally: regardless of
+       what vLLM did internally across a 2&rarr;4&rarr;2 live rescale, the
+       container&rsquo;s
+       <code>HostConfig.DeviceRequests.DeviceIDs</code> remained
+       <code>[0,&nbsp;1,&nbsp;2,&nbsp;3]</code> for the entire process
+       lifetime. GPU memory released (<code>nvidia-smi</code> showed
+       ~35&nbsp;GB &rarr; 4&nbsp;MiB within ~10&nbsp;s of scale-down), but
+       the container &mdash; and therefore the Pod, and therefore the
+       scheduler&rsquo;s resource accounting &mdash; did not.</p>
+
+    <p><b>Conclusion.</b> Multi-GPU containers can host the serving process
+       through a scale event, but they cannot propagate the scaling decision
+       to the cluster scheduler. The freed GPUs are memory-free but
+       <i>container-trapped</i>.</p>
+
+    <h3>2.3 Two parallelism-adjustment patterns, only one of which needs per-GPU containers</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Pattern</th>
+          <th>Examples</th>
+          <th>Does process survive scaling?</th>
+          <th>Multi-GPU container OK?</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Stop-restart parallelism adjustment</b></td>
+          <td>Tenplex (SOSP&rsquo;24), ByteCheckpoint, Megatron resumable
+              training</td>
+          <td>No. Checkpoint &rarr; terminate &rarr; restart with new
+              parallelism.</td>
+          <td style="color:#2e7d32;"><b>Yes.</b> The container can be
+              recreated between runs with a different <code>--gpus</code>
+              set. Scheduler sees clean lifecycle. Exp&nbsp;A1 confirmed
+              this for Tenplex: multi-GPU containers handle stop-restart
+              elasticity without issue.</td>
+        </tr>
+        <tr>
+          <td><b>In-place parallelism adjustment</b></td>
+          <td>vLLM Elastic EP (v0.17+), NTP (arXiv&rsquo;25, non-uniform TP),
+              Expert-as-a-Service (arXiv&rsquo;25)</td>
+          <td>Yes. Communicators are reformed, weights redistributed, and
+              serving continues on the new set of GPUs without process
+              restart.</td>
+          <td style="color:#e65100;"><b>No.</b> The process does not
+              terminate, so the container is never recreated, so the
+              orchestrator-level GPU allocation is never adjusted.
+              Per-GPU containers are <i>required</i> for cluster-level
+              elasticity of in-place systems. Exp&nbsp;A3 Phase&nbsp;2
+              confirmed this.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>This is the refinement of v4&rsquo;s argument. Per-GPU containers
+       are not about &ldquo;finer scheduling in general.&rdquo; They are
+       the <i>only</i> path to cluster-visible elasticity for in-place
+       systems, because the container allocation is the level at which
+       GPUs are granted and revoked, and in-place systems never give the
+       orchestrator a chance to recreate the container.</p>
+
+    <h3>2.4 vLLM Elastic EP is the concrete case worth studying</h3>
+
+    <p>To ground the research in a real system, we need a deployed in-place
+       elastic technique to carry the weight of the study. vLLM&rsquo;s
+       Elastic Expert Parallelism (shipped in v0.17.0, March 2026) is the
+       natural choice:</p>
+
+    <ul>
+      <li><b>Production-grade.</b> Part of the dominant OSS LLM serving
+          engine; used by Red Hat, Databricks, Anyscale, and others in
+          production deployments.</li>
+      <li><b>Genuinely in-place.</b> The
+          <code>POST&nbsp;/scale_elastic_ep</code> endpoint reshapes EP/DP
+          size without restarting the serving process. Exp&nbsp;A3
+          Phase&nbsp;1 verified: the process survives 2&rarr;4 scale-up
+          (25.8&nbsp;s) and 4&rarr;2 scale-down (4.1&nbsp;s) with no
+          restart.</li>
+      <li><b>Mixture-of-Experts is the frontier deployment pattern.</b>
+          DeepSeek-V3/R1, Qwen3-MoE, Llama 4 Maverick are all MoE; EP is
+          the parallelism strategy used to serve them. Elasticity for MoE
+          serving is not a toy use case &mdash; it is how future large
+          deployments will scale with traffic.</li>
+      <li><b>Well-suited to per-GPU containers.</b> Experts are independent
+          computation units that map naturally one-expert-group-per-GPU
+          = one-container. The
+          <a href="https://arxiv.org/abs/2509.17863">Expert-as-a-Service
+          paradigm</a> already proposes exactly this disaggregation at the
+          application layer; we study the infrastructure layer that would
+          make it work.</li>
+      <li><b>We already have a working baseline.</b> Exp&nbsp;A3 Phase&nbsp;1
+          gives us 166.6&nbsp;tok/s native DP=4 performance and verified
+          functional behaviour. Every subsequent result can be compared to
+          this baseline.</li>
+    </ul>
+
+    <div class="highlight-box">
+      <p><b>The sharpened research question for v5:</b> Can per-GPU
+         containers host vLLM Elastic EP (or a modified variant thereof)
+         with throughput close to native, while enabling the cluster
+         scheduler to actually see the scaling decisions &mdash; in a way
+         that can be deployed in a real K8s-style production setting? If
+         yes, how? If not, which specific obstacles are fundamental vs.
+         engineering?</p>
+    </div>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 3: WHAT WE HAVE ALREADY VERIFIED                     -->
+    <!-- ============================================================ -->
+
+    <h2>3. What We Have Already Verified (Exp A1 + Exp A3)</h2>
+
+    <p>v5 does not start from scratch. Two experiments in v4 are
+       complete; their findings constrain v5&rsquo;s direction. This section
+       summarises what is now known empirically.</p>
+
+    <h3>3.1 Stop-restart elasticity is solved by multi-GPU containers (Exp&nbsp;A1)</h3>
+
+    <p><a href="../exp_a1_tenplex/analysis_report.html">Exp&nbsp;A1 (Tenplex)</a>
+       established that Tenplex&rsquo;s &ldquo;elastic&rdquo; reconfiguration
+       is stop-transform-restart: the training process terminates, state is
+       transformed on the host, and a new process starts with different
+       parallelism. The container can be recreated between runs with a
+       different <code>--gpus</code> set &mdash; the scheduler sees clean
+       lifecycle events, no GPU is trapped. <b>This pattern does not need
+       per-GPU containers.</b></p>
+
+    <h3>3.2 In-place elastic EP works on native hardware (Exp&nbsp;A3 Phase&nbsp;1)</h3>
+
+    <p><a href="../exp_a3_vllm_ep/analysis_report.html">Exp&nbsp;A3
+       Phase&nbsp;1</a> confirmed:</p>
+
+    <ul>
+      <li>vLLM Elastic EP v0.19 works end-to-end with Qwen3-30B-A3B on 4&times;
+          A100-40GB.</li>
+      <li>Throughput scales near-linearly: 87.4&nbsp;tok/s at DP=2 &rarr;
+          166.6&nbsp;tok/s at DP=4 (1.91&times;, 95% efficiency).</li>
+      <li>Scale-up 2&rarr;4 in 25.8&nbsp;s. Scale-down 4&rarr;2 in 4.1&nbsp;s.</li>
+      <li>Service interruption during scaling: ~3.5&nbsp;s 503 window.</li>
+      <li>After scale-down, GPU memory drops to 4&nbsp;MiB within ~10&nbsp;s
+          &mdash; CUDA contexts are cleanly released at the process level.</li>
+    </ul>
+
+    <h3>3.3 Multi-GPU container traps the freed GPUs (Exp&nbsp;A3 Phase&nbsp;2)</h3>
+
+    <p>Inside a single container with
+       <code>--gpus&nbsp;'&quot;device=0,1,2,3&quot;'</code>, the same
+       2&rarr;4&rarr;2 cycle works internally (throughput 66.7 &rarr;
+       154.1 &rarr; 69.2&nbsp;tok/s, 7&ndash;24% container overhead), but
+       <b><code>HostConfig.DeviceRequests.DeviceIDs</code> stays at
+       <code>[0,1,2,3]</code> for the entire container lifetime</b>, even
+       after vLLM has internally scaled down and released GPU 2 and 3
+       memory. An orchestrator sees four GPU requests held indefinitely.
+       This is the motivation argument (Section 2.2) in experimental form.</p>
+
+    <h3>3.4 Per-GPU containers eliminate the trap but expose new problems (Exp&nbsp;A3 Phase&nbsp;3)</h3>
+
+    <p>With four containers (one per GPU), a Docker bridge network, and a Ray
+       cluster spanning the containers, <code>vllm&nbsp;serve</code> at DP=4
+       runs successfully after one workaround. Each container&rsquo;s
+       <code>DeviceIDs</code> is just <code>['N']</code> &mdash; the trap
+       is eliminated. But three new problems emerged:</p>
+
+    <table>
+      <thead>
+        <tr><th>Problem</th><th>What we saw</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>vLLM&rsquo;s DP-master assumption</b></td>
+          <td>Default flags fail with
+              <code>ValueError: Not enough resources to allocate 4 DP
+              ranks on DP master node, possible to fit 1</code>. Workaround:
+              <code>--data-parallel-size-local 1</code>.</td>
+        </tr>
+        <tr>
+          <td><b>NCCL falls back to TCP sockets</b></td>
+          <td>All three NCCL same-node gates
+              (<code>hostHash</code>, <code>shmDev</code>, abstract UDS) fail.
+              Every channel logs <code>via NET/Socket/0</code>. Throughput
+              drops to 127.8&nbsp;tok/s (&minus;23% vs native), even though
+              GPU&nbsp;0 and GPU&nbsp;1 have physical NVLink NV12 between
+              them.</td>
+        </tr>
+        <tr>
+          <td><b><code>/scale_elastic_ep</code> bricks the service</b></td>
+          <td>The known EPLB <code>num_redundant &ge; 0</code> bug combined
+              with 4-container coordination leaves partial Ray actor
+              teardown and unrecoverable state. Process cannot be restarted
+              without tearing down all containers.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>The first two problems define the primary technical challenges for
+       v5. The third is a vLLM-level bug orthogonal to our research, but
+       one we must manage operationally.</p>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 4: EXPLORATION FIELDS                                -->
+    <!-- ============================================================ -->
+
+    <h2>4. Exploration Fields</h2>
+
+    <p>Each subsection describes an exploration field: what it is, why it
+       matters, what we have already observed, and a <i>workaround plan</i>
+       &mdash; the concrete next experiments and investigations that would
+       move understanding forward. We deliberately do not propose a final
+       system design. The design should fall out of the exploration.</p>
+
+    <h3>4.1 Recovering NCCL bandwidth across per-GPU containers</h3>
+
+    <h4>4.1.1 Challenge</h4>
+
+    <p>NCCL&rsquo;s transport-selection logic decides at communicator init
+       time whether two ranks are &ldquo;on the same node.&rdquo; Three
+       independent gates are checked; all three fail in our per-GPU
+       container setup:</p>
+
+    <table>
+      <thead>
+        <tr><th>Gate</th><th>Check</th><th>Why it fails in Phase 3</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>hostHash</code></td>
+          <td><code>hash(gethostname() + /proc/sys/kernel/random/boot_id)</code></td>
+          <td>Each container gets a distinct UTS namespace and hostname
+              (<code>ep-rank-0</code>, <code>ep-rank-1</code>, &hellip;).</td>
+        </tr>
+        <tr>
+          <td><code>shmDev</code></td>
+          <td><code>stat(&quot;/dev/shm&quot;).st_dev</code></td>
+          <td>Each container mounts its own <code>/dev/shm</code> tmpfs by
+              default.</td>
+        </tr>
+        <tr>
+          <td><code>IPC socket</code></td>
+          <td>Abstract UDS for <code>cuMem</code> FD passing (used to exchange
+              CUDA IPC handles).</td>
+          <td>Abstract UDS are network-namespace-scoped; each container has
+              its own netns.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Any single failure is enough to downgrade NCCL to the NET (sockets)
+       transport. On our hardware, this converts a 600&nbsp;GB/s NVLink NV12
+       link into a ~10&nbsp;GB/s loopback TCP link and costs
+       23% throughput on Qwen3-30B-A3B at DP=4.</p>
+
+    <h4>4.1.2 Workaround plan</h4>
+
+    <ol>
+      <li><b>Apply the LD_PRELOAD shim from Exp&nbsp;A</b>
+          (<code>common/shim/</code>, 261 lines of C99) to each per-GPU
+          container. The shim intercepts <code>gethostname()</code>,
+          <code>stat()</code>, <code>bind()</code>, and
+          <code>sendmsg()</code> to make all three gates pass. Exp&nbsp;A&rsquo;s
+          validation showed 100% NVLink bandwidth recovery
+          (156.8&nbsp;GB/s AllReduce, 262.4&nbsp;GB/s raw P2P) for the
+          NCCL benchmark. It has not been validated with vLLM.</li>
+      <li><b>Rerun Exp&nbsp;A3 Phase&nbsp;3 with the shim injected.</b>
+          Measure: (a) NCCL transport selection (expect
+          <code>NET/IB</code>, <code>P2P/IPC</code>, or similar
+          NVLink-capable transport instead of <code>NET/Socket/0</code>);
+          (b) throughput at DP=4 (target: close to Phase 2&rsquo;s
+          154.1&nbsp;tok/s or Phase 1&rsquo;s 166.6&nbsp;tok/s); (c)
+          scale-up weight transfer time (in Phase 1 this was ~50&ndash;200&nbsp;ms
+          per new engine; in Phase 3 without shim it would be seconds via
+          TCP).</li>
+      <li><b>Characterise which gates are actually load-bearing.</b> The
+          shim spoofs all three; in practice NCCL may select NVLink if any
+          one of them is made to pass. Stripping the shim down to the
+          minimal intercept set tells us which gate is the operative
+          barrier, and by extension what the minimal container-runtime
+          changes would look like (instead of LD_PRELOAD).</li>
+      <li><b>Check whether vLLM&rsquo;s additional communication paths
+          (weight transport, EPLB reshuffle coordination) also benefit.</b>
+          NCCL gates affect all NCCL calls, but vLLM also uses Gloo (CPU
+          collectives) and a TCP store for stateless-group coordination;
+          those are already TCP-based and unaffected. Verify that only the
+          NCCL data-path is the bottleneck.</li>
+    </ol>
+
+    <p>This is the highest-priority exploration because Phase 3 already
+       demonstrated the loss is large and the shim is known to recover
+       bandwidth in simpler benchmarks. If it does not work with vLLM, that
+       in itself is a finding and redirects the research.</p>
+
+    <h3>4.2 Coordinating container lifecycle with vLLM&rsquo;s scaling state machine</h3>
+
+    <h4>4.2.1 Challenge</h4>
+
+    <p>vLLM today expresses scaling as an HTTP call that internally
+       orchestrates Ray actor creation/destruction. The
+       caller&rsquo;s assumption is &ldquo;the Ray cluster stays, vLLM
+       manipulates actors inside it.&rdquo; The per-GPU-container design
+       wants the inverse: <i>the container lifecycle is the primitive</i>.
+       Scale-down is &ldquo;stop container <code>ep-rank-3</code>&rdquo;;
+       scale-up is &ldquo;start a new container.&rdquo;</p>
+
+    <p>The two views are not equivalent:</p>
+
+    <ul>
+      <li>Under the current HTTP model, vLLM destroys a Ray actor but the
+          underlying Ray worker (and its container) keeps running, just idle.
+          Scheduler still sees the GPU allocated. We saw this in
+          Phase&nbsp;3: after attempted scale-down, containers remained
+          <code>Up</code> even though vLLM had torn down engines.</li>
+      <li>Under the container-lifecycle model, the external action is
+          <code>docker stop ep-rank-3</code>. Ray node detaches abruptly.
+          vLLM&rsquo;s existing elastic EP code does not currently handle
+          &ldquo;a Ray node just went away unexpectedly&rdquo; &mdash; it
+          orchestrates its own actor teardown first.</li>
+    </ul>
+
+    <h4>4.2.2 Workaround plan</h4>
+
+    <ol>
+      <li><b>Map vLLM&rsquo;s scaling state machine onto container
+          lifecycle events.</b> Re-read the scale-down path in
+          <code>vllm/distributed/elastic_ep/elastic_state.py</code>: which
+          steps can be driven by an external actor that ALSO controls
+          container lifecycle? Which steps strictly require vLLM to be in
+          charge?</li>
+      <li><b>Experiment with a thin external coordinator.</b> The loop:
+          <i>(a)</i> call <code>/scale_elastic_ep</code> to 2; <i>(b)</i>
+          after the API completes, <code>docker stop</code> the two
+          departing containers. Measure: does this produce a clean
+          cluster-visible scale-down? Does it work repeatedly? Can we do
+          the inverse order (stop first, then call API)?</li>
+      <li><b>Study whether Ray&rsquo;s graceful node-removal can integrate
+          with vLLM.</b> Ray supports node shutdown with drain semantics
+          (<code>ray.shutdown()</code> on a worker). If vLLM&rsquo;s
+          reconfiguration code reacts to Ray node events the same way as
+          it reacts to actor failures, we might be able to use Ray events
+          as the trigger, with vLLM re-forming communicators from the
+          surviving set.</li>
+      <li><b>Prototype a &ldquo;container stop&rdquo; that behaves like a
+          controlled actor exit.</b> Send a signal to the Ray worker to
+          detach cleanly, wait for vLLM to finish its reconfiguration,
+          then terminate the container. Measure service interruption
+          compared to HTTP-API scale-down.</li>
+    </ol>
+
+    <p>The output of this exploration is an understanding of which scaling
+       operations can be expressed as container lifecycle events without
+       modifying vLLM, which require small patches, and which require
+       larger design changes.</p>
+
+    <h3>4.3 Auditing vLLM&rsquo;s hidden multi-GPU-master assumptions</h3>
+
+    <h4>4.3.1 Challenge</h4>
+
+    <p>Exp&nbsp;A3 Phase&nbsp;3 surfaced one such assumption: the CLI
+       rejected <code>--data-parallel-size 4</code> with &ldquo;Not enough
+       resources to allocate 4 DP ranks on DP master node, possible to fit
+       1 DP ranks.&rdquo; The workaround
+       (<code>--data-parallel-size-local 1</code>) got us past it, but
+       this hints at a broader pattern: vLLM&rsquo;s elastic EP was
+       designed and tested against single-node multi-GPU deployments. How
+       many other design-time assumptions about topology are baked in
+       where they will surface only in per-GPU container deployments?</p>
+
+    <p>Examples of assumptions that might (or might not) exist:</p>
+
+    <ul>
+      <li>Does scale-up assume the new Ray actor can be created on the
+          same node as an existing one for weight transport? (We know weight
+          transport uses GPU P2P; in a per-GPU setup the &ldquo;same
+          node&rdquo; pairing doesn&rsquo;t exist.)</li>
+      <li>Does the KV cache memory synchronisation
+          (<code>SYNC_KV_CACHE_MEMORY_SIZE</code> state) assume all engines
+          have similar topology? Our heterogeneous SXM4+PCIe-A100 setup
+          might expose NUMA/PCIe differences that were invisible with all
+          GPUs in one container.</li>
+      <li>Does the EPLB load-balancer assume collocated ranks for efficient
+          telemetry collection?</li>
+      <li>Does the stateless-group TCP store coordinator scale to 4, 16,
+          64 rank-containers the same way it scales within a single
+          process? </li>
+    </ul>
+
+    <h4>4.3.2 Workaround plan</h4>
+
+    <ol>
+      <li><b>Systematic source audit.</b> Read the Ray-related code paths
+          in vLLM&rsquo;s elastic EP for assumptions about rank co-location,
+          file-system visibility (shared model dir), or host-level
+          resource expectations. Produce a short &ldquo;per-GPU container
+          deployment checklist&rdquo;: which flags / env vars must be set,
+          which features are incompatible.</li>
+      <li><b>Stress test at larger DP.</b> 4 containers is too small to
+          expose coordinator scaling. Try DP=8 or DP=16 on hardware that
+          can host it (another machine, cloud instance) and see what breaks
+          at larger rank counts.</li>
+      <li><b>Document the delta between in-container config and
+          per-container config.</b> An operator deploying vLLM on K8s needs
+          to know exactly which settings differ from a single-node
+          deployment. The audit produces this delta.</li>
+    </ol>
+
+    <h3>4.4 Understanding EPLB robustness and the cold-start scale-down path</h3>
+
+    <h4>4.4.1 Challenge</h4>
+
+    <p>vLLM&rsquo;s EPLB rebalance code has a logical invariant
+       (<code>num_physical &ge; num_logical</code>) that is violated when a
+       cold-started DP=N deployment with
+       <code>num_redundant_experts=0</code> tries to scale down.
+       The assertion fires and the serving process does not recover. We
+       hit this in Phase&nbsp;1 (documented workaround: start at DP&le;N/2,
+       scale up first, then scale down freely). In Phase&nbsp;3 the same
+       bug bricked the multi-container cluster because recovery requires
+       coordinated tear-down across 4 containers.</p>
+
+    <p>For any production deployment, two questions arise: (a) is this a
+       vLLM bug that will be fixed upstream, and if so when? (b) what are
+       the safe-deployment rules until it is fixed?</p>
+
+    <h4>4.4.2 Workaround plan</h4>
+
+    <ol>
+      <li><b>Trace the EPLB rebalance code end to end.</b> Identify
+          exactly which code path derives the new
+          <code>num_physical</code> from the old one during scale-down,
+          and under what inputs the invariant holds. This is already
+          partially mapped in the analysis report (<code>num_replicas =
+          num_replicas // ep_group.size() * num_gpus</code>).</li>
+      <li><b>Experiment with
+          <code>--eplb-config.num_redundant_experts &gt; 0</code>.</b>
+          Redundancy allows scale-down to consume redundant copies rather
+          than drop logical experts. Verify scale-down 4&rarr;2 with e.g.
+          <code>num_redundant_experts=4</code> succeeds from a cold DP=4
+          start. Measure: memory cost of redundancy, throughput cost,
+          whether the bug is actually side-stepped.</li>
+      <li><b>Check upstream issue tracker.</b> If this is known, find the
+          fix PR. If not, file a minimal repro and propose a fix
+          (we have the full stack trace and a tight repro from Exp&nbsp;A3
+          Phase 1). An upstream fix would remove one constraint on our
+          deployment; if it is not forthcoming, our research must
+          explicitly document the workaround.</li>
+      <li><b>Test recovery from a broken scale event.</b> When the
+          assertion fires, what is the minimal set of actions to restore
+          service? (Restart containers? Restart only the master? Wipe Ray
+          state?) This determines the operator-side failure-handling logic
+          for any future system.</li>
+    </ol>
+
+    <h3>4.5 Characterising cross-container scale-up weight transport</h3>
+
+    <h4>4.5.1 Challenge</h4>
+
+    <p>Scale-up in vLLM Elastic EP streams non-expert model parameters
+       (~28&nbsp;GB for Qwen3-30B-A3B) from existing engines to new
+       engines over the NCCL channel (see Analysis Report Section 6.2).
+       In native and multi-GPU-container deployments, this uses NVLink
+       P2P and takes sub-second in theory and single-digit seconds in
+       practice. In per-GPU containers without the shim, this transfer
+       uses TCP sockets &mdash; potentially tens of seconds per new
+       rank.</p>
+
+    <p>We have not yet isolated the weight-transfer phase in Phase 3
+       timing. The 39&nbsp;s Phase-2 scale-up includes Ray actor spawn,
+       weight transfer, EPLB reshuffle, and group switching; only a small
+       fraction is likely pure transfer time.</p>
+
+    <h4>4.5.2 Workaround plan</h4>
+
+    <ol>
+      <li><b>Instrument the scale-up state machine.</b> Add timing
+          probes at each state transition
+          (<code>WAIT_NEW_CORE_ENGINES_INIT</code>,
+          <code>CREATE_STANDBY_GROUPS</code>,
+          <code>TRANSFER_EXPERT_MAPPING</code>,
+          <code>TRANSFER_WEIGHTS</code>, &hellip;) either by log parsing
+          (existing INFO lines include timestamps) or by a small vLLM
+          patch. Report time spent in each phase for all three phases of
+          Exp&nbsp;A3.</li>
+      <li><b>Measure weight transfer with and without the shim.</b> After
+          Section&nbsp;4.1 workarounds are in place, re-time scale-up in
+          Phase&nbsp;3. Expected: without shim, transfer phase dominates
+          scale-up time and explains much of the overhead; with shim,
+          transfer approaches Phase&nbsp;2 timing.</li>
+      <li><b>Consider alternative transfer paths if NCCL-over-TCP is
+          unworkable.</b> The mounted model volume is visible to every
+          container &mdash; a new rank could load non-expert weights from
+          disk instead of receiving them over NCCL. This trades transfer
+          time for I/O time and requires a vLLM patch, but it is worth
+          understanding as a fallback if NCCL-over-shim does not recover
+          enough bandwidth.</li>
+    </ol>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 5: EXPLORATION SEQUENCE                              -->
+    <!-- ============================================================ -->
+
+    <h2>5. Exploration Sequence and Decision Points</h2>
+
+    <p>The exploration fields above are not independent. A suggested order,
+       with explicit decision points:</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Iteration</th>
+          <th>Focus</th>
+          <th>What we learn</th>
+          <th>Decision it unblocks</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>1</b></td>
+          <td>4.1 NCCL bandwidth recovery (shim + vLLM)</td>
+          <td>Does the Exp A shim make NCCL pick NVLink across per-GPU
+              containers in a vLLM workload? What fraction of the 23% loss
+              is recovered?</td>
+          <td>If yes: per-GPU containers become viable from a performance
+              standpoint; proceed. If no: investigate why vLLM&rsquo;s NCCL
+              usage differs from the benchmark, possibly deeper
+              modifications.</td>
+        </tr>
+        <tr>
+          <td><b>2</b></td>
+          <td>4.5 Scale-up weight transport (instrumented)</td>
+          <td>How much does scale-up slow down in per-GPU containers?
+              Can the shim recover it?</td>
+          <td>Determines whether dynamic scale-up is fast enough for
+              second-latency scheduling, or only fit for minute-scale
+              rebalancing.</td>
+        </tr>
+        <tr>
+          <td><b>3</b></td>
+          <td>4.2 Container lifecycle as scaling primitive</td>
+          <td>Can scaling be driven from the outside, with vLLM just
+              reacting? What is the minimal coordination required?</td>
+          <td>Decides whether the system design should wrap vLLM behind an
+              operator that manages containers, or modify vLLM to accept
+              lifecycle-event triggers directly.</td>
+        </tr>
+        <tr>
+          <td><b>4</b></td>
+          <td>4.3 Assumption audit + 4.4 EPLB robustness</td>
+          <td>What deployment rules and config deltas are required; which
+              vLLM bugs block us; what production guardrails are needed.</td>
+          <td>Completes the catalogue of known-obstacles; everything
+              remaining is the actual research-system problem.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="warning-box">
+      <p><b>Stopping condition.</b> If Iteration 1 (NCCL + shim + vLLM)
+         does not recover most of the 23% loss, the per-GPU container
+         direction is in trouble and we reassess. If Iteration 2 shows
+         scale-up time dominated by something neither the shim nor
+         alternative transport can help (e.g., a fundamental Ray actor
+         cold-start latency), we may need to rethink the scaling
+         granularity. If Iteration 3 shows container lifecycle can not be
+         coordinated with vLLM without invasive patches, the system design
+         implications narrow substantially.</p>
+    </div>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 6: NON-GOALS FOR THIS PHASE                          -->
+    <!-- ============================================================ -->
+
+    <h2>6. Non-Goals for This Phase</h2>
+
+    <p>To keep v5 focused, the following are deliberately out of scope until
+       the exploration in Section 4 produces results:</p>
+
+    <ul>
+      <li><b>No new system design.</b> We do not propose a Kubernetes
+          operator architecture, a new serving engine, or a modified NCCL
+          replacement in this plan. The exploration is supposed to reveal
+          what the design should be. Writing a design first would bias the
+          experiments toward confirming it.</li>
+      <li><b>No new NCCL shim.</b> Exp A&rsquo;s existing shim is the
+          candidate; if it does not suffice, we investigate why, but we do
+          not build a replacement.</li>
+      <li><b>No new model.</b> Qwen3-30B-A3B is the reference model
+          throughout. Changing models would muddle the comparisons with
+          v4&rsquo;s A1/A3 baselines.</li>
+      <li><b>No multi-node cluster.</b> Single node (node192, 4&times;
+          A100-40GB) is sufficient to study the per-GPU container question
+          because NCCL gates are about the container boundary, not the
+          physical host. Multi-node introduces orthogonal concerns
+          (network topology, cross-host NVLink domains) that should be
+          tackled separately.</li>
+      <li><b>No production-readiness claims.</b> If the exploration
+          succeeds, the next phase plans a productisation path; that is
+          not in v5.</li>
+    </ul>
+
+
+    <!-- ============================================================ -->
+    <!-- SECTION 7: RELATIONSHIP TO v4                                -->
+    <!-- ============================================================ -->
+
+    <h2>7. Relationship to Research Plan v4</h2>
+
+    <p>v5 supersedes the v4 Exp&nbsp;A3 Phase&nbsp;3 section specifically.
+       Other v4 content remains valid but is no longer the active plan:</p>
+
+    <table>
+      <thead>
+        <tr><th>v4 content</th><th>Status under v5</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Section 1&ndash;3 (motivation, research gap, methodology)</td>
+          <td>Still accurate; v5 builds on them.</td>
+        </tr>
+        <tr>
+          <td>Exp A1 (Tenplex)</td>
+          <td>Complete. Finding folded into v5 Section 2.3 and 3.1.</td>
+        </tr>
+        <tr>
+          <td>Exp A2 (Oobleck, fault tolerance)</td>
+          <td>Not run; deferred. If v5 Section 4 discovers that per-GPU
+              containers fundamentally cannot host in-place elastic MoE
+              serving, Exp&nbsp;A2 becomes the backup direction.</td>
+        </tr>
+        <tr>
+          <td>Exp A3 Phases 1&ndash;3</td>
+          <td>Complete; findings drive v5.</td>
+        </tr>
+        <tr>
+          <td>v4 Section 8 &ldquo;Challenges to Investigate&rdquo; (inside
+              Exp A3)</td>
+          <td>Superseded by v5 Section 4, which is more specific and
+              informed by Phase&nbsp;3 data.</td>
+        </tr>
+      </tbody>
+    </table>
+
+  </main>
+</body>
+</html>
