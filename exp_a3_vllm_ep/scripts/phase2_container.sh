@@ -1,234 +1,171 @@
 #!/usr/bin/env bash
-# Phase 2: vLLM Elastic EP inside a Multi-GPU Container
+# Exp A3 Phase 2: vLLM Elastic EP inside a single multi-GPU container.
 #
-# Run vLLM Elastic EP in a single Docker container with --gpus all (visible to
-# GPUs 0-3). Run the same 2->4->2 cycle as Phase 1, but from a containerized
-# context. Key measurements:
-#   1. Does elastic EP work identically inside a container?
-#   2. After scale-down 4->2, does the container still claim all 4 GPUs?
-#   3. Can a second workload (from the host) claim GPUs 2-3?
+# Container is launched with --gpus '"device=0,1,2,3"', mounts the HF cache
+# read-only, and starts vllm serve at DP=2. Bench benchmarks use the same
+# `vllm bench serve` command as Phase 1, run from the host against port
+# ${VLLM_PORT}. The benchmark produces comparable numbers to Phase 1.
+#
+# Key Phase 2 observations captured by `state`:
+#     container's HostConfig.DeviceRequests.DeviceIDs  (what Docker claims)
+#     host-side nvidia-smi                              (what's actually in use)
+# The delta between these is the "orchestrator trap" finding.
 #
 # Usage:
-#   ./scripts/phase2_container.sh start      # launch container + serving
-#   ./scripts/phase2_container.sh bench N    # benchmark at DP=N
-#   ./scripts/phase2_container.sh scale-up   # 2 -> 4
-#   ./scripts/phase2_container.sh scale-down # 4 -> 2
-#   ./scripts/phase2_container.sh host-view  # snapshot Docker + host state
-#   ./scripts/phase2_container.sh stop       # clean up
+#   ./scripts/phase2_container.sh start         # run container + vllm serve
+#   ./scripts/phase2_container.sh bench LABEL   # vllm bench from host
+#   ./scripts/phase2_container.sh scale NEW_DP  # /scale_elastic_ep
+#   ./scripts/phase2_container.sh state [TAG]   # GPU + docker inspect snapshot
+#   ./scripts/phase2_container.sh cycle         # full 2->4->2 cycle
+#   ./scripts/phase2_container.sh stop
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
 
-# ─── Config ───────────────────────────────────────────────────────────
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=common.sh
+source "$SCRIPT_DIR/common.sh"
+
 CONTAINER_NAME="xtrans-exp-a3-phase2"
-IMAGE="xtrans-vllm-ep:v0.19.0"  # vllm/vllm-openai:v0.19.0 + ray[default] (see Dockerfile.phase2)
-# Mount the whole HF cache dir because snapshot files are symlinks to ../../blobs/
-MODEL_HOST="/data/models--Qwen--Qwen3-30B-A3B"
-MODEL_IN_CTN="/models/qwen3-30b-a3b/snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
-MODEL_MOUNT_IN_CTN="/models/qwen3-30b-a3b"
-PORT=8000
-INITIAL_DP=2
-MAX_MODEL_LEN=2048
-MAX_NUM_SEQS=16
-GPU_UTIL=0.90
-RESULTS_DIR="results/phase2"
-mkdir -p "$RESULTS_DIR"
+MODEL_MOUNT_IN_CTN="/models/qwen3-30b-a3b"  # parent dir for HF blob+snapshot layout
+RESULTS_DIR="$PROJECT_ROOT/exp_a3_vllm_ep/results/phase2"
 
-# ─── Subcommands ──────────────────────────────────────────────────────
-
+# ─── Server lifecycle ─────────────────────────────────────────────────
 start() {
-    echo "=== Phase 2: Launching container ==="
-    # Verify image is available
-    if ! docker image inspect "$IMAGE" > /dev/null 2>&1; then
-        echo "ERROR: image $IMAGE not found. Pull it first."
-        exit 1
+    mkdir -p "$RESULTS_DIR"
+    docker_ensure_image "$VLLM_IMAGE"
+
+    if ! all_gpus_free; then
+        log "WARNING: some GPUs already have memory in use; continuing anyway"
+        gpu_snapshot >&2
     fi
 
-    # Verify model exists
-    if [ ! -d "$MODEL_HOST" ]; then
-        echo "ERROR: model dir $MODEL_HOST not found."
-        exit 1
-    fi
-
-    # Clean up any previous container
     docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
-    # Record the host's view before we start
-    host_view "before-container" > /dev/null
-
-    # Launch container with all 4 GPUs, model mounted, port exposed
+    log "Launching container $CONTAINER_NAME on GPUs 0-3"
     docker run -d \
         --name "$CONTAINER_NAME" \
         --gpus '"device=0,1,2,3"' \
         --ipc=host \
         --shm-size=16g \
         -v "$MODEL_HOST:$MODEL_MOUNT_IN_CTN:ro" \
-        -p "$PORT:8000" \
+        -p "${VLLM_PORT}:8000" \
         -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
         -e VLLM_LOGGING_LEVEL=INFO \
         --entrypoint /bin/bash \
-        "$IMAGE" \
-        -c "vllm serve $MODEL_IN_CTN \
-            --host 0.0.0.0 \
-            --port 8000 \
-            --tensor-parallel-size 1 \
-            --data-parallel-size $INITIAL_DP \
-            --data-parallel-backend ray \
-            --enable-expert-parallel \
-            --enable-elastic-ep \
-            --enable-eplb \
-            --all2all-backend allgather_reducescatter \
-            --max-model-len $MAX_MODEL_LEN \
-            --max-num-seqs $MAX_NUM_SEQS \
-            --gpu-memory-utilization $GPU_UTIL \
-            --enforce-eager \
-            --trust-remote-code"
+        "$VLLM_IMAGE" \
+        -c "vllm serve $MODEL_PATH_IN_CTN \
+             --host 0.0.0.0 --port 8000 \
+             --tensor-parallel-size 1 \
+             --data-parallel-size 2 \
+             --data-parallel-backend ray \
+             --enable-expert-parallel \
+             --enable-elastic-ep \
+             --enable-eplb \
+             --all2all-backend allgather_reducescatter \
+             --max-model-len 2048 \
+             --max-num-seqs 16 \
+             --gpu-memory-utilization 0.90 \
+             --enforce-eager \
+             --trust-remote-code" \
+        > /dev/null
 
-    echo "Container $CONTAINER_NAME started. Waiting for vLLM to be ready..."
-    local start_ts=$(date +%s)
-    for i in $(seq 1 60); do
-        sleep 10
-        if curl -s --max-time 2 "http://localhost:$PORT/health" > /dev/null 2>&1; then
-            local end_ts=$(date +%s)
-            echo "READY after $((end_ts - start_ts))s"
-            host_view "after-ready" > "$RESULTS_DIR/host_view_after_ready.txt"
-            return 0
-        fi
-        echo "  loading... ($((i*10))s)"
-    done
-    echo "TIMEOUT waiting for vLLM ready; container logs:"
-    docker logs --tail 40 "$CONTAINER_NAME"
-    exit 1
-}
-
-bench() {
-    local label="${1:-unknown}"
-    local n_req="${2:-16}"
-    local workers="${3:-8}"
-    echo "=== Bench: $label (n=$n_req) ==="
-
-    python3 - <<PYEOF 2>&1 | tee "$RESULTS_DIR/bench_${label}.log"
-import requests, time, concurrent.futures, json
-
-URL = 'http://localhost:$PORT/v1/completions'
-MODEL = '$MODEL_IN_CTN'
-
-def send(i):
-    start = time.time()
-    try:
-        r = requests.post(URL, json={
-            'model': MODEL,
-            'prompt': f'Request {i}: Please write a paragraph about parallel computing. ',
-            'max_tokens': 128,
-            'temperature': 0.7,
-        }, timeout=180)
-        elapsed = time.time() - start
-        if r.status_code != 200:
-            return {'id': i, 'status': r.status_code, 'elapsed': round(elapsed, 3), 'error': r.text[:100]}
-        tok = r.json().get('usage', {}).get('completion_tokens', 0)
-        return {'id': i, 'status': 200, 'elapsed': round(elapsed, 3), 'tokens': tok}
-    except Exception as e:
-        return {'id': i, 'status': -1, 'elapsed': round(time.time()-start, 3), 'error': str(e)[:100]}
-
-# Warmup
-with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
-    list(ex.map(send, range(1000, 1002)))
-
-start = time.time()
-with concurrent.futures.ThreadPoolExecutor(max_workers=$workers) as ex:
-    results = list(ex.map(send, range($n_req)))
-total = time.time() - start
-ok = [r for r in results if r['status'] == 200]
-tok = sum(r['tokens'] for r in ok)
-out = {
-    'label': '$label',
-    'n_requests': $n_req, 'ok': len(ok), 'errors': $n_req - len(ok),
-    'total_time_s': round(total, 3),
-    'total_tokens': tok,
-    'throughput_tok_s': round(tok/total, 1) if total > 0 else 0,
-    'avg_latency_s': round(sum(r['elapsed'] for r in ok)/max(len(ok),1), 3),
-}
-print(f"Throughput: {out['throughput_tok_s']} tok/s, lat: {out['avg_latency_s']}s, OK: {len(ok)}/$n_req")
-with open('$RESULTS_DIR/bench_${label}.json', 'w') as f:
-    json.dump(out, f, indent=2)
-PYEOF
-}
-
-scale() {
-    local target="$1"
-    local label="${2:-scale-to-$target}"
-    echo "=== Scale to DP=$target ($label) ==="
-    python3 - <<PYEOF 2>&1 | tee "$RESULTS_DIR/${label}.log"
-import requests, time, json, subprocess
-
-def gpus():
-    out = subprocess.run(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader'],
-                         capture_output=True, text=True).stdout.strip().split('\n')
-    return [g.strip() for g in out]
-
-pre = gpus()
-print(f"Pre-scale GPU memory (host): {pre}")
-start = time.time()
-r = requests.post('http://localhost:$PORT/scale_elastic_ep',
-    json={'new_data_parallel_size': $target, 'drain_timeout': 60}, timeout=900)
-elapsed = time.time() - start
-mid = gpus()
-print(f"HTTP {r.status_code} in {elapsed:.2f}s")
-print(f"Post-scale GPU memory (host, immediate): {mid}")
-time.sleep(12)
-late = gpus()
-print(f"Post-scale GPU memory (host, +12s): {late}")
-if r.status_code != 200:
-    print(f"Body: {r.text[:300]}")
-json.dump({
-    'operation': '$label', 'target_dp': $target, 'http_code': r.status_code,
-    'elapsed_s': round(elapsed, 2),
-    'gpu_mem_pre': pre, 'gpu_mem_immediate': mid, 'gpu_mem_plus12s': late,
-}, open('$RESULTS_DIR/${label}.json', 'w'), indent=2)
-PYEOF
-}
-
-host_view() {
-    local tag="${1:-snapshot}"
-    echo "=== Host view ($tag) at $(date) ==="
-    echo ""
-    echo "## docker ps ##"
-    docker ps --filter "name=$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-    echo ""
-    echo "## docker inspect (HostConfig.DeviceRequests) ##"
-    docker inspect "$CONTAINER_NAME" --format '{{json .HostConfig.DeviceRequests}}' 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "Container not running."
-    echo ""
-    echo "## nvidia-smi (host) ##"
-    nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
-    echo ""
-    echo "## Processes on GPUs (host view) ##"
-    nvidia-smi --query-compute-apps=pid,process_name,used_memory,gpu_uuid --format=csv,noheader 2>/dev/null | head -20
-    echo ""
+    # Container-side logs persist; we also dump to results/ at stop.
+    wait_for_ready "http://localhost:${VLLM_PORT}/health" 600
 }
 
 stop() {
-    echo "=== Stopping container ==="
-    docker logs "$CONTAINER_NAME" > "$RESULTS_DIR/container.log" 2>&1 || true
-    docker stop "$CONTAINER_NAME" 2>/dev/null || true
-    docker rm "$CONTAINER_NAME" 2>/dev/null || true
-    echo "Stopped."
+    if docker ps -a --filter "name=$CONTAINER_NAME" --format '{{.Names}}' \
+            | grep -q "$CONTAINER_NAME"; then
+        log "Saving container logs to $RESULTS_DIR/container.log"
+        docker logs "$CONTAINER_NAME" > "$RESULTS_DIR/container.log" 2>&1 || true
+    fi
+    log "Removing container $CONTAINER_NAME"
+    docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+    sleep 3
+    gpu_snapshot >&2
 }
 
-logs() {
-    docker logs --tail "${1:-50}" "$CONTAINER_NAME"
+# ─── Subcommand: bench ────────────────────────────────────────────────
+bench() {
+    local label=${1:-unknown} num_prompts=${2:-32} concurrency=${3:-16}
+    vllm_bench "$label" "localhost:$VLLM_PORT" "$num_prompts" "$concurrency" "$RESULTS_DIR"
 }
 
-case "${1:-}" in
-    start) start ;;
-    bench) bench "${2:-unknown}" "${3:-16}" "${4:-8}" ;;
-    scale) scale "${2:?target DP}" "${3:-scale-to-$2}" ;;
-    scale-up) scale 4 "scale_up_2_to_4" ;;
-    scale-down) scale 2 "scale_down_4_to_2" ;;
-    host-view) host_view "${2:-snapshot}" ;;
-    logs) logs "${2:-50}" ;;
-    stop) stop ;;
+# ─── Subcommand: scale ────────────────────────────────────────────────
+scale() {
+    local new_dp=${1:?target DP size required}
+    trigger_scale "http://localhost:$VLLM_PORT" "$new_dp" \
+        | tee "$RESULTS_DIR/scale_to_dp${new_dp}_$(date +%H%M%S).log"
+}
+
+# ─── Subcommand: state ────────────────────────────────────────────────
+# Snapshots both what vLLM sees and what Docker still claims -- this is
+# the Phase 2 signature finding (DeviceIDs don't change).
+state() {
+    local tag=${1:-snapshot}
+    {
+        echo "=== Phase 2 state ($tag) at $(date) ==="
+        echo ""
+        echo "## Container ##"
+        docker ps --filter "name=$CONTAINER_NAME" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+        echo ""
+        echo "## Docker DeviceIDs (what Docker still claims) ##"
+        container_deviceids "$CONTAINER_NAME"
+        echo ""
+        echo "## Host nvidia-smi (what's actually in use) ##"
+        gpu_snapshot
+        echo ""
+        echo "## GPU processes on host ##"
+        gpu_processes
+        echo ""
+        echo "## Scaling flag ##"
+        curl -sS -X POST "http://localhost:$VLLM_PORT/is_scaling_elastic_ep" 2>&1 || echo "(unreachable)"
+    } | tee "$RESULTS_DIR/state_${tag}.txt"
+}
+
+# ─── Subcommand: cycle ────────────────────────────────────────────────
+cycle() {
+    state "pre_cycle"
+    bench dp2_initial 16 8
+    scale 4
+    sleep 3
+    state "post_scale_up"
+    bench dp4_post_up 32 16
+    scale 2
+    sleep 3
+    state "post_scale_down"
+    bench dp2_post_down 16 8
+    state "post_cycle"
+    log "Cycle complete. Results in $RESULTS_DIR/"
+}
+
+# ─── Dispatch ─────────────────────────────────────────────────────────
+cmd=${1:-}; shift || true
+case "$cmd" in
+    start)  start ;;
+    stop)   stop ;;
+    bench)  bench "$@" ;;
+    scale)  scale "$@" ;;
+    state)  state "$@" ;;
+    cycle)  cycle ;;
     *)
-        echo "Usage: $0 {start|bench LABEL [N] [W]|scale TARGET [LABEL]|scale-up|scale-down|host-view [TAG]|logs [N]|stop}"
+        cat <<'EOF' >&2
+usage: phase2_container.sh {start|stop|bench LABEL [N] [C]|scale TARGET_DP|state [TAG]|cycle}
+
+subcommands:
+    start                   launch container + start vllm serve inside
+    stop                    save container log, remove container
+    bench LABEL [N] [C]     run vllm bench from host
+    scale TARGET_DP         POST /scale_elastic_ep
+    state [TAG]             docker inspect DeviceIDs + host nvidia-smi snapshot
+                            -- the "orchestrator trap" observation
+    cycle                   full DP=2 → 4 → 2 reference cycle with benchmarks
+
+prerequisites:
+    * image `xtrans-vllm-ep:v0.19.0` built (see Dockerfile.phase2)
+    * Qwen3-30B-A3B downloaded to /data/models--Qwen--Qwen3-30B-A3B/
+    * all 4 GPUs free on the host
+EOF
         exit 1
         ;;
 esac

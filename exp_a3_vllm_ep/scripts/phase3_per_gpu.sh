@@ -1,135 +1,144 @@
 #!/usr/bin/env bash
-# Phase 3: One EP worker per container.
+# Exp A3 Phase 3: one vLLM Elastic EP rank per container.
 #
-# Goal: 4 Docker containers, each --gpus device=N (N=0..3), joined as
-# a single Ray cluster, serving one vLLM Elastic EP cluster at DP=4.
-# Scaling = container lifecycle instead of --scale_elastic_ep.
+# Four containers (ep-rank-0 ... ep-rank-3) on a Docker bridge network
+# ${NETWORK}. Each container owns exactly one GPU via --gpus device=N.
+# ep-rank-0 runs a Ray head + vllm serve; ep-rank-1..3 run Ray workers.
+# `vllm bench serve` runs from the host against ep-rank-0's exposed port.
 #
-# EXPECTED OUTCOME: friction. Problems we expect to hit, any of which
-# counts as a research finding:
-#   - Ray cluster formation failures (network, port, GPU discovery)
-#   - vLLM spawning actors across nodes (model-path visibility, rank
-#     assignment when every container sees GPU "0")
-#   - NCCL transport selection (hostHash collision or miss, shm gate,
-#     IPC socket in namespaced abstract UDS)
-#   - Performance collapse to TCP/SHM-over-network
+# Key Phase 3 observations:
+#     each container's DeviceIDs is ['N'] (not ['0','1','2','3']) -- the
+#     Phase 2 trap is gone, but NCCL falls back to NET/Socket/0 because all
+#     three same-node gates (hostname, /dev/shm, abstract UDS) fail.
 #
 # Usage:
-#   ./scripts/phase3_per_gpu.sh network      # create bridge network
-#   ./scripts/phase3_per_gpu.sh ray-head     # container 0: ray head
-#   ./scripts/phase3_per_gpu.sh ray-workers  # containers 1-3: ray workers
-#   ./scripts/phase3_per_gpu.sh ray-status   # inspect ray cluster
-#   ./scripts/phase3_per_gpu.sh serve        # exec vllm serve in head
-#   ./scripts/phase3_per_gpu.sh logs N       # container N's logs
-#   ./scripts/phase3_per_gpu.sh exec N CMD   # exec cmd in container N
-#   ./scripts/phase3_per_gpu.sh host-view    # snapshot host state
-#   ./scripts/phase3_per_gpu.sh teardown     # stop everything
+#   ./scripts/phase3_per_gpu.sh up            # full launch: network + all 4
+#                                             # containers + vllm serve
+#   ./scripts/phase3_per_gpu.sh bench LABEL   # vllm bench from host
+#   ./scripts/phase3_per_gpu.sh nccl-grep     # extract NCCL transport
+#                                             # selection from vllm log
+#   ./scripts/phase3_per_gpu.sh state [TAG]   # per-container DeviceIDs +
+#                                             # host nvidia-smi
+#   ./scripts/phase3_per_gpu.sh down          # teardown
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
 
-IMAGE="xtrans-vllm-ep:v0.19.0"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=common.sh
+source "$SCRIPT_DIR/common.sh"
+
 NETWORK="xtrans-phase3"
-MODEL_HOST="/data/models--Qwen--Qwen3-30B-A3B"
-MODEL_IN_CTN_MOUNT="/models/qwen3-30b-a3b"
-MODEL_PATH_IN_CTN="/models/qwen3-30b-a3b/snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
-RAY_PORT=26379
-VLLM_PORT=8000
-RESULTS_DIR="results/phase3"
-mkdir -p "$RESULTS_DIR"
+MODEL_MOUNT_IN_CTN="/models/qwen3-30b-a3b"
+RESULTS_DIR="$PROJECT_ROOT/exp_a3_vllm_ep/results/phase3"
+SERVE_LOG_IN_CTN="/tmp/vllm-serve.log"
 
+# ─── Internal helpers ─────────────────────────────────────────────────
 ensure_network() {
     if ! docker network inspect "$NETWORK" > /dev/null 2>&1; then
-        echo "Creating docker network $NETWORK"
-        docker network create "$NETWORK"
-    else
-        echo "Network $NETWORK exists"
+        log "Creating docker network $NETWORK"
+        docker network create "$NETWORK" > /dev/null
     fi
 }
 
-ray_head() {
-    ensure_network
-    docker rm -f "ep-rank-0" 2>/dev/null || true
+head_ip() {
+    # IP of ep-rank-0 on the $NETWORK bridge
+    docker inspect ep-rank-0 \
+        --format "{{(index .NetworkSettings.Networks \"$NETWORK\").IPAddress}}"
+}
 
-    echo "Starting ep-rank-0 (Ray head + vLLM API server) on GPU 0"
+launch_rank_container() {
+    local rank=$1
+    local name="ep-rank-$rank"
+    local start_cmd=$2       # ray start command to run (head or worker variant)
+    docker rm -f "$name" 2>/dev/null || true
+
+    local extra_ports=()
+    if [ "$rank" = "0" ]; then
+        extra_ports=(-p "${VLLM_PORT}:${VLLM_PORT}" -p "${RAY_PORT}:${RAY_PORT}")
+    fi
+
+    log "Starting $name on GPU $rank"
     docker run -d \
-        --name "ep-rank-0" \
-        --hostname "ep-rank-0" \
+        --name "$name" \
+        --hostname "$name" \
         --network "$NETWORK" \
-        --gpus '"device=0"' \
+        --gpus "\"device=$rank\"" \
         --ipc=host \
         --shm-size=16g \
-        -p "${VLLM_PORT}:${VLLM_PORT}" \
-        -p "${RAY_PORT}:${RAY_PORT}" \
-        -v "$MODEL_HOST:$MODEL_IN_CTN_MOUNT:ro" \
+        -v "$MODEL_HOST:$MODEL_MOUNT_IN_CTN:ro" \
+        "${extra_ports[@]}" \
         -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
         -e VLLM_LOGGING_LEVEL=INFO \
         -e NCCL_DEBUG=INFO \
         --entrypoint /bin/bash \
-        "$IMAGE" \
-        -c "ray start --head --port ${RAY_PORT} --num-gpus 1 \
-                --node-ip-address ep-rank-0 \
-                --min-worker-port 30000 --max-worker-port 39999 \
-                --disable-usage-stats && \
-            # Keep container alive so we can exec vllm serve into it
-            tail -f /dev/null"
+        "$VLLM_IMAGE" \
+        -c "$start_cmd && tail -f /dev/null" \
+        > /dev/null
+}
 
-    echo "Waiting for ray head to be ready..."
+# ─── Ray cluster + vLLM launch ────────────────────────────────────────
+up() {
+    mkdir -p "$RESULTS_DIR"
+    docker_ensure_image "$VLLM_IMAGE"
+
+    if ! all_gpus_free; then
+        log "WARNING: some GPUs already have memory in use; continuing anyway"
+        gpu_snapshot >&2
+    fi
+
+    ensure_network
+
+    # Head
+    launch_rank_container 0 \
+        "ray start --head --port ${RAY_PORT} --num-gpus 1 \
+             --node-ip-address ep-rank-0 \
+             --min-worker-port 30000 --max-worker-port 39999 \
+             --disable-usage-stats"
+
+    log "Waiting for ray head to be ready..."
     for i in $(seq 1 20); do
         sleep 2
         if docker exec ep-rank-0 ray status > /dev/null 2>&1; then
-            echo "Ray head ready (after $((i*2))s)"
-            return 0
+            log "Ray head ready after $((i*2))s"
+            break
         fi
     done
-    echo "Ray head not ready after 40s"
-    docker logs --tail 30 ep-rank-0
-    return 1
-}
 
-ray_workers() {
-    local head_ip
-    head_ip=$(docker inspect ep-rank-0 --format "{{(index .NetworkSettings.Networks \"$NETWORK\").IPAddress}}")
-    echo "Ray head IP on $NETWORK: $head_ip"
-
+    # Workers
+    local hip
+    hip=$(head_ip)
+    log "Ray head bridge IP: $hip"
     for i in 1 2 3; do
-        docker rm -f "ep-rank-$i" 2>/dev/null || true
-        echo "Starting ep-rank-$i (Ray worker) on GPU $i"
-        docker run -d \
-            --name "ep-rank-$i" \
-            --hostname "ep-rank-$i" \
-            --network "$NETWORK" \
-            --gpus "\"device=$i\"" \
-            --ipc=host \
-            --shm-size=16g \
-            -v "$MODEL_HOST:$MODEL_IN_CTN_MOUNT:ro" \
-            -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
-            -e NCCL_DEBUG=INFO \
-            --entrypoint /bin/bash \
-            "$IMAGE" \
-            -c "ray start --address ${head_ip}:${RAY_PORT} --num-gpus 1 \
-                    --node-ip-address ep-rank-$i \
-                    --min-worker-port 30000 --max-worker-port 39999 \
-                    --disable-usage-stats && \
-                tail -f /dev/null"
+        launch_rank_container "$i" \
+            "ray start --address ${hip}:${RAY_PORT} --num-gpus 1 \
+                 --node-ip-address ep-rank-$i \
+                 --min-worker-port 30000 --max-worker-port 39999 \
+                 --disable-usage-stats"
     done
 
-    echo "Waiting for all workers to join..."
-    sleep 5
-    docker exec ep-rank-0 ray status 2>&1 | head -30
-}
+    log "Waiting for all Ray workers to register..."
+    for i in $(seq 1 15); do
+        sleep 2
+        local ngpus
+        ngpus=$(docker exec ep-rank-0 ray status 2>/dev/null \
+                | grep -E '^\s*[0-9.]+/4.0 GPU$' | awk '{print $1}' | cut -d/ -f2 || true)
+        if [ "${ngpus:-0}" = "4.0" ]; then
+            log "4-GPU Ray cluster formed after $((i*2))s"
+            break
+        fi
+    done
+    docker exec ep-rank-0 ray status > "$RESULTS_DIR/ray_status.txt" 2>&1 || true
 
-serve() {
-    # Launch vllm serve inside the head container
-    echo "Starting vllm serve inside ep-rank-0 at DP=4..."
+    # vllm serve inside ep-rank-0 -- background via bash -c so the exec
+    # returns immediately; log file lives in the container at $SERVE_LOG_IN_CTN.
+    log "Launching vllm serve in ep-rank-0 at DP=2"
     docker exec -d ep-rank-0 /bin/bash -c "
         export RAY_ADDRESS=ep-rank-0:${RAY_PORT}
         export VLLM_LOGGING_LEVEL=INFO
         vllm serve ${MODEL_PATH_IN_CTN} \
-            --host 0.0.0.0 \
-            --port ${VLLM_PORT} \
+            --host 0.0.0.0 --port ${VLLM_PORT} \
             --tensor-parallel-size 1 \
-            --data-parallel-size 4 \
+            --data-parallel-size 2 \
             --data-parallel-size-local 1 \
             --data-parallel-backend ray \
             --data-parallel-address ep-rank-0 \
@@ -142,85 +151,121 @@ serve() {
             --gpu-memory-utilization 0.90 \
             --enforce-eager \
             --trust-remote-code \
-            > /tmp/vllm-serve.log 2>&1
+            > $SERVE_LOG_IN_CTN 2>&1
     "
-    echo "vllm serve launched (backgrounded in container). Monitor via:"
-    echo "    docker exec ep-rank-0 tail -f /tmp/vllm-serve.log"
+
+    wait_for_ready "http://localhost:${VLLM_PORT}/health" 600
 }
 
-wait_ready() {
-    local timeout=${1:-600}
-    local start=$(date +%s)
-    echo "Polling http://localhost:${VLLM_PORT}/health (timeout ${timeout}s)..."
-    while true; do
-        if curl -s --max-time 2 "http://localhost:${VLLM_PORT}/health" > /dev/null 2>&1; then
-            local end=$(date +%s)
-            echo "READY after $((end - start))s"
-            return 0
-        fi
-        local now=$(date +%s)
-        if (( now - start >= timeout )); then
-            echo "TIMEOUT after ${timeout}s"
-            return 1
-        fi
-        sleep 5
-    done
-}
-
-ray_status() {
-    docker exec ep-rank-0 ray status 2>&1
-}
-
-host_view() {
-    local tag="${1:-snapshot}"
-    {
-        echo "=== Host view ($tag) at $(date) ==="
-        echo ""
-        echo "## Containers ##"
-        docker ps --filter "name=ep-rank-" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-        echo ""
-        echo "## Docker network ##"
-        docker network inspect "$NETWORK" --format '{{range .Containers}}{{.Name}} {{.IPv4Address}}
-{{end}}' 2>/dev/null
-        echo ""
-        echo "## nvidia-smi (host) ##"
-        nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
-        echo ""
-        echo "## GPU processes ##"
-        nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null | head -20
-    }
-}
-
-teardown() {
-    echo "=== Saving container logs ==="
+down() {
+    log "Saving per-container logs to $RESULTS_DIR/"
     for i in 0 1 2 3; do
-        if docker ps -a --filter "name=ep-rank-$i" --format "{{.Names}}" | grep -q "ep-rank-$i"; then
+        if docker ps -a --filter "name=ep-rank-$i" --format '{{.Names}}' \
+                | grep -q "ep-rank-$i"; then
             docker logs "ep-rank-$i" > "$RESULTS_DIR/ep-rank-$i.log" 2>&1 || true
-            if [ "$i" = "0" ] && docker exec ep-rank-0 test -f /tmp/vllm-serve.log 2>/dev/null; then
-                docker exec ep-rank-0 cat /tmp/vllm-serve.log > "$RESULTS_DIR/vllm-serve.log" 2>/dev/null || true
-            fi
         fi
     done
-    echo "=== Stopping containers ==="
+    if docker exec ep-rank-0 test -f "$SERVE_LOG_IN_CTN" 2>/dev/null; then
+        docker exec ep-rank-0 cat "$SERVE_LOG_IN_CTN" > "$RESULTS_DIR/vllm-serve.log" 2>/dev/null || true
+    fi
+
+    log "Stopping containers"
     for i in 0 1 2 3; do
         docker rm -f "ep-rank-$i" 2>/dev/null || true
     done
-    echo "(Keeping docker network $NETWORK — remove with: docker network rm $NETWORK)"
+    log "Network $NETWORK left in place; remove with: docker network rm $NETWORK"
+    sleep 3
+    gpu_snapshot >&2
 }
 
-case "${1:-}" in
-    network)    ensure_network ;;
-    ray-head)   ray_head ;;
-    ray-workers) ray_workers ;;
-    ray-status) ray_status ;;
-    serve)      serve ;;
-    wait-ready) wait_ready "${2:-600}" ;;
-    logs)       docker logs --tail "${3:-80}" "ep-rank-${2:-0}" ;;
-    exec)       shift; i="$1"; shift; docker exec "ep-rank-$i" "$@" ;;
-    host-view)  host_view "${2:-snapshot}" ;;
-    teardown)   teardown ;;
+# ─── Subcommand: bench ────────────────────────────────────────────────
+bench() {
+    local label=${1:-unknown} num_prompts=${2:-32} concurrency=${3:-16}
+    vllm_bench "$label" "localhost:$VLLM_PORT" "$num_prompts" "$concurrency" "$RESULTS_DIR"
+}
+
+# ─── Subcommand: scale ────────────────────────────────────────────────
+# Note: known to hit the EPLB num_redundant>=0 assertion when scaling down
+# from a cold DP=N start. Expect unrecoverable failure in that path.
+scale() {
+    local new_dp=${1:?target DP size required}
+    trigger_scale "http://localhost:$VLLM_PORT" "$new_dp" \
+        | tee "$RESULTS_DIR/scale_to_dp${new_dp}_$(date +%H%M%S).log"
+}
+
+# ─── Subcommand: state ────────────────────────────────────────────────
+state() {
+    local tag=${1:-snapshot}
+    {
+        echo "=== Phase 3 state ($tag) at $(date) ==="
+        echo ""
+        echo "## Containers ##"
+        docker ps --filter "name=ep-rank-" --format 'table {{.Names}}\t{{.Status}}'
+        echo ""
+        echo "## Per-container DeviceIDs (each owns one GPU!) ##"
+        for i in 0 1 2 3; do
+            echo "  ep-rank-$i: $(container_deviceids ep-rank-$i)"
+        done
+        echo ""
+        echo "## Bridge network IPs ##"
+        docker network inspect "$NETWORK" \
+            --format '{{range .Containers}}{{.Name}} {{.IPv4Address}}
+{{end}}' 2>/dev/null
+        echo ""
+        echo "## Host nvidia-smi ##"
+        gpu_snapshot
+        echo ""
+        echo "## Scaling flag ##"
+        curl -sS -X POST "http://localhost:$VLLM_PORT/is_scaling_elastic_ep" 2>&1 || echo "(unreachable)"
+    } | tee "$RESULTS_DIR/state_${tag}.txt"
+}
+
+# ─── Subcommand: nccl-grep ────────────────────────────────────────────
+# Pull the NCCL transport-selection lines out of the vllm serve log. The
+# Phase 3 headline finding is "NET/Socket/0" on every channel.
+nccl_grep() {
+    if ! docker exec ep-rank-0 test -f "$SERVE_LOG_IN_CTN" 2>/dev/null; then
+        log "vllm-serve log not found in ep-rank-0"
+        return 1
+    fi
+    docker exec ep-rank-0 grep -E \
+        'NCCL INFO (Assigned NET plugin|Channel [0-9]+/[0-9]+ : |Check P2P Type|Connected all rings)' \
+        "$SERVE_LOG_IN_CTN" \
+        | tee "$RESULTS_DIR/nccl_transport.log" \
+        | head -40
+    echo ""
+    echo "Full capture saved to $RESULTS_DIR/nccl_transport.log"
+}
+
+# ─── Dispatch ─────────────────────────────────────────────────────────
+cmd=${1:-}; shift || true
+case "$cmd" in
+    up)         up ;;
+    down)       down ;;
+    bench)      bench "$@" ;;
+    scale)      scale "$@" ;;
+    state)      state "$@" ;;
+    nccl-grep)  nccl_grep ;;
     *)
-        echo "Usage: $0 {network|ray-head|ray-workers|ray-status|serve|wait-ready [T]|logs N [LINES]|exec N CMD|host-view|teardown}"
+        cat <<'EOF' >&2
+usage: phase3_per_gpu.sh {up|down|bench LABEL [N] [C]|scale TARGET_DP|state [TAG]|nccl-grep}
+
+subcommands:
+    up                      bridge network + 4 per-GPU containers +
+                            Ray cluster + vllm serve at DP=2
+    down                    save per-container logs, stop containers
+    bench LABEL [N] [C]     vllm bench from host
+    scale TARGET_DP         POST /scale_elastic_ep (known to hit EPLB
+                            num_redundant bug; use at your own risk)
+    state [TAG]             per-container DeviceIDs + host nvidia-smi
+    nccl-grep               extract NCCL transport selection from
+                            vllm-serve log (the NET/Socket/0 headline)
+
+prerequisites:
+    * image `xtrans-vllm-ep:v0.19.0` built
+    * Qwen3-30B-A3B at /data/models--Qwen--Qwen3-30B-A3B/
+    * all 4 GPUs free on the host
+EOF
         exit 1
         ;;
 esac
