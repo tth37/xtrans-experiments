@@ -53,11 +53,28 @@ ensure_venv() {
 }
 
 # ─── Serving readiness ────────────────────────────────────────────────
-# Usage: wait_for_ready http://localhost:8000/health 300
+# Polls URL until HTTP 200 OR the liveness callback fails OR timeout.
+#
+# Usage: wait_for_ready URL [TIMEOUT] [LIVENESS_CHECK] [DIAG_ON_FAIL]
+#
+#   URL             health endpoint (GET, expects HTTP 200)
+#   TIMEOUT         seconds before giving up (default 600)
+#   LIVENESS_CHECK  optional function name. Called every poll. If it exits
+#                   non-zero, wait_for_ready aborts early -- the underlying
+#                   server process is already dead, waiting longer is useless.
+#                   Should be cheap (< 1s).
+#   DIAG_ON_FAIL    optional function name. Called once on failure (timeout
+#                   or dead liveness) to dump helpful diagnostics (logs,
+#                   container state, etc). Runs AFTER the failure is logged.
+#
+# Progress is printed every 30s so the operator sees that we're still
+# polling and haven't silently hung.
 wait_for_ready() {
     local url=$1
     local timeout=${2:-600}
-    local start now elapsed
+    local liveness_check=${3:-}
+    local diag_on_fail=${4:-}
+    local start now elapsed last_progress=0
     start=$(date +%s)
     log "Polling $url (timeout ${timeout}s)"
     while :; do
@@ -66,10 +83,23 @@ wait_for_ready() {
             log "READY after ${elapsed}s"
             return 0
         fi
+        # Liveness check -- is the backing server actually alive?
+        if [ -n "$liveness_check" ] && ! "$liveness_check"; then
+            now=$(date +%s); elapsed=$((now - start))
+            log "ABORT: server process dead after ${elapsed}s (liveness check failed)"
+            [ -n "$diag_on_fail" ] && "$diag_on_fail"
+            return 2
+        fi
         now=$(date +%s); elapsed=$((now - start))
         if (( elapsed >= timeout )); then
             log "TIMEOUT after ${timeout}s"
+            [ -n "$diag_on_fail" ] && "$diag_on_fail"
             return 1
+        fi
+        # Progress ping every 30s
+        if (( elapsed - last_progress >= 30 )); then
+            log "  ...still waiting (${elapsed}s elapsed)"
+            last_progress=$elapsed
         fi
         sleep 5
     done
@@ -197,4 +227,20 @@ all_gpus_free() {
         fi
     done <<< "$used_list"
     return 0
+}
+
+# Abort unless all 4 GPUs are free. Set ALLOW_BUSY_GPUS=1 to override.
+# Prints a clear message either way so the operator knows why we aborted.
+require_gpus_free() {
+    if all_gpus_free; then
+        return 0
+    fi
+    log "Some GPUs are busy:"
+    gpu_snapshot | sed 's/^/    /' >&2
+    if [ "${ALLOW_BUSY_GPUS:-0}" = "1" ]; then
+        log "ALLOW_BUSY_GPUS=1 set, continuing anyway"
+        return 0
+    fi
+    log "Aborting. Set ALLOW_BUSY_GPUS=1 to override (at your own risk)."
+    return 1
 }

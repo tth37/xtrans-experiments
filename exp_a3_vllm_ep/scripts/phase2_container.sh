@@ -29,15 +29,26 @@ CONTAINER_NAME="xtrans-exp-a3-phase2"
 MODEL_MOUNT_IN_CTN="/models/qwen3-30b-a3b"  # parent dir for HF blob+snapshot layout
 RESULTS_DIR="$PROJECT_ROOT/exp_a3_vllm_ep/results/phase2"
 
+# ─── Liveness & diagnostics ──────────────────────────────────────────
+phase2_liveness() {
+    # Container still running (not Exited)
+    [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" = "true" ]
+}
+
+phase2_diag() {
+    log "docker inspect State:"
+    docker inspect -f '    Status={{.State.Status}} ExitCode={{.State.ExitCode}} Error={{.State.Error}}' \
+        "$CONTAINER_NAME" 2>&1 >&2 || true
+    log "Last 40 lines of container log:"
+    docker logs --tail 40 "$CONTAINER_NAME" 2>&1 | sed 's/^/    /' >&2 || true
+}
+
 # ─── Server lifecycle ─────────────────────────────────────────────────
 start() {
     mkdir -p "$RESULTS_DIR"
     docker_ensure_image "$VLLM_IMAGE"
 
-    if ! all_gpus_free; then
-        log "WARNING: some GPUs already have memory in use; continuing anyway"
-        gpu_snapshot >&2
-    fi
+    require_gpus_free || return 1
 
     docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
@@ -70,7 +81,8 @@ start() {
         > /dev/null
 
     # Container-side logs persist; we also dump to results/ at stop.
-    wait_for_ready "http://localhost:${VLLM_PORT}/health" 600
+    wait_for_ready "http://localhost:${VLLM_PORT}/health" 600 \
+        phase2_liveness phase2_diag
 }
 
 stop() {

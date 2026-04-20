@@ -27,15 +27,24 @@ RESULTS_DIR="$PROJECT_ROOT/exp_a3_vllm_ep/results/phase1"
 SERVE_SESSION="a3-phase1-serve"
 SERVE_LOG="$RESULTS_DIR/serve.log"
 
+# ─── Liveness & diagnostics ──────────────────────────────────────────
+# Check the tmux session that holds `vllm serve` is still running. If it
+# died (OOM, bad flag, crash) there is no point continuing to poll /health.
+phase1_liveness() {
+    tmux has-session -t "$SERVE_SESSION" 2>/dev/null
+}
+
+phase1_diag() {
+    log "Last 30 lines of vllm serve log:"
+    tail -30 "$SERVE_LOG" 2>/dev/null | sed 's/^/    /' >&2
+}
+
 # ─── Server lifecycle ─────────────────────────────────────────────────
 start() {
     ensure_venv
     mkdir -p "$RESULTS_DIR"
 
-    if ! all_gpus_free; then
-        log "WARNING: some GPUs already have memory in use; continuing anyway"
-        gpu_snapshot >&2
-    fi
+    require_gpus_free || return 1
 
     # Dedicated Ray head. Explicit address+ports prevent collision with any
     # unrelated Ray instance the host might run (we've seen this bite us).
@@ -71,7 +80,8 @@ start() {
              --trust-remote-code \
              2>&1 | tee $SERVE_LOG"
 
-    wait_for_ready "http://localhost:${VLLM_PORT}/health" 300
+    wait_for_ready "http://localhost:${VLLM_PORT}/health" 300 \
+        phase1_liveness phase1_diag
 }
 
 stop() {

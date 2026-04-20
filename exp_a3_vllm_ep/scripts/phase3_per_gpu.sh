@@ -76,15 +76,36 @@ launch_rank_container() {
         > /dev/null
 }
 
+# ─── Liveness & diagnostics ──────────────────────────────────────────
+# Check that all 4 ep-rank-N containers are still Running AND that the
+# vllm-serve process inside ep-rank-0 is still alive (crashes inside the
+# backgrounded docker exec are silent otherwise).
+phase3_liveness() {
+    for i in 0 1 2 3; do
+        local state
+        state=$(docker inspect -f '{{.State.Running}}' "ep-rank-$i" 2>/dev/null)
+        [ "$state" = "true" ] || return 1
+    done
+    # vllm serve PID tracked by pgrep inside ep-rank-0
+    docker exec ep-rank-0 pgrep -f 'vllm serve' > /dev/null 2>&1 || return 1
+    return 0
+}
+
+phase3_diag() {
+    log "Container states:"
+    for i in 0 1 2 3; do
+        echo "    ep-rank-$i: $(docker inspect -f 'Status={{.State.Status}} ExitCode={{.State.ExitCode}}' ep-rank-$i 2>/dev/null || echo 'missing')" >&2
+    done
+    log "Last 40 lines of vllm-serve log (inside ep-rank-0):"
+    docker exec ep-rank-0 tail -40 "$SERVE_LOG_IN_CTN" 2>&1 | sed 's/^/    /' >&2 || true
+}
+
 # ─── Ray cluster + vLLM launch ────────────────────────────────────────
 up() {
     mkdir -p "$RESULTS_DIR"
     docker_ensure_image "$VLLM_IMAGE"
 
-    if ! all_gpus_free; then
-        log "WARNING: some GPUs already have memory in use; continuing anyway"
-        gpu_snapshot >&2
-    fi
+    require_gpus_free || return 1
 
     ensure_network
 
@@ -154,7 +175,11 @@ up() {
             > $SERVE_LOG_IN_CTN 2>&1
     "
 
-    wait_for_ready "http://localhost:${VLLM_PORT}/health" 600
+    # Give vllm serve ~15s to actually start before we check for its PID --
+    # otherwise pgrep fires before the process exists and we falsely abort.
+    sleep 15
+    wait_for_ready "http://localhost:${VLLM_PORT}/health" 600 \
+        phase3_liveness phase3_diag
 }
 
 down() {
