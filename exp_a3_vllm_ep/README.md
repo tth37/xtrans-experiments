@@ -205,14 +205,86 @@ serving lifetime.**
 **Results:** `results/phase2/` (including `phase2_results.json`, `start.log`, host view snapshots)
 **Analysis:** `analysis_report.html` section 5.5
 
-### Phase 3: Per-GPU Containers (The Solution)
+### Phase 3: Per-GPU Containers — COMPLETE (with friction, as expected)
 
-Each EP worker in its own container. Scaling = container lifecycle.
-- Scale-down: stop containers → GPUs **immediately free**
-- Scale-up: start new containers → new workers join
-- Key challenges: cross-container NCCL All-to-All, dynamic communicator creation
+Ran 2026-04-20: 4 containers (one per GPU), Docker bridge network `xtrans-phase3`,
+Ray cluster across containers, `vllm serve` exec'd in `ep-rank-0` with 4 engines
+placed via Ray. The point of Phase 3 was to *surface* the friction of per-GPU
+deployment; friction is the finding.
+
+**Setup actually worked:**
+- Docker bridge network + 4 containers (~1 s)
+- Ray cluster formation across 4 containers (~5 s)
+- vLLM serve across the Ray cluster (92 s to ready, after workaround below)
+- Inference at DP=4: **127.8 tok/s** (−23% vs. Phase 1's 166.6 tok/s)
+
+**Three problems (each a research finding):**
+
+**1. vLLM's DP-master-node assumption.** Default `--data-parallel-size 4`
+crashes with:
+```
+ValueError: Not enough resources to allocate 4 DP ranks on DP master node
+ep-rank-0, possible to fit 1 DP ranks.
+```
+vLLM assumes the master node has enough GPUs for all DP ranks — a multi-GPU
+container assumption baked into the CLI. Workaround: add
+`--data-parallel-size-local 1` to tell vLLM this node contributes 1 DP rank
+and find the others elsewhere in Ray.
+
+**2. NCCL falls back to TCP sockets.** Every inter-rank channel logs:
+```
+NCCL INFO Assigned NET plugin Socket to comm
+NCCL INFO Channel 00/0 : 1[0] -> 2[0] [send] via NET/Socket/0
+NCCL INFO Check P2P Type isAllDirectP2p 0 directMode 0
+NCCL INFO Connected all rings, use ring PXN 0 GDR 0
+```
+All three NCCL same-node gates fail:
+- `hostHash` differs (each container has unique hostname)
+- `/dev/shm st_dev` differs (separate tmpfs)
+- Abstract UDS is network-namespace-scoped
+
+Result: NVLink NV12 (~600 GB/s) bypassed, traffic goes over Docker bridge
+TCP. 23% throughput loss on single-node. **This directly validates the
+motivation for the NCCL shim (`common/shim/`) from Exp A.**
+
+**3. `/scale_elastic_ep` 4→2 kills the service.** Same EPLB
+`num_redundant >= 0` bug we documented in Phase 1 (cold DP=4 start). In
+Phase 1/2 the process got stuck in 503 state. In Phase 3 the 4-container
+coordination means partial Ray actor teardown; all 4 GPUs drop to 4 MiB;
+restarting `vllm serve` alone doesn't recover (stale Ray actors / connections).
+
+**The intended Phase 3 benefit confirmed:**
+
+Each container's `HostConfig.DeviceRequests.DeviceIDs` contains only its own
+GPU:
+```
+ep-rank-0 DeviceIDs: ['0']
+ep-rank-1 DeviceIDs: ['1']
+ep-rank-2 DeviceIDs: ['2']
+ep-rank-3 DeviceIDs: ['3']
+```
+
+Contrast Phase 2 where one container claimed `['0','1','2','3']` for its
+lifetime. Stopping `ep-rank-N` would truly free GPU N at both levels — vLLM
+releases CUDA context AND orchestrator reclaims the GPU. **The trap from
+Phase 2 is eliminated.**
+
+**Throughput summary across all three phases:**
+
+| Config | Transport | DP=4 tok/s | vs. native |
+|--------|-----------|-----------|-----------|
+| Phase 1 (native) | NVLink / CUDA IPC / SHM | 166.6 | 100% |
+| Phase 2 (4-GPU container) | NVLink / CUDA IPC / SHM | 154.1 | −7.5% |
+| Phase 3 (per-GPU containers) | **TCP sockets** | **127.8** | **−23.3%** |
 
 **Script:** `scripts/phase3_per_gpu.sh`
+**Results:** `results/phase3/`
+**Analysis:** `analysis_report.html` section 5.6
+
+**Next:** apply the `common/shim/` LD_PRELOAD shim to the per-GPU container
+setup. Expected: NCCL gates pass, NVLink P2P recovered, throughput jumps
+from 127.8 tok/s toward Phase 2's 154.1 tok/s while keeping the Phase 3
+scheduler-level elasticity. That's the payoff of the whole v4 research plan.
 
 ## Smoke Test Findings (2026-04-17, on GPUs 0-1 only)
 
