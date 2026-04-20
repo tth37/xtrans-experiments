@@ -160,14 +160,50 @@ from a cold DP=4 start hits an EPLB assertion with `num_redundant_experts=0`):
 **Results:** `results/phase1/` (including `phase1_results.json`, `round2.json`, `serve.log`)
 **Analysis:** `analysis_report.html` sections 5.0–5.4
 
-### Phase 2: Multi-GPU Container (The In-Place Barrier)
+### Phase 2: Multi-GPU Container (The In-Place Barrier) — COMPLETE
 
-Run vLLM inside a single container with all 4 GPUs.
-- Scale-down works internally, but GPUs are **trapped** (Docker can't release them)
-- Scale-up impossible (Docker can't hot-add GPUs)
-- This is the **fundamental limitation** for in-place systems (unlike Tenplex where it was just engineering)
+Ran 2026-04-20 on the same hardware with the same 2→4→2 cycle, but
+inside a single Docker container launched with `--gpus '"device=0,1,2,3"'`.
+
+**Image:** `xtrans-vllm-ep:v0.19.0` — built via `Dockerfile.phase2` which
+adds `ray[default]==2.55.0` to `vllm/vllm-openai:v0.19.0` (the upstream
+image does not include Ray, and elastic EP requires it).
+
+**Throughput (Phase 1 ↔ Phase 2):**
+
+| Config | Phase 1 (native) | Phase 2 (container) | Container overhead |
+|--------|------------------|---------------------|--------------------|
+| DP=2 initial | 87.4 tok/s | 66.7 tok/s | −23.7% |
+| DP=4 post-scale-up | 166.6 tok/s | 154.1 tok/s | −7.5% |
+| DP=2 post-scale-down | 91.6 tok/s | 69.2 tok/s | −24.5% |
+
+**Rescaling (Phase 1 ↔ Phase 2):**
+
+| Operation | Phase 1 | Phase 2 |
+|-----------|---------|---------|
+| Startup → first request | 70 s | 110 s |
+| Scale-up 2→4 | 22.97–25.81 s | 39.18 s |
+| Scale-down 4→2 | 4.05–9.64 s | 4.65 s |
+
+**Critical finding — GPU trapping:**
+
+`docker inspect HostConfig.DeviceRequests.DeviceIDs` is **immutable at
+`['0','1','2','3']`** throughout the entire container lifetime. Host-side
+`nvidia-smi` confirms the memory actually releases (GPU 2–3 drop to 4 MiB
+within ~10s of scale-down, same as Phase 1). So the container releases
+**memory** but not **GPU allocation** at the orchestrator level. In a K8s
+deployment, the Pod would still be charged for all 4 `nvidia.com/gpu`
+requests even when vLLM has internally scaled down to 2 engines.
+
+This is the key difference from Exp A1 (Tenplex): Tenplex restarts its
+process during reshape, so the container can be recreated with a different
+`--gpus` set between runs. vLLM's serving process stays running
+indefinitely — no such window exists. **The trap persists for the entire
+serving lifetime.**
 
 **Script:** `scripts/phase2_container.sh`
+**Results:** `results/phase2/` (including `phase2_results.json`, `start.log`, host view snapshots)
+**Analysis:** `analysis_report.html` section 5.5
 
 ### Phase 3: Per-GPU Containers (The Solution)
 

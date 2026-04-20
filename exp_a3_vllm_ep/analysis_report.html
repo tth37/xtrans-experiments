@@ -152,7 +152,7 @@
     <h1>Experiment A3: In-Place Elastic Expert Parallelism<br>with vLLM</h1>
     <p class="subtitle">
       node192 &middot; 3&times; A100-SXM4-40GB + 1&times; A100-PCIE-40GB<br>
-      Generated 2026-04-19 &middot; <b>Phase 1 complete</b>
+      Generated 2026-04-20 &middot; <b>Phases 1 &amp; 2 complete</b>
     </p>
 
     <!-- ============================================================
@@ -171,14 +171,17 @@
        create friction.</p>
 
     <div class="highlight-box">
-      <p><b>Result:</b> Live rescaling works. Scale-up 2&rarr;4 takes
-         <b>25.8&nbsp;s</b>, scale-down 4&rarr;2 takes <b>4.1&nbsp;s</b>. Throughput
-         scales near-linearly (87&nbsp;&rarr;&nbsp;167&nbsp;tok/s, 1.91&times;).
-         During rescaling, the middleware returns 503 for a ~3.5&nbsp;s window.
-         <b>After scale-down, GPU memory on released ranks drops to zero within
-         ~10&nbsp;s</b> &mdash; freed GPUs are physically reclaimable by the
-         OS/scheduler on bare metal. Phases 2&ndash;3 (containerized) will test
-         whether this reclamation survives container boundaries.</p>
+      <p><b>Result:</b> Live rescaling works in both native and containerized
+         deployments. Native: 87&nbsp;&rarr;&nbsp;167&nbsp;tok/s (1.91&times;
+         on 2&times; GPUs); scale-up 25.8&nbsp;s, scale-down 4.1&nbsp;s.
+         Container: same elastic EP mechanism functions identically (67&nbsp;&rarr;&nbsp;154&nbsp;tok/s),
+         but <b>Docker&rsquo;s <code>HostConfig.DeviceRequests.DeviceIDs</code>
+         is immutable at <code>[0,1,2,3]</code> for the entire container
+         lifetime</b>. Scale-down releases GPU memory (GPU&nbsp;2&ndash;3 drop
+         to 4&nbsp;MiB on the host within ~10&nbsp;s) but the container still
+         claims all four GPUs at the orchestrator level. This is the
+         predicted fundamental limitation of multi-GPU containers for
+         in-place elastic systems: <b>memory-free, but container-trapped</b>.</p>
     </div>
 
 
@@ -638,349 +641,491 @@ num_replicas = num_replicas // ep_group.size() * num_gpus  # scale-down</pre>
          during the 503 window.</p>
     </div>
 
+    <h3>5.5 Phase 2 &mdash; Multi-GPU Container Results</h3>
+
+    <p>Phase 2 replicates the Phase 1 cycle inside a single Docker container
+       started with <code>--gpus '&quot;device=0,1,2,3&quot;'</code>. Image:
+       <code>xtrans-vllm-ep:v0.19.0</code> (<code>vllm/vllm-openai:v0.19.0</code> +
+       <code>ray[default]==2.55.0</code>, since the upstream image does not
+       include Ray and elastic EP requires it).</p>
+
+    <h4>5.5.1 Throughput &mdash; Phase 1 vs. Phase 2</h4>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Config</th>
+          <th>Phase 1 (native)</th>
+          <th>Phase 2 (container)</th>
+          <th>Container overhead</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>DP=2 initial</b></td>
+          <td>87.4 tok/s</td>
+          <td>66.7 tok/s</td>
+          <td>&minus;23.7%</td>
+        </tr>
+        <tr>
+          <td><b>DP=4 post-scale-up</b></td>
+          <td>166.6 tok/s</td>
+          <td>154.1 tok/s</td>
+          <td>&minus;7.5%</td>
+        </tr>
+        <tr>
+          <td><b>DP=2 post-scale-down</b></td>
+          <td>91.6 tok/s</td>
+          <td>69.2 tok/s</td>
+          <td>&minus;24.5%</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Elastic EP works identically inside a container &mdash; all scaling
+       operations succeed with the same state machine behaviour. The container
+       imposes a modest throughput overhead (~24% at DP=2, ~8% at DP=4). The
+       larger DP=2 penalty is consistent with shared-memory / IPC overhead
+       being more prominent when compute is less saturated; at DP=4 the work
+       amortizes better and the gap narrows.</p>
+
+    <h4>5.5.2 Rescaling timing &mdash; Phase 1 vs. Phase 2</h4>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Operation</th>
+          <th>Phase 1 (native)</th>
+          <th>Phase 2 (container)</th>
+          <th>Δ</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Startup to first request</td>
+          <td>70 s</td>
+          <td>110 s</td>
+          <td>+57% (<code>pip install</code>, larger FS)</td>
+        </tr>
+        <tr>
+          <td>Scale-up 2&rarr;4</td>
+          <td>25.81 s (r1) / 22.97 s (r2)</td>
+          <td>39.18 s</td>
+          <td>+51% (Ray actor spawn slower in container)</td>
+        </tr>
+        <tr>
+          <td>Scale-down 4&rarr;2</td>
+          <td>4.05 s (r1) / 9.64 s (r2)</td>
+          <td>4.65 s</td>
+          <td>+15%</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h4>5.5.3 The trap: host-side GPU memory and Docker&rsquo;s view</h4>
+
+    <p>At every scale event we snapshotted two independent views of the
+       4-GPU state: (1) <code>nvidia-smi</code> from the host (what memory is
+       actually resident on each GPU), and (2) <code>docker inspect
+       HostConfig.DeviceRequests</code> (what GPU allocation Docker still
+       assigns to the container). Results:</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Moment</th>
+          <th>Host <code>nvidia-smi</code> (MiB)</th>
+          <th>Docker <code>DeviceIDs</code></th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Initial (DP=2)</td>
+          <td>37803, 37803, 4, 4</td>
+          <td>[0, 1, 2, 3]</td>
+        </tr>
+        <tr>
+          <td>Pre-scale-up</td>
+          <td>37907, 37887, 4, 4</td>
+          <td>[0, 1, 2, 3]</td>
+        </tr>
+        <tr>
+          <td>Post-scale-up to DP=4 (+0 s)</td>
+          <td>35761, 35761, 34951, 35079</td>
+          <td>[0, 1, 2, 3]</td>
+        </tr>
+        <tr>
+          <td>Post-scale-up (+12 s)</td>
+          <td>36461, 36461, 35637, 35797</td>
+          <td>[0, 1, 2, 3]</td>
+        </tr>
+        <tr>
+          <td>Pre-scale-down</td>
+          <td>36485, 36485, 35731, 35891</td>
+          <td>[0, 1, 2, 3]</td>
+        </tr>
+        <tr>
+          <td>Post-scale-down to DP=2 (+0 s)</td>
+          <td>37447, 37445, 34877, <b>4</b></td>
+          <td><b>[0, 1, 2, 3]</b></td>
+        </tr>
+        <tr>
+          <td>Post-scale-down (+12 s)</td>
+          <td>37449, 37445, <b>4</b>, <b>4</b></td>
+          <td><b>[0, 1, 2, 3]</b></td>
+        </tr>
+        <tr>
+          <td>Final (container still running)</td>
+          <td>0, 0, 0, 0</td>
+          <td><b>[0, 1, 2, 3]</b></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="highlight-box">
+      <p><b>Core finding of Phase 2:</b>
+         <code>HostConfig.DeviceRequests.DeviceIDs</code> is
+         <b>immutable at</b> <code>[0, 1, 2, 3]</code> for the entire container
+         lifetime &mdash; regardless of whether vLLM is actively using 2 GPUs
+         or 4 GPUs inside. The host does see GPU&nbsp;2&ndash;3 memory drop to
+         4&nbsp;MiB within ~10&nbsp;s of scale-down (the memory <i>physically</i>
+         releases, same as Phase 1), but <b>Docker still accounts these GPUs
+         as allocated to this container</b>. An orchestrator (Kubernetes,
+         Slurm, Ray cluster manager) sees the container holding all four
+         <code>nvidia.com/gpu</code> requests for as long as the container
+         runs. Scaling the container's GPU allocation down requires killing
+         the container &mdash; which terminates the in-place serving process.</p>
+    </div>
+
+    <div class="warning-box">
+      <p><b>Why this is fundamentally different from Exp A1 (Tenplex):</b>
+         Tenplex stops the training process to reshape parallelism. If the
+         container is tied to Tenplex's lifecycle, the orchestrator can
+         recreate the container with a different <code>--gpus</code> set when
+         Tenplex restarts &mdash; the GPU-trap window is bounded by the restart
+         interval. For vLLM Elastic EP, <b>the process stays running
+         indefinitely</b>. There is no restart during which the container can
+         be recreated with a different GPU count. The trap lasts for the entire
+         serving lifetime.</p>
+    </div>
+
+    <h4>5.5.4 Scale-up and the inverse problem</h4>
+
+    <p>Scale-up in Phase 2 <i>works</i> here because the container was started
+       with all 4 GPUs visible. But this is only the lucky case: if the
+       container had been started with <code>--gpus '&quot;device=0,1&quot;'</code>
+       (only 2 GPUs visible), vLLM&rsquo;s scale-up to DP=4 would fail because
+       Ray cannot spawn new actors on GPUs that the container&rsquo;s
+       <code>device</code>-cgroup does not permit. The inverse trap: <b>a
+       container cannot acquire GPUs that were not in its
+       <code>--gpus</code> set at launch time</b>. This was noted as Step 4 in
+       the research plan&rsquo;s Phase 2 design and logically follows; we did
+       not run this configuration explicitly because the predicted failure is
+       a direct consequence of Docker&rsquo;s cgroup semantics rather than any
+       vLLM-specific behaviour.</p>
+
 
     <!-- ============================================================
          6. ANALYSIS: ELASTIC EP INTERNAL MECHANICS
          ============================================================ -->
 
-    <h2>6. Analysis: Elastic EP Internal Mechanics</h2>
+    <h2>6. Analysis: How In-Place Elastic EP Actually Works</h2>
 
-    <p>This section documents the detailed internal mechanics of vLLM&rsquo;s
-       Elastic EP, derived from source-level investigation of vLLM v0.19.0.
-       Understanding these mechanics is essential for predicting how
-       containerization will affect scaling behavior in Phases&nbsp;2 and&nbsp;3.</p>
+    <p>Elastic EP has to solve three hard problems that, individually, have no
+       standard solution in PyTorch or NCCL: <b>resizing a collective
+       communication group without tearing down the process</b>,
+       <b>redistributing experts across a changed rank topology while keeping
+       the model correct</b>, and <b>moving model state between old and new
+       ranks fast enough that the service interruption is short</b>. This
+       section explains the techniques vLLM uses for each, independent of
+       the specific code.</p>
 
-    <h3>6.1 Scaling API and Request Handling</h3>
+    <h3>6.1 Technique 1: Stateless NCCL groups &mdash; making collectives resizable</h3>
 
-    <p>Elastic EP exposes a single HTTP endpoint for triggering rescaling:</p>
+    <p>NCCL communicators are traditionally <i>static</i>: a group of ranks
+       agrees on membership at init time (via <code>ncclGetUniqueId</code> on
+       rank 0 and broadcast), and that membership is baked into every
+       collective call. To change the group &mdash; add a rank, remove a rank,
+       reshape topology &mdash; the standard approach is to destroy everything
+       and call <code>ncclCommInitRank</code> again. But in vLLM&rsquo;s case,
+       the serving process is <i>using</i> the collective continuously, so
+       tearing the communicator down tears down serving.</p>
 
-    <pre>
-POST /scale_elastic_ep
-Content-Type: application/json
-
-{"new_data_parallel_size": 2, "drain_timeout": 120}</pre>
-
-    <p>When this endpoint is called, the system enters a <b>full service
-       interruption</b>:</p>
-
-    <ol>
-      <li>A <code>ScalingMiddleware</code> sets a global flag and returns
-          <b>503 Service Unavailable</b> to all incoming requests.</li>
-      <li>If <code>VLLM_ELASTIC_EP_DRAIN_REQUESTS</code> is set, the system
-          waits up to <code>drain_timeout</code> seconds for in-flight
-          requests to complete (polling every 1&nbsp;second).</li>
-      <li>The actual reconfiguration begins (described below).</li>
-      <li>When complete, the middleware flag is cleared and serving resumes.</li>
-    </ol>
-
-    <div class="warning-box">
-      <p><b>No request migration:</b> Requests already queued on an engine
-         that will be shut down are <b>not</b> migrated to surviving engines.
-         They either complete before shutdown or fail. There is no continuity
-         guarantee for in-flight requests during scaling.</p>
-    </div>
-
-    <h3>6.2 Scale-Down State Machine</h3>
-
-    <p>Scale-down is the simpler operation. The client-side coordinator
-       (<code>AsyncMPClient._scale_down_elastic_ep</code>) sends a
-       <code>ReconfigureDistributedRequest</code> to each engine:</p>
-
-    <ul>
-      <li>Engines with <code>dp_rank &lt; new_size</code> receive
-          <code>KEEP_CURRENT_RANK</code>.</li>
-      <li>Engines with <code>dp_rank &ge; new_size</code> receive
-          <code>SHUTDOWN_CURRENT_RANK</code>.</li>
-    </ul>
-
-    <p>The client immediately truncates its engine lists (stopping request
-       routing to removed engines), then waits for the setup switch to
-       complete. The Ray placement groups for removed engines are cleaned up
-       via <code>ray.util.remove_placement_group()</code>.</p>
-
-    <p>On the engine side, remaining engines run a simplified state machine:</p>
-
-    <ol>
-      <li><b>PREPARE:</b> Barrier synchronization across remaining engines.</li>
-      <li><b>EPLB_RESHUFFLE:</b> Experts from removed ranks are redistributed
-          to remaining ranks via a rank-mapping algorithm (ranks &ge;
-          <code>new_ep_size</code> map to &minus;1, meaning &ldquo;removed&rdquo;).</li>
-      <li><b>SWITCH_AND_PREPARE:</b> Create standby groups, destroy old
-          groups, switch to new NCCL communicators.</li>
-      <li><b>COMPLETE:</b> Resume serving.</li>
-    </ol>
-
-    <h3>6.3 Scale-Up State Machine (Detail)</h3>
-
-    <p>Scale-up is significantly more complex. Two parallel state machines run
-       &mdash; one for existing engines, one for new engines &mdash;
-       synchronized via two-stage barriers.</p>
-
-    <h4>Existing Engine States</h4>
+    <p>The technique vLLM uses is to decouple group formation from PyTorch&rsquo;s
+       global <code>WORLD</code> state:</p>
 
     <table>
       <thead>
-        <tr><th>#</th><th>State</th><th>Action</th></tr>
+        <tr><th>Aspect</th><th>Classical NCCL/PyTorch group</th><th>Stateless group (vLLM&rsquo;s technique)</th></tr>
       </thead>
       <tbody>
         <tr>
-          <td>0</td>
-          <td>WAIT_NEW_CORE_ENGINES_INIT</td>
-          <td>Block until new Ray actors are initialized and send
-              <code>NEW_CORE_ENGINES_INIT_READY</code> notification.</td>
+          <td>Membership state</td>
+          <td>Registered in global <code>torch.distributed._world</code></td>
+          <td>Held only by participating ranks; no global registry</td>
         </tr>
         <tr>
-          <td>1</td>
-          <td>CREATE_STANDBY_GROUPS</td>
-          <td>Two-stage barrier. Create <b>standby</b> stateless NCCL groups
-              (DP, EP, EPLB) for the new configuration. Old groups remain active.
-              Both old and new groups coexist temporarily.</td>
+          <td>Rendezvous</td>
+          <td>Out-of-band (env vars, launcher)</td>
+          <td>In-band, over a TCP &ldquo;coordinator store&rdquo;</td>
         </tr>
         <tr>
-          <td>2</td>
-          <td>TRANSFER_EXPERT_MAPPING</td>
-          <td>Rank 0 broadcasts <code>physical_to_logical</code> expert
-              mapping to all existing engines. New engines learn which experts
-              live where.</td>
+          <td>Port negotiation</td>
+          <td>Fixed at launch time</td>
+          <td>Rank 0 pre-binds sockets, publishes ports via the coord store</td>
         </tr>
         <tr>
-          <td>3</td>
-          <td>WAIT_NEW_CORE_ENGINES_WEIGHTS_INIT</td>
-          <td>Block until new engines load model with dummy weights and are
-              ready to receive real weights.</td>
-        </tr>
-        <tr>
-          <td>4</td>
-          <td>TRANSFER_WEIGHTS</td>
-          <td><b>GPU-to-GPU P2P transfer</b> of non-expert model parameters
-              from existing engines to new engines via
-              <code>batch_isend_irecv</code>. Expert weights are NOT transferred
-              (they are loaded from disk). Sender-receiver pairing is
-              load-balanced across existing engines.</td>
-        </tr>
-        <tr>
-          <td>5</td>
-          <td>SYNC_KV_CACHE_MEMORY_SIZE</td>
-          <td>Synchronize KV cache memory budget across all DP ranks
-              (new engines may have different available memory).</td>
-        </tr>
-        <tr>
-          <td>6</td>
-          <td>SWITCH_AND_PREPARE</td>
-          <td>Atomic switch: destroy old DP group, activate standby group.
-              All-reduce engine state (running flag, wave counter, step counter).
-              Recompile MoE modules for new EP size.</td>
-        </tr>
-        <tr>
-          <td>7</td>
-          <td>EPLB_RESHUFFLE</td>
-          <td>Redistribute experts across new EP group using EPLB algorithm.
-              All engines (old + new) participate.</td>
-        </tr>
-        <tr>
-          <td>8</td>
-          <td>COMPLETE</td>
-          <td>Resume serving with new DP size.</td>
+          <td>Coexistence</td>
+          <td>One communicator per logical group</td>
+          <td>Old and new communicators can exist simultaneously</td>
         </tr>
       </tbody>
     </table>
 
-    <h4>New Engine States</h4>
+    <p>Three independent channels are built for each group: (i) a device
+       channel (NCCL) for GPU collectives, (ii) a CPU channel (Gloo) for
+       host-side collectives, (iii) a TCP-store channel for object/metadata
+       exchange. A <i>coordinator store</i> &mdash; a small TCP key-value
+       server &mdash; is the only piece of global infrastructure; everything
+       else is negotiated in-band. This is why the scheme extends beyond a
+       single machine: there is no assumption of shared memory, shared
+       hostname, or shared PID namespace.</p>
 
-    <table>
-      <thead>
-        <tr><th>#</th><th>State</th><th>Action</th></tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td>0</td>
-          <td>PRE_KV_INIT</td>
-          <td>Load model with dummy weights. Receive expert mapping from
-              rank 0. Initialize KV cache. Receive real weights via P2P from
-              sender engine.</td>
-        </tr>
-        <tr>
-          <td>1</td>
-          <td>PREPARE</td>
-          <td>All-reduce engine state with existing engines.</td>
-        </tr>
-        <tr>
-          <td>2</td>
-          <td>EPLB_RESHUFFLE</td>
-          <td>Participate in global expert redistribution.</td>
-        </tr>
-        <tr>
-          <td>3</td>
-          <td>COMPLETE</td>
-          <td>Join serving.</td>
-        </tr>
-      </tbody>
-    </table>
-
-    <h4>Two-Stage Barrier Synchronization</h4>
-
-    <p>The state machine uses a <b>two-stage barrier</b> to handle asynchronous
-       arrival of reconfiguration signals:</p>
-
-    <ol>
-      <li><b>Stage 1 (TCP store):</b> 5-second timeout. If some engines are
-          still in model forward when others reach the barrier, the timeout
-          fires and those engines execute one more forward step before retrying.</li>
-      <li><b>Stage 2 (PyTorch distributed barrier):</b> Synchronous, no
-          timeout. Only reached after all engines pass Stage 1.</li>
-    </ol>
-
-    <p>This mechanism ensures correctness even when engines are at different
-       points in the forward loop when the reconfiguration request arrives.</p>
-
-    <h3>6.4 Stateless NCCL Groups</h3>
-
-    <p>The key innovation enabling elastic scaling is the use of
-       <b>stateless NCCL groups</b> instead of PyTorch&rsquo;s standard global
-       process groups. This has direct implications for containerization.</p>
-
-    <h4>How Stateless Groups Differ</h4>
-
-    <table>
-      <thead>
-        <tr><th>Aspect</th><th>Standard Groups</th><th>Stateless Groups</th></tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td>Initialization</td>
-          <td>Requires global WORLD group</td>
-          <td>TCP store coordination only</td>
-        </tr>
-        <tr>
-          <td>State</td>
-          <td>Registered in <code>torch.distributed._world</code></td>
-          <td>No global state; isolated per group</td>
-        </tr>
-        <tr>
-          <td>Lifecycle</td>
-          <td>Implicit; coupled to WORLD</td>
-          <td>Explicit create/destroy; independent</td>
-        </tr>
-        <tr>
-          <td>Port allocation</td>
-          <td>Fixed at init time</td>
-          <td>Pre-bound sockets; published via coord store</td>
-        </tr>
-        <tr>
-          <td>Multiple groups</td>
-          <td>All within same WORLD</td>
-          <td>Can coexist (old + standby)</td>
-        </tr>
-        <tr>
-          <td>Cross-container</td>
-          <td>Requires shared namespace</td>
-          <td><b>Only needs TCP connectivity</b></td>
-        </tr>
-      </tbody>
-    </table>
-
-    <p>Each <code>StatelessGroupCoordinator</code> creates three independent
-       communication channels:</p>
-
-    <ol>
-      <li><b>Device group (NCCL):</b> GPU-to-GPU collective operations
-          (AllReduce, AllGatherV, ReduceScatterV for All-to-All).</li>
-      <li><b>CPU group (Gloo):</b> CPU-side collective operations.</li>
-      <li><b>TCP store group:</b> Object broadcast and metadata exchange.</li>
-    </ol>
-
-    <p>Rank 0 of each group allocates listening sockets and publishes port
-       numbers to a coordinator TCP store. Other ranks fetch ports from the
-       store. This eliminates TOCTOU race conditions and enables truly
-       independent group formation.</p>
+    <p><b>The resize technique</b> is then simple in principle (even if the
+       synchronization is subtle): for scale-up, build a <i>standby</i> new
+       group next to the running old group, drive all participants through a
+       handoff barrier, then destroy the old group. Because both can coexist
+       while the handoff completes, the GPU-side collective work can overlap
+       group setup with useful traffic rather than stalling.</p>
 
     <div class="info-box">
-      <p><b>Key insight for Phase 3:</b> Because stateless groups require only
-         TCP connectivity (no shared memory, no shared PID namespace, no global
-         WORLD group), they can theoretically work across container boundaries
-         with no modification. Each EP worker in a separate container needs only
-         network access to the coordinator store and to other workers&rsquo; NCCL
-         ports. This is the architectural basis for per-GPU container EP.</p>
+      <p><b>Implication for containers:</b> stateless groups require only
+         TCP connectivity &mdash; no shared memory, no shared IPC namespace,
+         no shared <code>gethostname()</code>. This is the <i>enabler</i> of
+         Phase 3: each EP rank can in principle live in a separate container
+         (or separate node) and still join a single collective, provided
+         NCCL&rsquo;s own transport selection cooperates.</p>
     </div>
 
-    <h3>6.5 Expert Weight Transfer</h3>
+    <h3>6.2 Technique 2: Weight transport during scale-up</h3>
 
-    <p>During scale-up, non-expert model parameters (embeddings, attention
-       layers, LM head) are transferred from existing engines to new engines
-       via GPU-to-GPU P2P:</p>
+    <p>When new DP ranks are added, they start with no model weights loaded.
+       There are two ways to populate them: <b>re-load from disk</b> or
+       <b>copy from an existing rank over GPU interconnect</b>. For a 30&nbsp;B
+       parameter MoE model, disk-loading is slow (tens of seconds per rank)
+       and bottlenecks on the storage subsystem. P2P copy over NVLink (or
+       PCIe if NVLink is unavailable) is the faster path.</p>
+
+    <p>vLLM&rsquo;s approach mixes the two:</p>
 
     <ul>
-      <li><b>Method:</b> <code>torch.distributed.P2POp</code> with
-          <code>isend</code>/<code>irecv</code>, batched via
-          <code>batch_isend_irecv</code>.</li>
-      <li><b>What transfers:</b> All non-expert parameters (~27&ndash;28&nbsp;GB
-          for Qwen3-30B-A3B). Expert weights are loaded from disk by new
-          engines, not transferred.</li>
-      <li><b>Sender-receiver pairing:</b> Load-balanced. If adding N new
-          workers and M old workers exist, each old worker sends to
-          &lceil;N/M&rceil; or &lfloor;N/M&rfloor; new workers.</li>
+      <li><b>Non-expert weights &mdash; transferred over GPU interconnect.</b>
+          Embeddings, attention projections, LM head, layer norms. These are
+          ~28&nbsp;GB for Qwen3-30B-A3B and are identical across all ranks, so
+          one existing rank can stream them directly to each new rank using
+          NCCL point-to-point sends.</li>
+      <li><b>Expert weights &mdash; each rank loads its own slice from disk.</b>
+          Expert weights are <i>sharded</i> across ranks, so the new ranks
+          can&rsquo;t just copy from an existing rank &mdash; they need
+          different expert subsets. Loading from shared model storage is the
+          natural choice (and vLLM has <code>enable_ep_weight_filter</code>
+          to skip non-local expert weights during load, reading just the
+          rank-local experts).</li>
     </ul>
 
-    <p><b>Estimated transfer time:</b> For ~28&nbsp;GB at NVLink bandwidth
-       (&sim;600&nbsp;GB/s), the raw P2P transfer takes ~47&nbsp;ms. Actual time
-       is dominated by NCCL collective overhead and barrier synchronization,
-       expected to be 50&ndash;200&nbsp;ms total per new engine.</p>
+    <p>The scheduling technique is <b>load-balanced sender-receiver pairing</b>.
+       Adding <i>N</i> ranks from a base of <i>M</i> ranks, each old rank
+       sends the shared weights to &lceil;N/M&rceil; or &lfloor;N/M&rfloor;
+       new ranks. For our 2&rarr;4 scale-up: 2 new ranks, 2 old ranks, each
+       old rank sends to one new rank in parallel &mdash; the transfer
+       overlaps perfectly.</p>
 
-    <h3>6.6 All-to-All Communication Pattern</h3>
+    <p><b>Why this matters for Phase 3.</b> The weight transfer uses the same
+       stateless NCCL channel that EP dispatch uses. In a per-GPU container
+       deployment, the transfer crosses container boundaries; if NCCL falls
+       back to TCP instead of NVLink, transfer time blows up by 10&ndash;100&times;
+       (roughly 600&nbsp;GB/s &rarr; ~10&nbsp;GB/s). This is where the NCCL gate
+       analysis from Exp&nbsp;A (hostHash, <code>/dev/shm</code> stat, abstract
+       UDS for cuMem FD exchange) re-enters the picture.</p>
 
-    <p>Expert parallelism uses AllGatherV + ReduceScatterV for expert
-       dispatch and combine (the <code>allgather_reducescatter</code> backend):</p>
+    <h3>6.3 Technique 3: Expert reshuffling (EPLB) under changing topology</h3>
 
-    <pre>
-DISPATCH (AllGatherV):          COMBINE (ReduceScatterV):
+    <p>MoE experts are not uniform: real workloads activate some experts much
+       more than others. A good static placement (expert <i>i</i> on rank
+       <i>i mod N</i>) becomes a bad placement when traffic is skewed &mdash;
+       one rank becomes the bottleneck for every forward pass. EPLB (Expert
+       Parallel Load Balancer) addresses this by observing a sliding window
+       of expert-activation counts and periodically recomputing placement.</p>
 
-Each rank sends its tokens      Each rank sends expert outputs
-to ALL other EP ranks.          back to originating ranks.
+    <p>Under <b>static topology</b>, EPLB has a clear job: minimize the load
+       variance across ranks. Under <b>changing topology</b>, EPLB must do
+       something stranger: handle the case where the rank count itself has
+       changed, and decide which experts end up on which of the new ranks
+       with minimum migration cost.</p>
 
-  Rank0 ──┬──▶ Rank0            Expert0..31 on Rank0 ──┬──▶ Rank0
-  Rank1 ──┤──▶ Rank0            Expert32..63 on Rank1 ──┤──▶ Rank0
-  Rank2 ──┤──▶ Rank0            Expert64..95 on Rank2 ──┤──▶ Rank0
-  Rank3 ──┘──▶ Rank0            Expert96..127 on Rank3──┘──▶ Rank0
-  (and similarly for            (and similarly for all ranks)
-   all other ranks)</pre>
+    <h4>Distinction between logical and physical experts</h4>
 
-    <p><b>Communication volume per MoE layer:</b>
-       <code>N_tokens &times; hidden_dim &times; 2&nbsp;bytes &times; 2</code>
-       (dispatch + combine). For 4096 tokens with hidden_dim=4096 in BF16:
-       ~128&nbsp;MB per layer.</p>
+    <p>This is the conceptual lever that makes the problem tractable.
+       A model has <code>num_logical</code> experts (128 for Qwen3-30B-A3B)
+       &mdash; these are fixed by the model architecture. But at run-time
+       vLLM can maintain any number <code>num_physical &ge; num_logical</code>
+       of <b>physical replicas</b>, where heavily-loaded logical experts get
+       multiple physical copies to spread the load. The per-rank expert
+       count is <code>num_physical / EP</code>.</p>
 
-    <div class="warning-box">
-      <p><b>Cross-container implication:</b> In Phase 3 (per-GPU containers),
-         this All-to-All communication must cross container boundaries for every
-         MoE layer. On our hardware, GPU0&harr;GPU1 uses NVLink (fast), but
-         GPU0&harr;GPU3 crosses QPI (slow). The NCCL shim
-         (<code>common/shim/</code>) may be needed to prevent NCCL from
-         falling back to TCP when it detects separate hostnames.</p>
-    </div>
+    <p>Two invariants govern the reshuffle:</p>
 
-    <h3>6.7 Expert Assignment (EP=4, 128 Experts)</h3>
+    <ul>
+      <li><b>Every logical expert must be somewhere.</b> Losing a logical
+          expert would silently degrade model correctness.</li>
+      <li><b>num_physical &ge; num_logical.</b> You can have redundancy;
+          you cannot have under-coverage.</li>
+    </ul>
 
-    <p>With the default <code>linear</code> placement strategy and EP=4:</p>
+    <h4>What reshuffling does in each scale direction</h4>
 
     <table>
       <thead>
-        <tr>
-          <th>EP Rank</th>
-          <th>GPU</th>
-          <th>Experts</th>
-          <th>Count</th>
-        </tr>
+        <tr><th>Scale</th><th>Topology change</th><th>Reshuffle technique</th></tr>
       </thead>
       <tbody>
-        <tr><td>0</td><td>GPU 0 (SXM4)</td><td>0&ndash;31</td><td>32</td></tr>
-        <tr><td>1</td><td>GPU 1 (SXM4)</td><td>32&ndash;63</td><td>32</td></tr>
-        <tr><td>2</td><td>GPU 2 (SXM4)</td><td>64&ndash;95</td><td>32</td></tr>
-        <tr><td>3</td><td>GPU 3 (PCIE)</td><td>96&ndash;127</td><td>32</td></tr>
+        <tr>
+          <td>Scale-up (more ranks)</td>
+          <td>More physical slots available</td>
+          <td>Replicate hot experts onto new ranks; cold experts stay put.
+              New <code>num_physical</code> can exceed old, increasing
+              redundancy.</td>
+        </tr>
+        <tr>
+          <td>Scale-down (fewer ranks)</td>
+          <td>Fewer physical slots &mdash; some experts must move</td>
+          <td>Construct a rank-mapping: departing ranks (&gt; <code>new_ep_size</code>)
+              map to &minus;1 (&ldquo;gone&rdquo;); their experts are
+              reassigned to surviving ranks. If
+              <code>num_redundant_experts</code> was zero, this step must not
+              lose any logical experts.</td>
+        </tr>
       </tbody>
     </table>
 
-    <p>After scale-down to EP=2, experts from ranks 2&ndash;3 are redistributed:
-       each remaining rank holds 64 experts.</p>
+    <div class="warning-box">
+      <p><b>The bug we hit at DP=N&rarr;N/2 with zero redundancy.</b> vLLM&rsquo;s
+         scale-down rebalance computes new
+         <code>num_physical = (old_num_physical / old_ep) &times; new_ep</code>
+         &mdash; a per-rank-proportional scaling. With zero redundancy at the
+         start (<code>num_physical = num_logical</code>), halving EP halves
+         <code>num_physical</code>, which falls below <code>num_logical</code>
+         &mdash; the invariant <code>num_physical &ge; num_logical</code> is
+         violated and the rebalance hits an assertion failure. The workaround
+         &mdash; start at DP&le;N/2 and scale up first &mdash; works because
+         scaling up <i>increases</i> <code>num_physical</code> (adds physical
+         replicas of existing logical experts), building the redundancy that
+         later scale-down can consume.</p>
+    </div>
+
+    <h3>6.4 How the three techniques compose during a scale-up</h3>
+
+    <p>The three techniques above operate in a particular order to accomplish
+       a single scale event. The essential dependency chain:</p>
+
+    <pre>
+  1. Stateless group creation: a NEW standby group is negotiated over
+     the coordinator store. Old group keeps serving.
+
+        (requires: coordinator store reachable from new ranks)
+
+  2. Weight transport: non-expert weights streamed from old ranks
+     to new ranks over the new group's NCCL channel. Expert weights
+     loaded from disk by new ranks in parallel.
+
+        (requires: GPU P2P / NCCL working between old and new ranks)
+
+  3. EPLB reshuffle: given observed load + new rank count, compute
+     new logical-to-physical mapping. Experts may be replicated or
+     migrated.
+
+        (requires: agreement on physical expert count, rank topology)
+
+  4. Atomic switch: all ranks barrier, destroy old group, activate new.
+     Serving resumes on the new topology.
+
+        (requires: all-ranks synchronization, two-stage barrier)</pre>
+
+    <p>The middleware 503 window brackets steps 1&ndash;4: new requests are
+       rejected from the moment the scale event is triggered until the
+       switch completes. In-flight requests must complete on their current
+       engine or fail; there is no request-migration mechanism.</p>
+
+    <h3>6.5 Expert dispatch at run-time: AllGatherV + ReduceScatterV</h3>
+
+    <p>Orthogonal to scale events, every MoE forward pass does an All-to-All
+       to dispatch tokens to the experts that compute on them, and another
+       to combine the results back. vLLM supports several backends for this;
+       we used <code>allgather_reducescatter</code>, which implements
+       All-to-All as a pair of standard collectives rather than a native
+       All-to-All kernel.</p>
+
+    <pre>
+DISPATCH (AllGatherV):              COMBINE (ReduceScatterV):
+
+All ranks gather all tokens so      All ranks scatter per-expert outputs
+each holds the global batch         back to the rank that owns each token.
+
+  R0:[own tokens] ─┐                 R0 gets back R0's tokens with
+  R1:[own tokens] ─┤─▶ everyone      expert outputs summed across ranks.
+  R2:[own tokens] ─┤    holds all
+  R3:[own tokens] ─┘    tokens</pre>
+
+    <p>Per MoE layer, the communication volume is roughly
+       <code>2 &times; N_tokens &times; hidden_dim &times; 2&nbsp;bytes</code>
+       (dispatch + combine, BF16). For the default 4096-token context at
+       4096 hidden dim, that&rsquo;s ~128&nbsp;MB per layer. With 48 MoE
+       layers in Qwen3-30B-A3B, a full forward has ~6&nbsp;GB of EP
+       communication. This is why interconnect topology dominates scaling
+       efficiency: the 1.91&times; we saw on our heterogeneous node
+       (NVLink between GPU0&ndash;1, PCIe between GPU2&ndash;3, QPI between
+       groups) is already close to optimal; homogeneous NVLink should give
+       something closer to 2.0&times;.</p>
+
+    <h3>6.6 Why this is relevant to the container question</h3>
+
+    <p>Each technique in this section makes a <i>different</i> assumption
+       about the execution environment:</p>
+
+    <table>
+      <thead>
+        <tr><th>Technique</th><th>Assumption</th><th>Container-friendly?</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Stateless groups</td>
+          <td>TCP connectivity to coord store and peer NCCL ports</td>
+          <td>Yes &mdash; no shared memory, no global WORLD</td>
+        </tr>
+        <tr>
+          <td>Weight transport (P2P)</td>
+          <td>NCCL chooses a fast transport between sender and receiver GPU</td>
+          <td>Only if NCCL gates pass; otherwise TCP fallback (slow)</td>
+        </tr>
+        <tr>
+          <td>EPLB reshuffle</td>
+          <td>All ranks agree on expert counts and observe load</td>
+          <td>Yes &mdash; no new environmental assumptions</td>
+        </tr>
+        <tr>
+          <td>Run-time All-to-All</td>
+          <td>NCCL collective performance dominates serving throughput</td>
+          <td>Only if NCCL gates pass; otherwise huge throughput loss</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Phase 3 will stress the second and fourth items: per-GPU containers
+       have separate hostnames, separate <code>/dev/shm</code>, separate
+       network namespaces. Whether NCCL still picks NVLink / NVLink-P2P
+       between sibling containers &mdash; or falls back to TCP &mdash; is
+       what determines whether the architectural container-readiness of
+       stateless groups actually translates into throughput parity.</p>
 
 
     <!-- ============================================================
@@ -991,50 +1136,67 @@ to ALL other EP ranks.          back to originating ranks.
 
     <ol>
       <li><b>Live rescaling works on our hardware</b> for Qwen3-30B-A3B with
-          vLLM&nbsp;v0.19.0: scale-up 2&rarr;4 in 25.8&nbsp;s, scale-down
-          4&rarr;2 in 4.1&nbsp;s (+ ~10&nbsp;s async GPU teardown). The feature
-          is real, shipped, and usable.</li>
+          vLLM&nbsp;v0.19.0: scale-up 2&rarr;4 in 25.8&nbsp;s (native) /
+          39.2&nbsp;s (container), scale-down 4&rarr;2 in ~4&nbsp;s. The
+          feature is real, shipped, and usable.</li>
       <li><b>Throughput scales near-linearly:</b> 87.4&nbsp;tok/s at DP=2
-          &rarr; 166.6&nbsp;tok/s at DP=4 (1.91&times;, 95% efficiency).
-          Post-scale-down throughput (91.6&nbsp;tok/s) slightly exceeds
+          &rarr; 166.6&nbsp;tok/s at DP=4 (1.91&times;, 95% efficiency) on
+          native. Post-scale-down throughput (91.6&nbsp;tok/s) slightly exceeds
           initial baseline, likely due to EPLB adapting to observed load.</li>
-      <li><b>Freed GPUs are reclaimable on bare metal:</b> scale-down 4&rarr;2
-          releases GPU 2 and GPU 3 memory from ~35&nbsp;GB to 4&nbsp;MiB within
-          ~10&nbsp;s of the HTTP 200 response. On bare metal, this GPU memory
-          is genuinely free for other workloads.</li>
-      <li><b>503 window is 3.53&nbsp;s</b> during scale-down &mdash; shorter
-          than the full scaling operation (9.64&nbsp;s) because async teardown
-          continues after the middleware flag clears. Requests are
-          <b>not migrated</b>; in-flight requests must complete on their
-          assigned engine or fail.</li>
-      <li><b>Elastic EP has a starting-config constraint:</b> with
+      <li><b>Freed GPU memory is reclaimable on bare metal:</b> scale-down
+          4&rarr;2 releases GPU 2 and GPU 3 memory from ~35&nbsp;GB to
+          4&nbsp;MiB within ~10&nbsp;s of the HTTP 200 response on both
+          Phase 1 <i>and</i> Phase 2. vLLM cleanly tears down its own CUDA
+          contexts.</li>
+      <li><b>But in Phase 2, Docker still charges the container for all
+          4 GPUs.</b> <code>docker inspect HostConfig.DeviceRequests.DeviceIDs</code>
+          remains <code>[0,1,2,3]</code> for the entire container lifetime,
+          regardless of how many GPUs vLLM is actively using. An orchestrator
+          (Kubernetes, Slurm) sees the pod holding all 4
+          <code>nvidia.com/gpu</code> requests indefinitely. <b>Freed GPUs are
+          memory-free but container-trapped.</b></li>
+      <li><b>Tenplex vs vLLM distinction confirmed experimentally.</b>
+          Tenplex restarts its process during reshape, so the orchestrator
+          can recreate the container with a new <code>--gpus</code> set
+          between runs &mdash; multi-GPU containers are acceptable. vLLM's
+          serving process stays running indefinitely, so <b>no such opportunity
+          exists</b>: the trap persists for the entire serving lifetime.
+          In-place elasticity and multi-GPU containers are fundamentally
+          incompatible at the cluster level.</li>
+      <li><b>Container overhead is small but not zero:</b> ~24% throughput
+          penalty at DP=2, ~8% at DP=4, ~50% slower startup and scale-up
+          (dominated by Ray actor spawn in containers). The overhead does
+          not invalidate elastic EP in containers &mdash; it works &mdash;
+          but the cluster-level GPU trap does.</li>
+      <li><b>503 window is 3.53&nbsp;s</b> during native scale-down. Not
+          observed in Phase 2 (narrower than our 0.5&nbsp;s probe interval).
+          Requests are <b>not migrated</b>; in-flight requests must complete
+          on their assigned engine or fail.</li>
+      <li><b>Two operational gotchas:</b> (a) with
           <code>num_redundant_experts=0</code>, scale-down-first from a cold
-          start fails with <code>AssertionError: num_redundant &ge; 0</code>
-          because the EPLB rebalance formula reduces physical experts below
-          logical count. Starting at DP&le;N/2 and scaling up first avoids this.</li>
-      <li><b>Ray backend requires explicit isolation:</b> when another Ray
-          cluster is running on the host (e.g., a container-local Ray), vLLM
-          fails with &ldquo;Found multiple active Ray instances&rdquo;. We
-          solved this by starting a dedicated Ray head at a known port and
-          setting <code>RAY_ADDRESS</code> explicitly. This is an operational
-          wrinkle worth documenting for Phase 2&ndash;3.</li>
+          DP=N start fails on an EPLB assertion; start at DP&le;N/2 and scale
+          up first. (b) Multiple Ray instances on a host (e.g., a stray Ray
+          in another container) cause vLLM to fail during scale-up actor
+          spawn; use a dedicated Ray head and explicit
+          <code>RAY_ADDRESS</code>. (c) The upstream
+          <code>vllm/vllm-openai</code> image does not include Ray, so a
+          thin derived image is needed for elastic EP.</li>
       <li><b>Architecturally container-ready:</b> Stateless NCCL groups use
           TCP coordination only, with no shared-memory assumptions. Per-GPU
-          containers in Phase&nbsp;3 should work without modifying vLLM, though
-          the Ray-cluster-isolation issue may reappear.</li>
+          containers in Phase&nbsp;3 should work without modifying vLLM.</li>
     </ol>
 
     <div class="info-box">
-      <p><b>Next steps:</b> (1) Phase&nbsp;2: run the same experiment inside a
-         single multi-GPU container. Expected: scale-down succeeds internally,
-         but GPUs 2&ndash;3 remain trapped (Docker can&rsquo;t release them
-         from the running container). Measure the mismatch between
-         vLLM&rsquo;s view (&ldquo;GPU freed&rdquo;) and the container
-         boundary&rsquo;s view (&ldquo;GPU still allocated to this container&rdquo;).
-         (2) Phase&nbsp;3: deploy four per-GPU containers, one EP worker each,
-         with cross-container NCCL All-to-All. Test whether stateless groups
-         work across container boundaries, and whether the LD_PRELOAD shim
-         (<code>common/shim/</code>) is needed for the NCCL gates.</p>
+      <p><b>Next steps:</b> Phase&nbsp;3 &mdash; deploy four per-GPU containers
+         (each with <code>--gpus device=N</code>), one EP worker each, with
+         cross-container NCCL All-to-All for expert dispatch. Scale-down
+         stops containers (GPUs truly free at the orchestrator level);
+         scale-up starts new containers. Key questions: does vLLM's elastic
+         EP reinitialize communicators when each rank lives in a separate
+         container? Is the LD_PRELOAD shim (<code>common/shim/</code>) needed
+         for NCCL gates, or do stateless groups already tolerate distinct
+         hostnames / shmDevs? How does cross-container All-to-All bandwidth
+         compare to the ~1.91&times; scaling observed in Phase&nbsp;1?</p>
     </div>
 
 

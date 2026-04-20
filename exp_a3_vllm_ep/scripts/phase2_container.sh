@@ -21,9 +21,11 @@ cd "$(dirname "$0")/.."
 
 # ─── Config ───────────────────────────────────────────────────────────
 CONTAINER_NAME="xtrans-exp-a3-phase2"
-IMAGE="vllm/vllm-openai:v0.19.0"
-MODEL_HOST="/data/models--Qwen--Qwen3-30B-A3B/snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
-MODEL_IN_CTN="/models/qwen3-30b-a3b"
+IMAGE="xtrans-vllm-ep:v0.19.0"  # vllm/vllm-openai:v0.19.0 + ray[default] (see Dockerfile.phase2)
+# Mount the whole HF cache dir because snapshot files are symlinks to ../../blobs/
+MODEL_HOST="/data/models--Qwen--Qwen3-30B-A3B"
+MODEL_IN_CTN="/models/qwen3-30b-a3b/snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
+MODEL_MOUNT_IN_CTN="/models/qwen3-30b-a3b"
 PORT=8000
 INITIAL_DP=2
 MAX_MODEL_LEN=2048
@@ -60,7 +62,7 @@ start() {
         --gpus '"device=0,1,2,3"' \
         --ipc=host \
         --shm-size=16g \
-        -v "$MODEL_HOST:$MODEL_IN_CTN:ro" \
+        -v "$MODEL_HOST:$MODEL_MOUNT_IN_CTN:ro" \
         -p "$PORT:8000" \
         -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
         -e VLLM_LOGGING_LEVEL=INFO \

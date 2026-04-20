@@ -1,0 +1,11 @@
+FROM vllm/vllm-openai:v0.19.0
+
+# Elastic EP requires Ray; vllm-openai base image doesn't include it.
+# Use Tsinghua mirror (faster on Chinese networks).
+RUN pip install --no-cache-dir \
+    --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+    "ray[default]==2.55.0"
+
+# vllm-openai's default entrypoint is `python3 -m vllm.entrypoints.openai.api_server`
+# but we override to allow starting Ray head explicitly if needed.
+# (Phase 2 script overrides entrypoint to /bin/bash -c "vllm serve ...")
