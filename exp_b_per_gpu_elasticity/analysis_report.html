@@ -809,6 +809,313 @@ num_replicas = new_num_replicas</pre>
          Track 1b sketch list.</p>
     </div>
 
+    <h3>6.5 Mechanism: expert placement under scale events</h3>
+
+    <p>Two concrete questions motivate this subsection, both with the
+       same underlying answer:</p>
+
+    <ul>
+      <li><b>Q1.</b> Why does a cold <code>DP=2 &rarr; 4 &rarr; 2</code>
+          cycle succeed with <code>num_redundant_experts=0</code>, while
+          a cold <code>DP=4 &rarr; 2</code> scale-down from the same
+          <code>R=0</code> fails at the <code>num_redundant &ge; 0</code>
+          assertion?</li>
+      <li><b>Q2.</b> Does Phase&nbsp;3 (per-GPU containers) need <i>more</i>
+          redundancy than Phase&nbsp;1 (native)? Both validated cycles used
+          <code>R=128</code>; is there a mechanism difference?</li>
+    </ul>
+
+    <p>Both resolve to one observation about how EPLB sizes physical
+       experts across scale events.</p>
+
+    <h4>The per-GPU invariant</h4>
+
+    <p>The scale-down path in
+       <code>vllm/distributed/eplb/eplb_state.py:rearrange</code> (the
+       site patch 0001 guards) computes:</p>
+
+    <pre>num_physical_new = num_physical_old // old_ep_size * new_ep_size</pre>
+
+    <p>Which is equivalent to:</p>
+
+    <pre>per_gpu_new  =  num_physical_new / new_ep_size
+             =  (num_physical_old // old_ep_size * new_ep_size) / new_ep_size
+             =  num_physical_old / old_ep_size  =  per_gpu_old</pre>
+
+    <p>The formula <b>preserves per-GPU expert count</b> across scale
+       events. Scale-up applies the symmetric direction: new GPUs each
+       receive <code>per_gpu</code> expert slots, which EPLB populates
+       by replicating logical experts via load-aware bin packing
+       (uniformly at cold-start, when no load statistics have been
+       observed yet). The invariant is not a performance choice &mdash;
+       every downstream buffer in vLLM (<code>expert_weights</code>,
+       <code>physical_to_logical_map</code>,
+       <code>expert_load_window</code>, the shape assertions in
+       <code>rebalance_execute.py</code>) is sized against
+       <code>per_gpu</code>. Changing it mid-cycle is the five-point
+       cascade that
+       <a href="README.md">Exp&nbsp;B&rsquo;s Track&nbsp;1b</a> documents.</p>
+
+    <p>The invariant is concretely enforced by
+       <code>elastic_ep_execute.switch_and_prepare</code>, which runs
+       during every scale event. On scale-up it
+       <code>F.pad</code>s <code>expert_load_pass</code> and
+       <code>expert_load_window</code> from the old to the new
+       <code>num_local &times; ep_size</code>, and mutates
+       <code>parallel_config.eplb_config.num_redundant_experts</code>
+       in place so subsequent <code>rearrange()</code> calls see the
+       grown total. On scale-down it slices the same buffers down
+       symmetrically. The formula above lives inside
+       <code>rearrange()</code>; <code>switch_and_prepare</code> is what
+       makes the new <code>num_physical_experts</code> value visible to
+       the rest of the model state.</p>
+
+    <h4>Scenario A &mdash; cold DP=2 with R=0, full 2 &rarr; 4 &rarr; 2 cycle (Phase 1 native reference)</h4>
+
+    <table>
+      <thead>
+        <tr>
+          <th>State</th>
+          <th>num_log</th>
+          <th>num_redundant</th>
+          <th>num_phy</th>
+          <th>ep_size</th>
+          <th>per_gpu</th>
+          <th>Notes</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>cold DP=2</td>
+          <td>128</td>
+          <td>0</td>
+          <td>128</td>
+          <td>2</td>
+          <td>64</td>
+          <td>GPU 0 holds a 64-expert slice of the 128 logical set; GPU 1 holds the complement.</td>
+        </tr>
+        <tr>
+          <td>scale-up to DP=4</td>
+          <td>128</td>
+          <td><b>128</b></td>
+          <td><b>256</b></td>
+          <td>4</td>
+          <td>64</td>
+          <td><code>switch_and_prepare</code> sets
+              <code>num_physical = 64 &times; 4 = 256</code> and pads
+              per-rank buffers. <code>rearrange()</code> then populates
+              the 256 slots by bin-packing logical experts; each
+              surviving GPU still holds 64.</td>
+        </tr>
+        <tr>
+          <td>scale-down to DP=2</td>
+          <td>128</td>
+          <td>0</td>
+          <td>128</td>
+          <td>2</td>
+          <td>64</td>
+          <td>Formula: <code>256 // 4 &times; 2 = 128</code>. The 128 redundant copies
+              built by scale-up are consumed; back to the start state.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Scale-up <i>conjures</i> redundancy out of thin air to preserve
+       per_gpu; scale-down <i>consumes</i> exactly what scale-up built.
+       The cycle is symmetric and closes cleanly with no operator-supplied
+       redundancy. This is why Exp&nbsp;A3 Phase&nbsp;1 validates
+       2&nbsp;&rarr;&nbsp;4&nbsp;&rarr;&nbsp;2 at <code>R=0</code>.</p>
+
+    <h4>Scenario B &mdash; cold DP=4 with R=0, 4 &rarr; 2 (the failure)</h4>
+
+    <table>
+      <thead>
+        <tr>
+          <th>State</th>
+          <th>num_log</th>
+          <th>num_redundant</th>
+          <th>num_phy</th>
+          <th>ep_size</th>
+          <th>per_gpu</th>
+          <th>Notes</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>cold DP=4</td>
+          <td>128</td>
+          <td>0</td>
+          <td>128</td>
+          <td>4</td>
+          <td>32</td>
+          <td>Each GPU holds 32 of the 128 logical experts, one copy each.</td>
+        </tr>
+        <tr>
+          <td>attempted scale-down to DP=2</td>
+          <td>128</td>
+          <td><b>&minus;64</b></td>
+          <td>64</td>
+          <td>2</td>
+          <td>32</td>
+          <td>Formula: <code>128 // 4 &times; 2 = 64</code>. But
+              <code>num_redundant = num_phy &minus; num_log = 64 &minus; 128 = &minus;64</code>
+              &mdash; <code>assert num_redundant &ge; 0</code> fires in
+              <code>replicate_experts</code> (vLLM
+              <code>policy/default.py:93</code>).</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>There is no pre-built redundancy to consume. The formula produces
+       a value below <code>num_log</code> because per_gpu was already at
+       its minimum (1 copy per logical expert per GPU). The invariant
+       preservation policy is fundamentally at odds with the absence of
+       redundancy on a cold start above DP=num_log / per_gpu.</p>
+
+    <p><b>Counterfactual with grow-density.</b> If the formula were
+       instead
+       <code>max(num_logical, num_physical_old // old_ep &times; new_ep)</code>,
+       the attempted scale-down would compute
+       <code>max(128, 64) = 128</code> and each surviving GPU would grow
+       to hold 64 physical experts (double its previous 32). That
+       preserves the <code>num_phy &ge; num_log</code> invariant &mdash;
+       but breaks the per_gpu invariant that the rest of the reshuffle
+       pipeline relies on. Five buffer-sizing assumptions downstream
+       (<code>_map_{new,old}_expert_indices_with_rank_mapping</code>,
+       per-rank <code>expert_weights</code> allocation,
+       <code>physical_to_logical_map</code> shape, the load-window
+       indexing, and the slot-migration semantics in
+       <code>move_to_buffer</code>/<code>move_from_buffer</code>) all
+       assume <code>per_gpu</code> is constant across a scale. This is
+       the five-point cascade in Section&nbsp;6.3, which is why Track&nbsp;1b
+       is a multi-file refactor rather than a one-liner.</p>
+
+    <h4>Scenario C &mdash; cold DP=4 with R=128, 4 &rarr; 2 (validated Exp B cycle)</h4>
+
+    <table>
+      <thead>
+        <tr>
+          <th>State</th>
+          <th>num_log</th>
+          <th>num_redundant</th>
+          <th>num_phy</th>
+          <th>ep_size</th>
+          <th>per_gpu</th>
+          <th>Notes</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>cold DP=4, R=128</td>
+          <td>128</td>
+          <td>128</td>
+          <td>256</td>
+          <td>4</td>
+          <td>64</td>
+          <td>Operator pre-allocates 128 redundant slots at startup, so
+              each GPU holds 64 physical experts = 2 copies per logical
+              expert on average. Memory footprint doubles vs Scenario B
+              (~35.8&nbsp;GB vs 16.4&nbsp;GB per GPU).</td>
+        </tr>
+        <tr>
+          <td>scale-down to DP=2</td>
+          <td>128</td>
+          <td>0</td>
+          <td>128</td>
+          <td>2</td>
+          <td>64</td>
+          <td>Formula: <code>256 // 4 &times; 2 = 128</code>.
+              <code>num_redundant = 0 &ge; 0</code>, assertion passes. The
+              128 redundant copies placed at startup are consumed during
+              the scale-down.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>The post-scale-down state of Scenario&nbsp;C is structurally
+       identical to the final state of Scenario&nbsp;A. Different paths
+       to the same place: Scenario&nbsp;A lets scale-up build the
+       redundancy implicitly; Scenario&nbsp;C asks the operator to build
+       it up-front at cluster launch. Patch 0001&rsquo;s error message
+       exists to tell an operator on the failed Scenario&nbsp;B path
+       exactly how to convert their deployment into Scenario&nbsp;C.</p>
+
+    <h4>Side-by-side summary</h4>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Step</th>
+          <th>A: 2&rarr;4&rarr;2 (R=0)</th>
+          <th>B: cold 4&rarr;2 (R=0)</th>
+          <th>C: cold 4&rarr;2 (R=128)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Initial (num_phy, num_log, per_gpu)</td>
+          <td>128, 128, 64 &#64; DP=2</td>
+          <td>128, 128, 32 &#64; DP=4</td>
+          <td>256, 128, 64 &#64; DP=4</td>
+        </tr>
+        <tr>
+          <td>After scale-up (if any)</td>
+          <td>256, 128, 64 &#64; DP=4</td>
+          <td>&mdash;</td>
+          <td>&mdash;</td>
+        </tr>
+        <tr>
+          <td>After scale-down (num_phy, num_log, per_gpu)</td>
+          <td>128, 128, 64 &#64; DP=2 &#10003;</td>
+          <td><b>64, 128, 32</b> &#x2717; assertion fires</td>
+          <td>128, 128, 64 &#64; DP=2 &#10003;</td>
+        </tr>
+        <tr>
+          <td>Peak per-GPU expert memory</td>
+          <td>~16.4&nbsp;GB (@ DP=2) / ~16.4&nbsp;GB (@ DP=4)</td>
+          <td>~16.4&nbsp;GB (scale-down never completes)</td>
+          <td>~35.8&nbsp;GB (both DPs)</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>The asymmetry between cycling and cold-starting is visible at a
+       glance: Scenario&nbsp;A reaches per_gpu=64 by going through
+       DP=4&rsquo;s intermediate state (which implicitly requires memory
+       for 64 experts/GPU anyway); Scenario&nbsp;B tries to reach
+       per_gpu=32 at DP=2, which would require <i>shrinking</i>
+       num_phy below num_log, and that&rsquo;s the invariant violation.</p>
+
+    <h4>Answer to Q2: Phase 3 does not need more redundancy than Phase 1</h4>
+
+    <p>The EPLB formula is the same in Phase&nbsp;1 native and Phase&nbsp;3
+       per-GPU containers &mdash; it lives in vLLM core, not in any
+       container-specific code. Both validated elastic cycles use
+       <code>R=128</code> because both were run as <i>cold&nbsp;DP=4</i>
+       starts; if Phase&nbsp;3 were started at DP=2 first (which
+       patch&nbsp;0002 now makes possible as Config&nbsp;B), the Phase&nbsp;1
+       Scenario&nbsp;A behaviour would apply with no pre-allocated
+       redundancy needed. The redundancy requirement is a function of
+       the <i>starting DP</i>, not the containerisation regime.</p>
+
+    <p>Where Phase&nbsp;3 <i>does</i> interact with the redundancy choice
+       is memory budget: each container has exactly one GPU, so the
+       <code>R=128</code> load (~35.8&nbsp;GB per rank for
+       Qwen3-30B-A3B) must fit on that single GPU. On 40&nbsp;GB A100s
+       this works (documented in Section&nbsp;3.3). On smaller GPUs the
+       feasibility constraint would bite harder in Phase&nbsp;3 than in
+       Phase&nbsp;1 multi-GPU deployments, where the same redundancy
+       could be spread across several GPUs via TP; this is a memory-
+       budget concern, not an EPLB one.</p>
+
+    <p><b>Tie to Track 1b.</b> The precise reason Track&nbsp;1b is a
+       multi-file refactor rather than a one-line formula change is
+       exactly the per-GPU invariant demonstrated above: grow-density
+       scale-down breaks the invariant that every downstream buffer
+       sizing currently assumes (Section&nbsp;6.3 enumerates the five
+       sites). Any serious fix has to propagate the new per-GPU count
+       through all of them atomically.</p>
+
 
     <!-- ============================================================
          7. CONCLUSIONS
