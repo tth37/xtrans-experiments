@@ -1114,7 +1114,7 @@ ep-rank-3 DeviceIDs: ['3']</pre>
           <td><b>DP=2 initial</b> (cold-start baseline)</td>
           <td>77.9 tok/s</td>
           <td>65.5 tok/s</td>
-          <td><i>n/a</i> (see below)</td>
+          <td>68.53 tok/s<sup>&dagger;</sup></td>
         </tr>
         <tr>
           <td><b>DP=4</b> (post-scale-up for P1/P2, static for P3)</td>
@@ -1126,7 +1126,7 @@ ep-rank-3 DeviceIDs: ['3']</pre>
           <td><b>DP=2 post-scale-down</b></td>
           <td>69.0 tok/s</td>
           <td>65.5 tok/s</td>
-          <td><i>n/a</i></td>
+          <td>91.43 tok/s<sup>&dagger;</sup></td>
         </tr>
         <tr style="background:#f7f7f7;">
           <td><b>DP=4 overhead vs Phase 1</b></td>
@@ -1149,16 +1149,22 @@ ep-rank-3 DeviceIDs: ['3']</pre>
       </tbody>
     </table>
 
-    <p><i>Why DP=2 cells are n/a for Phase&nbsp;3:</i> the per-GPU container
-       topology has 4 Ray nodes (one GPU each). With
-       <code>--data-parallel-size-local 1</code>, Ray greedily creates one
-       placement group per available node, forcing DP = cluster size. Asking
-       for <code>--data-parallel-size 2</code> in a 4-node cluster triggers
+    <p><sup>&dagger;</sup> <i>Phase&nbsp;3 DP=2 cells were originally
+       &ldquo;n/a&rdquo; and have been populated by
+       <a href="../exp_b_per_gpu_elasticity/analysis_report.html">Exp&nbsp;B</a>
+       (2026-04-21) via patches 0001 + 0002 plus
+       <code>--eplb-config.num_redundant_experts=128</code>.</i> At the time
+       of this report&rsquo;s initial writing, both were blocked: the
+       per-GPU container topology has 4 Ray nodes (one GPU each); with
+       <code>--data-parallel-size-local 1</code>, Ray greedily created one
+       placement group per available node, so asking for
+       <code>--data-parallel-size 2</code> triggered
        <code>AssertionError: Created 4 DP placement groups, expected 2</code>
-       before model load. Reaching DP=2 from DP=4 via
-       <code>/scale_elastic_ep</code> is also blocked in this topology by
-       the EPLB <code>num_redundant&nbsp;&ge;&nbsp;0</code> bug (Section
-       5.6.4). Phase 3 therefore observes DP=4 static.</p>
+       before model load (fixed by Exp&nbsp;B patch 0002). Reaching DP=2
+       from DP=4 via <code>/scale_elastic_ep</code> hit the EPLB
+       <code>num_redundant&nbsp;&ge;&nbsp;0</code> bug (Section 5.6.4),
+       surfaced as an actionable error by Exp&nbsp;B patch 0001 and
+       unblocked by the redundancy-config redirect.</p>
 
     <p>Three readings of the same table:</p>
 
@@ -1175,13 +1181,21 @@ ep-rank-3 DeviceIDs: ['3']</pre>
           falls to <code>NET/Socket/0</code>. The compounding is visible in
           TTFT: 348&nbsp;ms native &rarr; 2431&nbsp;ms multi-GPU container
           &rarr; 3152&nbsp;ms per-GPU containers.</li>
-      <li><b>The missing cells are the story:</b> Phase 3&rsquo;s n/a entries
-          are not a measurement gap &mdash; they encode the observation that
-          vLLM&rsquo;s elastic-EP implementation does not straightforwardly
-          support dynamic rank counts in a per-GPU-container cluster under
-          current flags and EPLB defaults. This is part of what Section 4
-          of v5 proposes to address (lifecycle-driven scaling, EPLB
-          redundancy, placement audits).</li>
+      <li><b>The DP=2 cells for Phase&nbsp;3 are now populated, but
+          the story they tell has changed shape:</b> the original n/a
+          entries encoded the observation that vLLM&rsquo;s elastic-EP
+          implementation did not straightforwardly support dynamic rank
+          counts in a per-GPU-container cluster under the default flags
+          and EPLB defaults. <a href="../exp_b_per_gpu_elasticity/analysis_report.html">Exp&nbsp;B</a>
+          shows that two narrow patches plus a
+          <code>num_redundant_experts=128</code> deployment-time redirect
+          do unlock the cycle &mdash; 68.53&nbsp;tok/s cold DP=2 and
+          91.43&nbsp;tok/s post-scale-down DP=2 &mdash; at the cost of
+          doubling per-GPU expert memory. The remaining throughput gap
+          vs Phase&nbsp;2 / Phase&nbsp;1 is attributable to Phase&nbsp;3&rsquo;s
+          <code>NET/Socket/0</code> NCCL fallback (v5&nbsp;&sect;4.1 shim
+          track), not to the patches. A clean fix without the redundancy
+          tax remains open as Exp&nbsp;B&rsquo;s Track&nbsp;1b.</li>
     </ul>
 
 
