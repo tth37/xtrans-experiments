@@ -71,7 +71,57 @@ tmux new-session -d -s model-download \
 tail -f /tmp/qwen3-moe-download.log
 ```
 
-### 3. Start Serving with Elastic EP
+### 3. Reproduce end-to-end with the refactored scripts
+
+All three phases use the shared harness in `scripts/common.sh` (venv
+activation, `vllm bench serve` invocation, `/scale_elastic_ep` driver,
+`nvidia-smi` snapshots, container inspection). Each phase entry point
+shares a common subcommand surface.
+
+**Phase 1 (native, reference baseline):**
+```bash
+./scripts/phase1_native.sh start    # Ray head + vllm serve at DP=2
+./scripts/phase1_native.sh cycle    # bench DP=2 → scale 4 → bench DP=4
+                                    # → scale 2 → bench DP=2 (post)
+./scripts/phase1_native.sh stop
+```
+
+**Phase 2 (multi-GPU container):**
+```bash
+./scripts/phase2_container.sh start
+./scripts/phase2_container.sh cycle # same cycle, inside container
+./scripts/phase2_container.sh stop
+# state snapshots capture docker DeviceIDs -- the trap signature
+```
+
+**Phase 3 (per-GPU containers, static DP=4):**
+```bash
+./scripts/phase3_per_gpu.sh up      # bridge network + 4 containers +
+                                    # Ray cluster + vllm serve at DP=4
+./scripts/phase3_per_gpu.sh bench dp4 32 16
+./scripts/phase3_per_gpu.sh nccl-grep   # extract the NET/Socket/0 finding
+./scripts/phase3_per_gpu.sh down
+```
+
+All subcommands produce timestamped, progress-reporting output. The
+`wait_for_ready` helper aborts fast if the backing process dies and
+dumps diagnostics instead of polling to timeout. Results land in
+`results/<phase>/` (gitignored); each `bench_<label>.json` is a
+standard `vllm bench serve` output with TTFT/TPOT/ITL percentiles plus
+throughput. Hard prerequisite: all 4 GPUs free on the host; override
+with `ALLOW_BUSY_GPUS=1` at your own risk.
+
+**2026-04-21 re-run (refactored scripts):** all three phases produced
+results consistent with the original numbers in this README. Output
+throughput at DP=4 under `vllm bench serve --dataset-name random`:
+Phase&nbsp;1 ≈ 160&nbsp;tok/s, Phase&nbsp;2 ≈ 128&nbsp;tok/s,
+Phase&nbsp;3 ≈ 109&nbsp;tok/s — same ranking as original, absolute
+numbers slightly lower because the new bench uses a stricter
+random-prompt shape (input 128 / output 128) vs. the original ad-hoc
+benchmark. The qualitative findings (Phase 2 DeviceIDs trap, Phase 3
+NCCL TCP fallback) are identical.
+
+### Legacy direct invocation (for reference)
 
 ```bash
 # Resolve model path from HF cache
@@ -93,9 +143,6 @@ vllm serve "$MODEL" \
     --enforce-eager \
     --trust-remote-code \
     --port 8000
-
-# Or use the script:
-./scripts/phase1_native.sh serve
 ```
 
 ### 4. Trigger Live Rescaling
