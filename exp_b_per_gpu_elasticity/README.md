@@ -155,6 +155,100 @@ to handle the edge case; if no, deeper issue.
 the patched image in Phase 2 mode). Measure 503 window and timing;
 compare against the Phase 1 baseline of 4.1 s.
 
+#### Track 1 findings (2026-04-21, session 1)
+
+The `max(num_logical, ...)` candidate fix above was tried and **does not
+work end-to-end**. It clears the `num_redundant >= 0` assertion at
+`policy/default.py:93`, but immediately hits a second assertion:
+
+```
+rebalance_execute.py:592
+    assert old_global_expert_indices.shape[1] == new_global_expert_indices.shape[1]
+```
+
+Root cause: `_map_new_expert_indices_with_rank_mapping`
+([rebalance_execute.py:705](../3rdparty/vllm/vllm/distributed/eplb/rebalance_execute.py#L705))
+derives the output's expected old-layout shape from
+`new_num_physical_experts // new_ep_size` — i.e., the *new* per-GPU
+density is assumed to equal the *old* per-GPU density. The grow-density
+clamp breaks this invariant: for DP=4→2 with 128 logical experts and
+`num_redundant_experts=0`, new per-GPU = 64 while old per-GPU = 32, so
+the mapping reconstructs a bogus `old_total = 4 * 64 = 256` and the
+assertion fails.
+
+Making grow-density work end-to-end therefore requires cascading changes
+across at least five places:
+
+1. `_map_new_expert_indices_with_rank_mapping` + its sibling
+   `_map_old_expert_indices_with_rank_mapping` — take the actual old
+   shape as an explicit argument instead of re-deriving it.
+2. Per-GPU `expert_weights` allocation — on scale-down, surviving GPUs
+   must *grow* their expert slot count (32 → 64 for DP=4→2). Current
+   allocation is fixed at model load time.
+3. `physical_to_logical_map` per-rank shape — similarly sized at init
+   for `num_local_physical_experts = num_phy_old / ep_size_old`.
+4. `expert_load_window` — sized at total physical, indexed via
+   `num_valid_physical_experts`; probably fine but needs verification.
+5. `move_to_buffer` / `move_from_buffer` in rebalance_execute — the
+   slot-wise diff logic assumes slot index i on the new layout lives
+   on the same GPU as slot index i on the old layout. Growing density
+   means slots migrate across GPUs, so the transfer primitives would
+   need extended semantics.
+
+This is a multi-file vLLM refactor outside the sandbox's scope. A
+proper upstream fix would likely redesign the scale-down path to
+explicitly distinguish "redundancy-absorbing shrink" (current code) vs
+"density-growing shrink" (needed for `num_redundant_experts=0`).
+
+**What shipped instead (patch 0001):** a **refuse-with-error** check at
+the `eplb_state.rearrange` entry point that validates the precondition
+(`new_num_replicas >= num_logical_experts`) before running the broken
+formula. When the precondition fails, raise `ValueError` with an
+actionable message:
+
+```
+ValueError: Scale-down from ep_size=4 to 2 requires num_redundant_experts
+>= 128 (current: 0). Pass --eplb-config.num_redundant_experts=128 at vllm
+serve startup.
+```
+
+Validated in Phase 1 native DP=4 cold start + scale-down to DP=2: the
+cryptic `AssertionError` in a Ray worker is replaced by the ValueError
+above. The serving process still dies (same as before — proper
+rejection at the HTTP layer would require reaching into the
+`/scale_elastic_ep` handler on engine core before dispatching to
+workers, also deferred), but the failure is diagnosable and the
+operator knows what to do.
+
+**Math note for the error message.** For scale-down from DP=N to DP=M
+with the existing formula (new_num_phy = num_log × old_per_gpu / N × M)
+to yield `new_num_phy >= num_log`, the operator needs
+`num_redundant_experts >= num_log × (N − M) / M`. For N=4, M=2 with 128
+logical experts that's 128 redundant. The patch currently suggests
+`num_redundant_experts = num_logical_experts` as a conservative upper
+bound that satisfies all supported scale-down pairs, not the exact
+tight minimum.
+
+#### Track 1b — Grow-density scale-down for `num_redundant_experts=0`
+
+Open. Deferred until a later session with more budget. Would
+unblock the primary use case (scale-down on the default vLLM config).
+See the five-point cascade above for the scope of work. A sketch:
+
+- Patch `_map_{new,old}_expert_indices_with_rank_mapping` to accept the
+  actual `old_num_physical_experts` as a caller-provided parameter;
+  produce output sized to match the actual old shape, leaving the
+  "departing-rank" regions as -1 placeholders.
+- Extend per-rank `expert_weights` and `physical_to_logical_map`
+  buffers to hold `num_logical_experts / new_ep_size` slots after
+  scale-down (grow in place via new allocation + copy; tear down the
+  old allocation).
+- Walk through `move_to_buffer` / `move_from_buffer` to see whether
+  cross-GPU slot migration works out of the box or needs new logic.
+- Add a precondition check in `AsyncLLM.scale_elastic_ep` so the
+  `/scale_elastic_ep` HTTP handler returns 400 instead of letting the
+  ValueError take down the serving process.
+
 ### Track 2 — Fix placement-group count mismatch (site #1)
 
 Required for the per-GPU topology; addresses DP < Ray-cluster-size.
