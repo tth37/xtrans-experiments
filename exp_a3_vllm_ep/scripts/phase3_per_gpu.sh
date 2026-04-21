@@ -152,10 +152,12 @@ up() {
 
     # vllm serve inside ep-rank-0 -- background via bash -c so the exec
     # returns immediately; log file lives in the container at $SERVE_LOG_IN_CTN.
-    # Phase 3 starts at DP=4 directly (matches Ray cluster size). Elastic
-    # scaling via /scale_elastic_ep is known to brick the service in this
-    # topology (EPLB bug + cross-container teardown), so we don't cycle.
-    log "Launching vllm serve in ep-rank-0 at DP=4"
+    # Default is DP=4; override with PHASE3_DP=<N> to start at a smaller
+    # size (used by Exp B to isolate the placement-group patch). Extra
+    # serve flags (e.g. --eplb-config) can be passed via EXTRA_SERVE_ARGS.
+    local dp_size=${PHASE3_DP:-4}
+    local extra=${EXTRA_SERVE_ARGS:-}
+    log "Launching vllm serve in ep-rank-0 at DP=${dp_size} (extra=${extra:-none})"
     docker exec -d ep-rank-0 /bin/bash -c "
         export RAY_ADDRESS=ep-rank-0:${RAY_PORT}
         export VLLM_LOGGING_LEVEL=INFO
@@ -163,7 +165,7 @@ up() {
             --served-model-name ${SERVED_MODEL_NAME} \
             --host 0.0.0.0 --port ${VLLM_PORT} \
             --tensor-parallel-size 1 \
-            --data-parallel-size 4 \
+            --data-parallel-size ${dp_size} \
             --data-parallel-size-local 1 \
             --data-parallel-backend ray \
             --data-parallel-address ep-rank-0 \
@@ -176,6 +178,7 @@ up() {
             --gpu-memory-utilization 0.90 \
             --enforce-eager \
             --trust-remote-code \
+            ${extra} \
             > $SERVE_LOG_IN_CTN 2>&1
     "
 

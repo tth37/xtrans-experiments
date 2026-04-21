@@ -1,0 +1,41 @@
+# Exp B patch 0002: placement-group outer-loop early exit
+#
+# Against: vllm 0.19.0
+# Target file: vllm/v1/engine/utils.py
+#
+# Problem: RayDPClient.make_dp_placement_groups iterates all Ray nodes in
+# an outer loop and per-node allocates bundles into an inner loop. The
+# inner loop has a break at `if len(placement_groups) == dp_size: break`,
+# but that break only exits the inner loop -- the outer loop keeps
+# visiting subsequent nodes and creating extra placement groups. With
+# dp_size < len(nodes) (e.g. the Phase 3 per-GPU container setup:
+# dp_size=2 against a 4-Ray-node cluster), this overshoots and trips
+# `assert len(placement_groups) == dp_size` a few lines below with
+# "Created 4 DP placement groups, expected 2".
+#
+# Fix: add an outer-loop early exit once dp_size placement groups have
+# been created. Mirrors the same pattern already used by the scale-up
+# counterpart add_dp_placement_groups (num_pg_created >= num_pg_to_create
+# break), which this cold-start function simply forgot.
+#
+# Safety across pack_strategy branches:
+# - "strict" / "fill": each outer iteration synchronously emits pgs;
+#   no accumulated state to strand.
+# - "span": pgs are emitted only when collected_bundles == world_size,
+#   which resets collected_bundles = [] immediately. len(placement_groups)
+#   == dp_size can only be reached right after that reset, so the outer
+#   break never leaves a partial-bundle remainder behind.
+#
+# local_dp_ranks is appended in lockstep with placement_groups, so the
+# secondary assertion `len(local_dp_ranks) == dp_size` is unaffected.
+--- a/vllm/v1/engine/utils.py
++++ b/vllm/v1/engine/utils.py
+@@ -564,6 +564,8 @@
+                 local_dp_ranks.append(i)
+                 if len(placement_groups) == dp_size:
+                     break
++            if len(placement_groups) >= dp_size:
++                break
+
+         if len(placement_groups) < dp_size:
+             raise ValueError(
