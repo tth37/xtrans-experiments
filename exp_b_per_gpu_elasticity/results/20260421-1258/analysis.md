@@ -274,6 +274,112 @@ state after each transition and is not separately instrumented here.
 - `bench_dp4_post_scale_up_patched.json` — bench JSON at DP=4 after
   the scale-up leg (in `exp_a3_vllm_ep/results/phase3/`).
 
+## Addendum — primary cycle re-run as 2 → 4 → 2 (matching Exp A3 Phase 1)
+
+Re-ran the full cycle as **cold DP=2 → scale-up → scale-down**, matching
+Exp A3 Phase 1's 2 → 4 → 2 convention. This is the cleaner result because
+it validates the per-GPU container elastic cycle with
+`num_redundant_experts=0` — patch 0001's redirect is not on the critical
+path. Scale-up builds the redundancy that scale-down later consumes
+(Scenario A in §6.5 of the HTML report).
+
+Same image `xtrans-vllm-ep-patched:20260421-1258`, same harness, same
+Qwen3-30B-A3B. Only differences vs the earlier 4 → 2 → 4 run:
+`PHASE3_DP=2` (not 4), no `--eplb-config.num_redundant_experts=128`,
+`--gpu-memory-utilization 0.95` (passed via `EXTRA_SERVE_ARGS` — wins
+over the harness's hardcoded 0.90 via argparse last-wins).
+
+| Step | Timing | Outcome |
+|---|---|---|
+| Cold DP=2 startup (R=0) | 95 s | 2 GPUs loaded ~38.9 GB each, 2 GPUs idle (4 MiB) |
+| DP=2 initial bench | — | 62.21 tok/s output, 124.43 tok/s total, mean TTFT 1689 ms |
+| `POST /scale_elastic_ep {new_dp: 4}` | **49.93 s** | HTTP 200; all 4 GPUs loaded ~39 GB each |
+| DP=4 post-scale-up bench | — | 114.68 tok/s output, 229.36 tok/s total, mean TTFT 2263 ms |
+| `POST /scale_elastic_ep {new_dp: 2}` | **12.92 s** | HTTP 200; GPUs 2, 3 → 4 MiB |
+| DP=2 post-scale-down bench | — | 67.53 tok/s output, 135.07 tok/s total, mean TTFT 619 ms |
+
+**Scale-event timeline** (from `vllm-serve-242.log`):
+
+```
+14:32:05  POST /scale_elastic_ep {new_dp: 4}         (curl start, +0)
+14:32:30  [Elastic EP] Created standby communication groups
+14:32:55  [Elastic EP] Scale up completed, new DP size: 4  (+49.93 s, HTTP 200)
+14:32:55  [Elastic EP] Starting expert resharding...
+14:33:19  [Elastic EP] EPLB reshuffle completed      (post-switch reshuffle, +24 s)
+# DP=4 bench window
+14:33:59  DPCoordinator scaled down from 4 to 2 engines
+14:33:59  [Elastic EP] Starting expert resharding...
+14:34:09  [Elastic EP] EPLB reshuffle completed      (+10 s, pre-switch)
+14:34:10  [Elastic EP] Created standby communication groups
+14:34:12  [Elastic EP] Scale down completed, new DP size: 2  (+12.92 s, HTTP 200)
+14:34:12  [Elastic EP] Switched to new setup
+```
+
+**Post-scale-down host state:**
+
+```
+GPU 0: 39075 MiB, GPU 1: 39075 MiB  (loaded, serving at DP=2)
+GPU 2:     4 MiB, GPU 3:     4 MiB  (fully released)
+
+docker ps:
+  ep-rank-3  Up 6 minutes
+  ep-rank-2  Up 6 minutes
+  ep-rank-1  Up 6 minutes
+  ep-rank-0  Up 7 minutes
+
+vllm PID counts:
+  ep-rank-0: 4  (API server + Ray head + engine + worker)
+  ep-rank-1: 2  (engine + worker)
+  ep-rank-2: 0  (idle, container running)
+  ep-rank-3: 0  (idle, container running)
+```
+
+### Observations
+
+- **No `num_redundant_experts` set at startup.** The `R=0` cycle works
+  end-to-end thanks to scale-up building up the redundancy internally
+  (per the §6.5 mechanism in the HTML report).
+- **Surviving ranks are {0, 1}** in this run, whereas the earlier
+  4 → 2 → 4 run landed on {0, 3}. The rank-to-container mapping
+  continues to be non-deterministic across runs; only the invariant "2
+  of 4 GPUs released" is guaranteed.
+- **Scale-up is slower than scale-down** (49.93 s vs 12.92 s) — the
+  ~28 GB of non-expert weights streamed over Socket NCCL dominates
+  scale-up, while scale-down only needs to drop expert replicas.
+  Matches Phase 1 native's directional asymmetry (native: ~25 s up
+  vs 4 s down) scaled up by the NCCL Socket penalty.
+- **DP=2 post-scale-down throughput (67.53) is slightly above DP=2
+  initial (62.21)** — warmup effect from the DP=4 bench running
+  between the two measurements, consistent with the earlier observation
+  that TTFT drops ~3× after the cluster has seen traffic.
+- **DP=4 at 114.68 tok/s is 89.7% of the Phase 3 unpatched baseline
+  (127.8 tok/s with R=0, per_gpu=32).** The ~10% shortfall is because
+  post-scale-up DP=4 has R=128 / per_gpu=64 (built up by scale-up),
+  matching the penalty we measured for cold DP=4 with R=128 earlier.
+  This is a direct consequence of the per-GPU invariant in §6.5 —
+  scale-up preserves per_gpu at 64, doubling physical experts.
+
+### Artefacts
+
+- `vllm-serve-242.log` — full serve log across the 2 → 4 → 2 cycle.
+- `scale_events_242.log` — extracted event timeline above.
+- `nvidia_smi_post_down_242.txt`, `docker_ps_post_down_242.txt`,
+  `container_processes_post_down_242.txt` — post-scale-down state.
+- `bench_dp2_initial_242.json`, `bench_dp4_post_up_242.json`,
+  `bench_dp2_post_down_242.json` — bench JSONs (under
+  `exp_a3_vllm_ep/results/phase3/`).
+
+### Relationship to the earlier 4 → 2 → 4 run
+
+Both cycles succeed end-to-end on the same patched image. The 4 → 2 → 4
+run (same file, earlier section) validated patch 0001's redundancy
+redirect as a usable operator-facing workaround for deployments that
+must cold-start above their minimum DP. The 2 → 4 → 2 run validates
+that patch 0002 alone — plus Phase 1's native scaling pattern — is
+enough for per-GPU container elasticity when the deployment can start
+small. Both paths are real; the 2 → 4 → 2 is what Exp A3 Phase 1
+demonstrated, and is now the primary reference in the HTML report.
+
 ## What remains (not done this session)
 
 - **Track 1b** (grow-density scale-down for `num_redundant_experts=0`).
