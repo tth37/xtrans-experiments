@@ -1,13 +1,20 @@
 # Exp B: Enabling Per-GPU Container Elastic Scaling
 
 **Status:** Headline success criterion met (2026-04-21) via patches
-0001 + 0002 plus a `--eplb-config.num_redundant_experts=128`
-deployment-time redirect. Full Phase 3 elastic cycle DP=4 → DP=2
-succeeds end-to-end: HTTP 200 in 13.89 s, 2 of 4 GPUs fully released
-(4 MiB) at the container-scoped GPU-allocation level while the other
-2 keep serving. Track 1b (grow-density for `num_redundant_experts=0`)
-and Track 3 (external container lifecycle coordinator) remain open.
-See `results/20260421-1258/analysis.md` for the full validation.
+0001 + 0002. Full Phase 3 elastic cycle DP=2 → 4 → 2 succeeds
+end-to-end with `num_redundant_experts=0`, matching Exp A3 Phase 1
+native's convention: scale-up 49.93 s, scale-down 12.92 s, DP=2
+throughput cycles 62.21 → 114.68 (@DP=4) → 67.53 tok/s. 2 of 4 GPUs
+fully released (4 MiB) at the container-scoped GPU-allocation level
+post-scale-down; all 4 containers remain `Up`. Patch 0001's
+`--eplb-config.num_redundant_experts` redirect is an alternate path
+(separately validated, see lab notebook) for deployments that must
+cold-start above their minimum DP. Track 1b (grow-density for cold-
+DP=N with `R=0`) and Track 3 (external container lifecycle
+coordinator) remain open. See
+`results/20260421-1258/analysis.md` for the full lab-notebook
+record and `analysis_report.html` for the research-narrative
+writeup.
 **Research plan:** `../docs/research_plan_v5.html`
 **Prerequisite experiment:** `../exp_a3_vllm_ep/` (Phases 1–3 complete;
 this experiment builds directly on Phase 3's per-GPU container setup).
@@ -352,33 +359,35 @@ per-GPU container cluster**. Specifically:
 
 ### Status (2026-04-21)
 
-**Met for the scale-down half of the cycle**, with the combined
-patches 0001 + 0002 and the
-`--eplb-config.num_redundant_experts=128` redirect that patch 0001's
-error message recommends. Measured Phase 3 numbers, full write-up in
-[`results/20260421-1258/analysis.md`](results/20260421-1258/analysis.md):
+**Met end-to-end for the primary 2 → 4 → 2 cycle** with patches 0001 +
+0002 and `num_redundant_experts=0`, matching Exp A3 Phase 1 native's
+convention. Measured Phase 3 numbers, full write-up in
+[`results/20260421-1258/analysis.md`](results/20260421-1258/analysis.md)
+and in [`analysis_report.html`](analysis_report.html):
 
 | Step | Outcome |
 |---|---|
-| Cold DP=4 startup (redundancy=128) | 101 s ready, 4 GPUs loaded ~36 GB each |
-| `POST /scale_elastic_ep {new_dp: 2}` | HTTP 200 in 13.89 s |
-| Host GPU post-scale | 2 GPUs fully released to 4 MiB, other 2 still serving |
-| `docker ps` post-scale | all 4 containers still `Up` |
-| DP=2 post-scale bench | 91.43 tok/s output (warmed) |
-| DP=4 pre-scale bench | 119.65 tok/s output (−6.4% vs Phase 3 baseline) |
+| Cold DP=2 startup (R=0) | 95 s ready, 2 GPUs loaded ~38.9 GB, 2 idle |
+| DP=2 initial bench | 62.21 tok/s output (1689 ms mean TTFT) |
+| `POST /scale_elastic_ep {new_dp: 4}` | HTTP 200 in 49.93 s |
+| DP=4 post-scale-up bench | 114.68 tok/s output (89.7% of Phase 3 unpatched baseline) |
+| `POST /scale_elastic_ep {new_dp: 2}` | HTTP 200 in 12.92 s |
+| Host GPU post-scale-down | 2 GPUs fully released to 4 MiB, other 2 still serving |
+| `docker ps` post-scale-down | all 4 containers still `Up` |
+| DP=2 post-scale-down bench | 67.53 tok/s output (619 ms mean TTFT, warmed) |
 | NCCL transport | `NET/Socket/0` (unchanged, orthogonal v5 §4.1 track) |
 
-Criterion (3) — scale-up 2 → 4 — not retested in this run. Phase 1
-native already validates the scale-up path works under vLLM 0.19.0;
-Phase 3 scale-up should also work given that (a) the Track 2 patch is
-compatible with `add_dp_placement_groups` (which already had its
-outer-loop break), and (b) no scale-up-specific new bug is known.
-Formal end-to-end verification is deferred.
+Criterion (4) repeatability — not formally retested across multiple
+consecutive cycles, but the post-scale-down state
+(`is_scaling_elastic_ep: false`, service healthy) is the same terminal
+state as Phase 1's repeated 2-4-2 cycle consumes, so no structural
+reason it shouldn't repeat.
 
-Criterion (4) repeatability — also not formally retested, but the
-post-scale-down state (`is_scaling_elastic_ep: false`, service
-healthy) is the same terminal state as Phase 1's repeated 2-4-2 cycle
-consumes, so no structural reason it shouldn't repeat.
+An alternate deployment path (cold DP=4 + `--eplb-config.num_redundant_experts=128`
++ scale-down) was separately validated in the lab notebook for
+operators that cannot cold-start at their minimum DP. That path
+exercises patch 0001's redirect end-to-end; see `§6.4` of the
+analysis report.
 
 **Stretch results:**
 - Coordinator-driven container lifecycle (Track 3): scale-down also
