@@ -1,0 +1,1348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>vLLM Elastic Expert Parallelism &mdash; Mechanism Deep Dive</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: "Times New Roman", "Nimbus Roman", Times, serif;
+      background: #fff;
+      color: #111;
+      line-height: 1.6;
+    }
+    main {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 40px 32px 60px;
+    }
+    h1 {
+      font-size: 22px;
+      text-align: center;
+      margin: 0 0 4px;
+      line-height: 1.3;
+    }
+    .subtitle {
+      text-align: center;
+      font-size: 14px;
+      color: #444;
+      margin: 0 0 24px;
+    }
+    h2 {
+      font-size: 17px;
+      border-bottom: 1px solid #999;
+      padding-bottom: 4px;
+      margin: 28px 0 12px;
+    }
+    h3 {
+      font-size: 15px;
+      margin: 20px 0 8px;
+    }
+    h4 {
+      font-size: 14px;
+      margin: 16px 0 6px;
+    }
+    p, li {
+      font-size: 14px;
+      margin: 0 0 10px;
+    }
+    ul, ol {
+      padding-left: 24px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      margin: 12px 0;
+    }
+    th, td {
+      border: 1px solid #bbb;
+      padding: 5px 7px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #f0f0f0;
+      font-weight: bold;
+    }
+    td {
+      font-variant-numeric: tabular-nums;
+    }
+    code {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 13px;
+      background: #f5f5f5;
+      padding: 1px 4px;
+    }
+    pre {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 12px;
+      background: #f8f8f8;
+      border: 1px solid #ddd;
+      padding: 12px 16px;
+      margin: 12px 0;
+      overflow-x: auto;
+      line-height: 1.5;
+    }
+    .highlight-box {
+      background: #e8f5e9;
+      border: 2px solid #2e7d32;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .highlight-box p { margin: 0; }
+    .warning-box {
+      background: #fff3e0;
+      border: 2px solid #e65100;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .warning-box p { margin: 0; }
+    .info-box {
+      background: #e3f2fd;
+      border: 2px solid #1565c0;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .info-box p { margin: 0; }
+    .src {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 12px;
+      color: #555;
+    }
+  </style>
+</head>
+<body>
+  <main>
+
+    <h1>vLLM Elastic Expert Parallelism<br>Under-the-Hood Mechanism Deep Dive</h1>
+    <p class="subtitle">
+      Companion to <code>analysis_report.html</code> &middot;
+      Source-grounded walk-through of <code>enable_elastic_ep</code>
+      in vLLM v0.19 &middot;
+      Generated 2026-04-20
+    </p>
+
+    <div class="info-box">
+      <p><b>Scope.</b> The analysis report&rsquo;s Section 6 explains <i>what
+         techniques</i> vLLM uses at a conceptual level. This document goes one
+         layer deeper &mdash; to the actual classes, methods, enums, and formulas
+         in <code>3rdparty/vllm/vllm/</code>. Every non-obvious claim cites a
+         file and line. The goal is to make the v5 exploration fields (&sect;4.1
+         shim, &sect;4.2 container-lifecycle coordination, &sect;4.3 hidden
+         assumption audit, &sect;4.4 EPLB cold-start bug, &sect;4.5 weight
+         transport) concrete enough to act on without re-reading the vLLM
+         source.</p>
+    </div>
+
+
+    <!-- ============================================================ -->
+    <!-- 1. ARCHITECTURE MAP                                          -->
+    <!-- ============================================================ -->
+
+    <h2>1. Architecture Map of an Elastic Scale Event</h2>
+
+    <p>An elastic scale event is a distributed protocol with six cooperating
+       subsystems. Understanding the names, roles, and boundaries up front
+       makes the later sections easier to follow.</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Subsystem</th>
+          <th>Canonical file</th>
+          <th>Role during a scale event</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>StatelessGroupCoordinator</code></td>
+          <td><code>distributed/stateless_coordinator.py</code></td>
+          <td>Replaces <code>torch.distributed._world</code>. Holds the three
+              transport channels (NCCL / Gloo / TCP-store) for a single group.
+              Survives scale events as <i>an instance per group</i>; the old
+              instance is destroyed and a new instance takes its place.</td>
+        </tr>
+        <tr>
+          <td><code>ElasticEPScalingState</code></td>
+          <td><code>distributed/elastic_ep/elastic_state.py</code></td>
+          <td>Per-engine state machine driving each rank through the scale
+              event. Four flavours (see &sect;3) depending on whether the rank
+              is existing/new and the event is up/down.</td>
+        </tr>
+        <tr>
+          <td><code>ElasticEPScalingExecutor</code></td>
+          <td><code>distributed/elastic_ep/elastic_execute.py</code></td>
+          <td>Concrete operations invoked by the state machine: creating standby
+              groups, transferring weights, swapping MoE configs, expanding
+              EPLB state.</td>
+        </tr>
+        <tr>
+          <td>Standby group registry</td>
+          <td><code>distributed/elastic_ep/standby_state.py</code></td>
+          <td>Process-global slots (<code>_STANDBY_WORLD</code>,
+              <code>_STANDBY_DP</code>, <code>_STANDBY_EP</code>,
+              <code>_STANDBY_EPLB</code>) that hold the not-yet-active group
+              coordinators until the atomic switch.</td>
+        </tr>
+        <tr>
+          <td>Weight transfer engine</td>
+          <td><code>distributed/weight_transfer/</code></td>
+          <td>Pluggable backend (NCCL broadcast or CUDA IPC) that streams
+              non-expert model parameters from old ranks to new ranks during
+              scale-up.</td>
+        </tr>
+        <tr>
+          <td>EPLB state / rebalance</td>
+          <td><code>distributed/eplb/</code></td>
+          <td>Tracks logical-vs-physical expert mapping, accumulates expert
+              load counters, and re-solves placement when topology changes
+              (see &sect;6).</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Two client-facing entry points drive all of this from outside the
+       engine:</p>
+
+    <ul>
+      <li><code>POST /scale_elastic_ep {"new_data_parallel_size": N}</code>
+          &rarr; HTTP handler in
+          <code>entrypoints/serve/elastic_ep/api_router.py</code>.</li>
+      <li><code>AsyncLLM._scale_up_elastic_ep()</code> / <code>_scale_down_elastic_ep()</code>
+          in <code>v1/engine/core_client.py</code> (lines 1542&ndash;1695).
+          These send <code>ReconfigureDistributedRequest</code> messages to
+          every engine, spawn / retire Ray actors as needed, then await a
+          barrier on the stateless coordinator.</li>
+    </ul>
+
+
+    <!-- ============================================================ -->
+    <!-- 2. STATELESS GROUP COORDINATOR                               -->
+    <!-- ============================================================ -->
+
+    <h2>2. Stateless Group Coordinator &mdash; the TCP-Store-Backed Group</h2>
+
+    <p>The foundation that makes every other piece possible. Classical PyTorch
+       process groups are registered in a global
+       <code>torch.distributed._world._world</code> and identified by an
+       opaque <code>ProcessGroup</code> pointer; destroying and recreating one
+       invalidates ranks that held references to it. vLLM&rsquo;s
+       <code>StatelessGroupCoordinator</code> replaces this with a
+       self-contained object whose lifetime can be managed per-scale-event.</p>
+
+    <h3>2.1 Structure of a single coordinator</h3>
+
+    <p>A <code>StatelessGroupCoordinator</code> instance
+       (<span class="src">stateless_coordinator.py:61&ndash;194</span>)
+       owns three independent process-group abstractions over the same set of
+       ranks:</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Channel</th><th>Backend</th><th>Used for</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>device_group</code></td>
+          <td>NCCL</td>
+          <td>GPU collectives &mdash; weight-transfer broadcast, all-reduce
+              for sync, any MoE collective that runs on this group.</td>
+        </tr>
+        <tr>
+          <td><code>cpu_group</code></td>
+          <td>Gloo</td>
+          <td>CPU-side host collectives (metadata, barriers that must not
+              block on CUDA streams).</td>
+        </tr>
+        <tr>
+          <td><code>tcp_store_group</code></td>
+          <td>PyTorch <code>c10d::TCPStore</code></td>
+          <td>Keyed object exchange, barriers, broadcast of small
+              Python objects. Wraps <code>StatelessProcessGroup</code>
+              (<span class="src">distributed/utils.py:167&ndash;194</span>).</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>All three channels use three <i>independent</i> TCP ports
+       (<code>_PORTS_FMT = "!3I"</code>,
+       <span class="src">stateless_coordinator.py:28</span>) that rank&nbsp;0
+       binds locally and publishes into the shared
+       <code>coord_store</code> (a <i>parent</i> TCPStore that every rank
+       already knows how to reach via
+       <code>data_parallel_master_ip:coord_store_port</code>). Non-zero ranks
+       block on <code>_fetch_group_ports()</code>
+       (<span class="src">stateless_coordinator.py:112</span>) until rank 0
+       publishes. This is why the coordinator scheme extends across machines:
+       every rank only needs <i>one</i> globally-known TCP endpoint (the
+       coord store) to bootstrap every group it will ever join.</p>
+
+    <h3>2.2 Public operations</h3>
+
+    <p>The coordinator exposes roughly the same API as a PyTorch
+       <code>ProcessGroup</code> (<span class="src">stateless_coordinator.py:195&ndash;366</span>):
+       <code>size()</code>, <code>broadcast()</code>,
+       <code>broadcast_object_list()</code>, <code>broadcast_tensor_dict()</code>,
+       <code>send_object()</code>/<code>recv_object()</code>,
+       <code>send_tensor_dict()</code>/<code>recv_tensor_dict()</code>,
+       <code>barrier()</code>, <code>gather()</code>. Tensor-dict transfer
+       is hybrid: metadata travels over the TCP-store (cheap, no CUDA
+       dependency) while tensor payloads route through
+       <code>device_communicator</code> / <code>cpu_group</code>.</p>
+
+    <h3>2.3 Why this matters</h3>
+
+    <ul>
+      <li><b>Creation is rank-local.</b> Any subset of the world can form a new
+          group as long as each member can talk to the coord store &mdash; no
+          &ldquo;the launcher must restart&rdquo; barrier. This is what makes
+          both scale-up (new ranks join) and scale-down (departing ranks leave)
+          possible in-place.</li>
+      <li><b>Destruction is local too.</b> The old group is torn down on an
+          all-ranks barrier at
+          <span class="src">elastic_state.py:510</span> via
+          <code>stateless_destroy_torch_distributed_process_group(old_dp_group)</code>,
+          not by removing a global registry entry. Other groups
+          (EPLB, EP, WORLD) are unaffected.</li>
+      <li><b>Coexistence is free.</b> Two coordinators can live on the same
+          ranks simultaneously, because their membership is held by the
+          coordinator object itself, not by a singleton. This is the basis
+          of standby groups (&sect;4).</li>
+    </ul>
+
+
+    <!-- ============================================================ -->
+    <!-- 3. SCALING STATE MACHINE                                     -->
+    <!-- ============================================================ -->
+
+    <h2>3. The Scaling State Machine (per engine)</h2>
+
+    <p><code>elastic_state.py</code> defines <i>four</i> separate
+       IntEnum state machines, one per role a rank can play during a scale
+       event. A rank picks exactly one on entry and walks it to completion.
+       The state enum names below are verbatim from the source.</p>
+
+    <h3>3.1 The four role state-machines</h3>
+
+    <h4>3.1.1 Scale-up, existing engine
+        (<code>ScaleUpExistingEngineState</code>,
+        <span class="src">elastic_state.py:33&ndash;42</span>)</h4>
+<pre>
+0  WAIT_NEW_CORE_ENGINES_INIT        wait for new Ray actors to come online
+1  CREATE_STANDBY_GROUPS             allocate new NCCL groups next to active
+2  TRANSFER_EXPERT_MAPPING           broadcast physical-to-logical map to newcomers
+3  WAIT_NEW_CORE_ENGINES_WEIGHTS_INIT wait for new ranks' weight buffers ready
+4  TRANSFER_WEIGHTS                  P2P send non-expert weights (batch_isend_irecv)
+5  SYNC_KV_CACHE_MEMORY_SIZE         max-reduce of per-rank KV reservation
+6  SWITCH_AND_PREPARE                atomic group swap; rebuild MoE configs
+7  EPLB_RESHUFFLE                    rearrange experts on the new topology
+8  COMPLETE                          terminal
+</pre>
+
+    <h4>3.1.2 Scale-up, new engine
+        (<code>ScaleUpNewEngineState</code>,
+        <span class="src">elastic_state.py:45&ndash;49</span>)</h4>
+<pre>
+0  PRE_KV_INIT        receive expert map + weights; init KV cache slot
+1  PREPARE            participate in all_reduce to sync engine state
+2  EPLB_RESHUFFLE     reshuffle with the rest of the cluster
+3  COMPLETE           terminal
+</pre>
+
+    <h4>3.1.3 Scale-down, remaining engine
+        (<code>ScaleDownRemainingEngineState</code>,
+        <span class="src">elastic_state.py:52&ndash;56</span>)</h4>
+<pre>
+0  PREPARE            increment barrier; confirm all survivors present
+1  EPLB_RESHUFFLE     reshuffle experts including those inherited from leavers
+2  SWITCH_AND_PREPARE create standby (smaller) group and atomically swap
+3  COMPLETE           terminal
+</pre>
+
+    <h4>3.1.4 Scale-down, removing engine
+        (<code>ScaleDownRemovingEngineState</code>,
+        <span class="src">elastic_state.py:59&ndash;62</span>)</h4>
+<pre>
+0  PREPARE            join the staged barrier so survivors know we are done
+1  EPLB_RESHUFFLE     emit expert weights for the remaining ranks to inherit
+2  COMPLETE           exit cleanly (Ray actor will be reclaimed)
+</pre>
+
+    <h3>3.2 The two-stage barrier</h3>
+
+    <p>Transitions between these states are gated by a custom barrier
+       (<code>_staged_barrier</code>,
+       <span class="src">elastic_state.py:182&ndash;225</span>) rather than
+       <code>torch.distributed.barrier()</code>:</p>
+
+    <ol>
+      <li><b>Stage 1 (TCP-store).</b> Each rank writes a per-state arrival key
+          to <code>dp_store</code>, then polls for peers&rsquo; keys with a
+          5&nbsp;s timeout
+          (<span class="src">elastic_state.py:152&ndash;225</span>). A rank
+          that times out yields the state and re-enters next iteration &mdash;
+          the engine loop is not allowed to deadlock on a reconfiguration.</li>
+      <li><b>Stage 2 (NCCL).</b> Once all ranks have registered on the store,
+          a standard <code>torch.distributed.barrier(group=dp_group)</code>
+          forces GPU-side synchronisation
+          (<span class="src">elastic_state.py:215</span>).</li>
+    </ol>
+
+    <p>Stage 1 exists because during a scale event some engines may still be
+       draining a forward pass while others have already reached the barrier;
+       the two-stage design lets everyone queue on the cheap TCP store and
+       only enter the GPU barrier when all participants are ready.</p>
+
+    <h3>3.3 Atomic switch, in code</h3>
+
+    <p>The handoff the analysis-report calls &ldquo;atomic switch&rdquo;
+       consists of these statements executed in order on every rank
+       (<span class="src">elastic_state.py:505&ndash;535</span>):</p>
+
+<pre>
+# 1. Tear down the old group (collective)
+stateless_destroy_torch_distributed_process_group(old_dp_group)
+
+# 2. Adopt the new group as the active one
+self.engine_core.dp_group        = new_dp_group
+self.engine_core.dp_rank         = new_dp_rank
+self.engine_core.dp_store        = new_dp_store
+
+# 3. Agree with peers on shared engine scalars
+tensor = torch.tensor(
+    [engines_running, current_wave, step_counter],
+    dtype=torch.int32, device="cpu")
+torch.distributed.all_reduce(
+    tensor, op=torch.distributed.ReduceOp.MAX, group=new_dp_group)
+
+# 4. Rank 0 signals the client side
+_eep_send_engine_core_notification(
+    EEPNotificationType.RECONFIGURE_FINISHED)
+</pre>
+
+    <p>Step&nbsp;1 is the collective that must succeed on every old-group
+       member &mdash; a departing container that died early would deadlock
+       surviving ranks here. This is exactly the &ldquo;container as actor
+       exit&rdquo; question raised in v5 &sect;4.2.</p>
+
+
+    <!-- ============================================================ -->
+    <!-- 4. STANDBY GROUPS                                            -->
+    <!-- ============================================================ -->
+
+    <h2>4. Standby Groups &mdash; How Two Communicators Share a GPU</h2>
+
+    <p>A standby group is a <code>StatelessGroupCoordinator</code> created
+       <i>while the active group is still serving</i>. It lives in four
+       module-level slots
+       (<span class="src">standby_state.py:14&ndash;18</span>):</p>
+
+<pre>
+_STANDBY_WORLD: StatelessGroupCoordinator | None = None
+_STANDBY_DP:    StatelessGroupCoordinator | None = None
+_STANDBY_EP:    StatelessGroupCoordinator | None = None
+_STANDBY_EPLB:  StatelessGroupCoordinator | None = None
+</pre>
+
+    <p><code>create_standby_groups()</code>
+       (<span class="src">standby_state.py:37&ndash;100</span>) is called from
+       <code>ElasticEPScalingExecutor.create_standby_groups()</code>
+       (<span class="src">elastic_execute.py:175&ndash;197</span>) during the
+       <code>CREATE_STANDBY_GROUPS</code> state. It:</p>
+
+    <ol>
+      <li>Re-uses the cached parent coord store
+          (<code>get_cached_tcp_store_client(master_ip, coord_store_port)</code>,
+          <span class="src">standby_state.py:59</span>) so the standby groups
+          share a name-space with the active ones.</li>
+      <li>Computes the new membership tensors for WORLD, DP, EP, EPLB using
+          an all-ranks reshape
+          (<span class="src">standby_state.py:75&ndash;99</span>):
+<pre>
+all_ranks = torch.arange(new_world_size_across_dp).reshape(
+    -1, new_dp_size, pp_size, tp_size)
+standby_dp_ranks = (all_ranks
+                    .transpose(1, 3)
+                    .reshape(-1, new_dp_size)
+                    .unbind(0))
+</pre></li>
+      <li>Instantiates a new <code>StatelessGroupCoordinator</code> per group.
+          Each call negotiates three <i>fresh</i> TCP ports under keys like
+          <code>"world_0"</code>, <code>"dp_0"</code>, <code>"ep_0"</code> on
+          the shared coord store.</li>
+    </ol>
+
+    <p><b>Coexistence constraints observed in the code:</b></p>
+
+    <ul>
+      <li>Both groups target the same
+          <code>torch.device(f"cuda:{local_rank}")</code>
+          (<span class="src">stateless_coordinator.py:155</span>). Two
+          <code>ncclComm_t</code> handles exist per GPU during the window.</li>
+      <li>No communicator pooling &mdash; each coordinator&rsquo;s
+          <code>device_communicator</code> manages its own NCCL send/recv
+          buffers. Peak device memory during the transition is therefore
+          higher than either endpoint configuration. The code does not
+          explicitly account for this; in practice it works because NCCL
+          communicator state is tens of MB per GPU.</li>
+      <li>Kernels are serialised per CUDA stream, so old-group collectives
+          cannot truly run concurrently with standby-group collectives on the
+          same GPU. The overlap claimed in analysis-report &sect;6.1
+          materialises as async queueing, not parallelism.</li>
+    </ul>
+
+    <p><code>pop_standby_groups()</code>
+       (<span class="src">standby_state.py:102&ndash;123</span>) is the
+       &ldquo;commit&rdquo; operation &mdash; it returns the four standby
+       coordinators and clears the module-level slots in one shot. The caller
+       (<code>switch_and_prepare()</code>,
+       <span class="src">elastic_execute.py:290</span>) feeds the result to
+       <code>_replace_active_groups()</code>
+       (<span class="src">parallel_state.py:1205&ndash;1212</span>), which
+       rebinds the global <code>_WORLD</code>, <code>_DP</code>,
+       <code>_EP</code>, <code>_EPLB</code> symbols in a single critical
+       section.</p>
+
+
+    <!-- ============================================================ -->
+    <!-- 5. WEIGHT TRANSFER                                           -->
+    <!-- ============================================================ -->
+
+    <h2>5. Weight Transfer Subsystem</h2>
+
+    <p>Populating new ranks with model weights is the largest data movement
+       in a scale-up event. vLLM&rsquo;s weight-transfer subsystem is a
+       standalone, pluggable library
+       (<code>distributed/weight_transfer/</code>) that the elastic path uses
+       but that also has independent consumers (RLHF, training).</p>
+
+    <h3>5.1 Backend registry</h3>
+
+    <p>The factory registers two backends
+       (<span class="src">weight_transfer/factory.py:112&ndash;122</span>):</p>
+
+    <table>
+      <thead>
+        <tr><th>Name</th><th>Class</th><th>Transport</th><th>Elastic EP uses it?</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>nccl</code></td>
+          <td><code>NCCLWeightTransferEngine</code>
+              (<span class="src">nccl_engine.py:97</span>)</td>
+          <td><code>ncclBroadcast</code> over a fresh
+              <code>PyNcclCommunicator</code></td>
+          <td>Yes (in-cluster scale-up)</td>
+        </tr>
+        <tr>
+          <td><code>ipc</code></td>
+          <td><code>IPCWeightTransferEngine</code>
+              (<span class="src">ipc_engine.py:111</span>)</td>
+          <td>CUDA IPC handles exchanged out-of-band
+              (Ray RPC or HTTP POST)</td>
+          <td>No &mdash; used by external training
+              frameworks to push updates in</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>The elastic-EP scale-up path calls
+       <code>batch_transfer_weights()</code>
+       (<span class="src">elastic_execute.py:48&ndash;86</span>) directly,
+       which uses the standby DP group&rsquo;s
+       <code>batch_isend_irecv()</code> rather than the
+       <code>WeightTransferEngine</code> abstraction &mdash; the engine
+       factory is used when weights come from <i>outside</i> the cluster.
+       The same NCCL channel and the same container-gate considerations
+       apply either way.</p>
+
+    <h3>5.2 PackedTensor &mdash; why small sends don&rsquo;t dominate</h3>
+
+    <p>A 30&nbsp;B-parameter model has thousands of named tensors. Naively
+       issuing one <code>ncclBroadcast</code> per tensor would pay the
+       per-collective latency (tens of microseconds) thousands of times.
+       <code>PackedTensor</code>
+       (<span class="src">weight_transfer/packed_tensor.py</span>) solves
+       this by linearising many tensors into a uint8 view and double-buffering
+       1&nbsp;GB chunks:</p>
+
+<pre>
+DEFAULT_PACKED_BUFFER_SIZE_BYTES = 1 << 30      # 1 GiB per buffer
+DEFAULT_PACKED_NUM_BUFFERS       = 2            # double-buffered
+</pre>
+
+    <p>The producer packs tensors into the current buffer as
+       <code>t.view(torch.uint8).view(-1)</code>, broadcasts it once via
+       <code>group.broadcast()</code>
+       (<span class="src">packed_tensor.py:76</span>), then rotates to the
+       next buffer while receivers unpack. The receiver reads the ordered
+       <code>shapes[]</code> / <code>dtype_names[]</code> metadata to split
+       the uint8 buffer back into the original tensors
+       (<span class="src">packed_tensor.py:112&ndash;140</span>).</p>
+
+    <p>This is why analysis-report &sect;6.2&rsquo;s claim that non-expert
+       weight transfer is &ldquo;seconds in practice&rdquo; holds only when
+       NCCL selects a fast transport: bytes-in-flight is already maximised
+       by packing, so the remaining bottleneck is transport bandwidth.
+       A TCP socket at ~10&nbsp;GB/s takes ~3&nbsp;s per 28&nbsp;GB rank;
+       NVLink at ~600&nbsp;GB/s would take ~50&nbsp;ms. <b>The 60&times;
+       gap is exactly what v5 &sect;4.5 wants to measure.</b></p>
+
+    <h3>5.3 Which parameters move and which don&rsquo;t</h3>
+
+    <p>The elastic-EP <code>batch_transfer_weights</code> explicitly filters
+       out expert weights from the state-dict iteration
+       (<span class="src">elastic_execute.py:59&ndash;71</span>):</p>
+
+<pre>
+# Build set of parameter IDs belonging to experts
+expert_weights_set = { id(w)
+                       for layer in moe_layers
+                       for w in layer.expert_weights }
+
+for name, param in model.named_parameters():
+    if id(param) in expert_weights_set:
+        continue          # skip experts &mdash; they come from EPLB reshuffle
+    if "expert_map" in name:
+        continue          # skip routing metadata
+    ...
+    send/recv(param)
+</pre>
+
+    <p>The rationale is sound: a newcomer rank will not end up with the same
+       expert slice as any existing rank, so copying one peer&rsquo;s experts
+       would be wrong. Instead, expert weights either come from
+       (a)&nbsp;shared-filesystem loading (cheap &mdash; each new rank reads
+       its own slice), or (b)&nbsp;an EPLB reshuffle that moves experts from
+       overloaded old ranks to new ones. The existence of
+       <code>enable_ep_weight_filter</code>
+       (<span class="src">config/parallel.py</span>) skips non-local expert
+       weights at load time, making (a) cheap in wall-clock.</p>
+
+    <h3>5.4 Sender/receiver pairing</h3>
+
+    <p>For a scale-up from <code>M</code> to <code>N&gt;M</code> ranks, each
+       old rank pairs with <code>&lceil;(N&minus;M)/M&rceil;</code> or
+       <code>&lfloor;(N&minus;M)/M&rfloor;</code> new ranks
+       (<span class="src">elastic_execute.py:216&ndash;232</span>):</p>
+
+<pre>
+num_new          = new_dp_size - old_dp_size
+num_dst_per_src  = num_new // old_dp_size
+remainder        = num_new  % old_dp_size
+
+if dp_rank &lt; remainder:
+    recv_begin  = dp_rank * (num_dst_per_src + 1)
+    recv_end    = recv_begin + (num_dst_per_src + 1)
+else:
+    recv_begin  = (remainder * (num_dst_per_src + 1)
+                  + (dp_rank - remainder) * num_dst_per_src)
+    recv_end    = recv_begin + num_dst_per_src
+</pre>
+
+    <p>For the 2&rarr;4 case that dominates analysis-report phase-1 and
+       phase-3 measurements: 2 new ranks, 2 old ranks, each old sends to one
+       new in parallel, no stragglers. The receiver mirror-calculates its
+       sender
+       (<span class="src">elastic_execute.py:501&ndash;535</span>).</p>
+
+
+    <!-- ============================================================ -->
+    <!-- 6. EPLB UNDER TOPOLOGY CHANGE                                -->
+    <!-- ============================================================ -->
+
+    <h2>6. EPLB: Logical vs Physical Experts, and the Cold-DP=N Bug</h2>
+
+    <p>EPLB is the single most complex subsystem involved in elasticity.
+       It owns three tensors per MoE layer that encode the logical/physical
+       expert mapping, plus load-accumulation counters, plus the
+       rebalancing policy. The elastic-EP code piggybacks on it heavily:
+       every scale event triggers a <code>rearrange()</code>.</p>
+
+    <h3>6.1 The three mapping tensors</h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Tensor</th><th>Shape</th><th>Meaning</th><th>Source</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>physical_to_logical_map</code></td>
+          <td><code>(num_moe_layers, num_physical_experts)</code></td>
+          <td>Value at <code>[L, p]</code> is the logical expert ID that
+              physical slot <code>p</code> hosts.</td>
+          <td><span class="src">eplb_state.py:94&ndash;109</span></td>
+        </tr>
+        <tr>
+          <td><code>logical_to_physical_map</code></td>
+          <td><code>(num_moe_layers, num_logical_experts, num_redundant_experts+1)</code></td>
+          <td>Value at <code>[L, l, k]</code> is the physical slot hosting
+              the <code>k</code>-th replica of logical expert <code>l</code>,
+              or <code>&minus;1</code> if there is no such replica.</td>
+          <td><span class="src">eplb_state.py:110&ndash;133</span></td>
+        </tr>
+        <tr>
+          <td><code>logical_replica_count</code></td>
+          <td><code>(num_moe_layers, num_logical_experts)</code></td>
+          <td>Number of non-<code>&minus;1</code> entries in
+              <code>logical_to_physical_map[L, l, :]</code>.</td>
+          <td><span class="src">eplb_state.py:134&ndash;148</span></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>The maximum replication factor for any logical expert is hard-coded at
+       1023 (<code>MAX_EXPERT_REDUNDANCY = 1023</code>,
+       <span class="src">eplb_state.py:397</span>), which sets the last
+       dimension of <code>logical_to_physical_map</code> when
+       <code>num_redundant_experts</code> is smaller.</p>
+
+    <h3>6.2 Load accumulation</h3>
+
+    <p>Per forward pass, each MoE layer writes routing hits into
+       <code>expert_load_pass</code>
+       (<span class="src">eplb_state.py:150&ndash;156</span>, int32 GPU tensor
+       of shape <code>(num_moe_layers, num_physical_experts)</code>). A
+       sliding window of these is retained in <code>expert_load_window</code>
+       (<span class="src">eplb_state.py:157&ndash;170</span>,
+       shape <code>(window_size, num_moe_layers, num_physical_experts)</code>).
+       Recording is gated by <code>should_record_tensor</code>
+       (<span class="src">eplb_state.py:605&ndash;616</span>) &mdash; counters
+       are only updated when the next rearrangement is within
+       <code>window_size</code> steps, to avoid wasting GPU cycles on load
+       counts that will be discarded.</p>
+
+    <h3>6.3 The rebalance policy</h3>
+
+    <p>The default policy is <code>DefaultEplbPolicy</code>
+       (<span class="src">eplb/policy/default.py</span>). Its
+       <code>rebalance_experts()</code> is a three-step hierarchical packing:</p>
+
+    <ol>
+      <li><b>Pack groups to nodes.</b> Logical experts are grouped
+          (by model-defined group structure), and groups are distributed
+          across <code>num_nodes</code> via <code>balanced_packing()</code>
+          to equalise per-node token load.</li>
+      <li><b>Construct redundant experts within each node.</b> Greedy
+          packing replicates hot experts to fill up to
+          <code>num_physical_experts / num_nodes</code> slots per node.</li>
+      <li><b>Pack physical experts to GPUs.</b> Normalise load by replica
+          count (<code>tokens_per_phy = tokens_per_mlog / mlogcnt</code>)
+          then balanced-pack across GPUs within a node, respecting node
+          boundaries.</li>
+    </ol>
+
+    <p>The output is a fresh <code>physical_to_logical_map</code> which the
+       surrounding plumbing translates into the per-rank expert-weight
+       movements described in &sect;6.5.</p>
+
+    <h3>6.4 The <code>num_replicas // ep_group.size() * num_gpus</code> formula</h3>
+
+    <p>This is the formula at the centre of the cold-DP=N scale-down bug
+       (analysis-report &sect;6.3). It lives in
+       <code>EplbState.rearrange()</code>
+       (<span class="src">eplb_state.py:771&ndash;786</span>):</p>
+
+<pre>
+if rank_mapping is not None and len(rank_mapping) == ep_group.size():
+    # NOTE(yongji): scale down...
+    coordinator = get_ep_group()
+    tcp_store_group = coordinator.tcp_store_group
+    num_gpus  = sum(new_rank != -1 for new_rank in rank_mapping.values())
+    num_nodes = _node_count_with_rank_mapping(tcp_store_group, rank_mapping)
+    num_replicas = (num_replicas // ep_group.size() * num_gpus)
+</pre>
+
+    <p>Unpacking: if the current config has <code>num_replicas = 128</code>
+       physical slots spread over <code>ep_group.size() = 4</code> ranks
+       (32 per rank), a scale-down to <code>num_gpus = 2</code> ranks sets
+       <code>num_replicas = 128/4 * 2 = 64</code>. For Qwen3-30B-A3B with
+       <code>num_logical_experts = 128</code> and
+       <code>num_redundant_experts = 0</code>, the initial
+       <code>num_replicas</code> equals 128, and a 4&rarr;2 scale-down
+       computes <code>num_replicas = 64 &lt; num_logical = 128</code>.
+       The later invariant check fires, and the assertion aborts the
+       process.</p>
+
+    <div class="warning-box">
+      <p><b>v5 &sect;4.4 connection.</b> The formula is
+         <i>per-rank-proportional</i>, not
+         <i>preserve-total-replicas</i>. This means scale-down
+         <i>always</i> reduces <code>num_replicas</code> proportionally,
+         and with zero redundancy that reduction is fatal. The
+         documented workaround (start at DP&le;N/2, scale up first) works
+         because the scale-up path runs the rebalance policy on a
+         <i>larger</i> <code>num_replicas</code>, building replicas that
+         survive the next scale-down.</p>
+    </div>
+
+    <h3>6.5 Expert weight movement during rebalance</h3>
+
+    <p>The data movement is done by
+       <code>move_to_buffer()</code>
+       (<span class="src">eplb/rebalance_execute.py:144&ndash;319</span>)
+       in four phases on every rank:</p>
+
+    <ol>
+      <li><b>Local moves</b>
+          (<span class="src">rebalance_execute.py:230&ndash;242</span>):
+          copy within-rank expert weights to an intermediate buffer. Uses
+          <code>torch.cuda.stream()</code> for async overlap.</li>
+      <li><b>Post sends</b>
+          (<span class="src">rebalance_execute.py:244&ndash;275</span>):
+          for each expert we own that another rank now needs,
+          <code>communicator.add_send(w[src], dst)</code>.</li>
+      <li><b>Post recvs</b>
+          (<span class="src">rebalance_execute.py:277&ndash;305</span>):
+          for each expert we&rsquo;re inheriting,
+          <code>communicator.add_recv(buf[dst], src)</code>.</li>
+      <li><b>Execute</b>
+          (<span class="src">rebalance_execute.py:308</span>):
+          <code>communicator.execute()</code> flushes the batch atomically.</li>
+    </ol>
+
+    <p>The communicator can be any of three backends
+       (<span class="src">eplb/eplb_communicator.py</span>):
+       <code>TorchDistNcclEplbCommunicator</code> (NCCL batched
+       isend/irecv), <code>TorchDistGlooStagedEplbCommunicator</code>
+       (H2D&rarr;gloo P2P&rarr;D2H, host-staged), or
+       <code>PyNcclEplbCommunicator</code>
+       (raw <code>ncclSend</code>/<code>ncclRecv</code> with manual
+       <code>group_start</code>/<code>group_end</code>). <b>Elastic EP
+       forces the PyNccl backend</b> (elected at
+       <span class="src">eplb_communicator.py:254&ndash;267</span>),
+       because it needs to target the stateless group rather than the
+       torch.distributed world.</p>
+
+    <h3>6.6 Rank mapping for departing ranks</h3>
+
+    <p>On scale-down, survivors need to know which old ranks are disappearing
+       so they can inherit those ranks&rsquo; experts. The encoding is a
+       <code>dict[int, int]</code> (<i>old rank &rarr; new rank</i>) where
+       departing ranks map to <code>&minus;1</code>
+       (<span class="src">rebalance_execute.py:645&ndash;677</span>). The
+       rearrange code walks this dict, expands departing ranks&rsquo; expert
+       slots into <code>&minus;1</code> placeholders in the working tensor,
+       and lets the policy re-solve placement over the reduced
+       <code>num_gpus</code>.</p>
+
+
+    <!-- ============================================================ -->
+    <!-- 7. RUNTIME ALL-TO-ALL                                        -->
+    <!-- ============================================================ -->
+
+    <h2>7. Runtime All-to-All Dispatch &mdash; the Hot Path</h2>
+
+    <p>Orthogonal to scale events, every MoE forward does an All-to-All.
+       This is the throughput-determining collective. vLLM registers
+       <b>eight</b> backends in
+       <code>device_communicators/cuda_communicator.py:118&ndash;172</code>
+       and implements them in
+       <code>device_communicators/all2all.py</code>.</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Backend</th><th>Primitive</th><th>Elastic EP-aware?</th>
+          <th>Fallback on NCCL failure</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>naive</code></td>
+          <td>per-rank broadcast loop over <code>all_reduce()</code></td>
+          <td>No</td><td>socket (slow)</td>
+        </tr>
+        <tr>
+          <td><code>allgather_reducescatter</code> (our choice)</td>
+          <td><code>ncclAllGather</code> dispatch + <code>ncclReduceScatter</code> combine</td>
+          <td>No</td><td>error (comm marked <code>disabled=True</code>)</td>
+        </tr>
+        <tr>
+          <td><code>deepep_high_throughput</code></td>
+          <td>DeepEP custom kernel, NVLink + RDMA</td>
+          <td>No</td><td>not supported</td>
+        </tr>
+        <tr>
+          <td><code>deepep_low_latency</code></td>
+          <td>DeepEP LL kernel, RDMA-only, no SMs for comm</td>
+          <td>No</td><td>not supported</td>
+        </tr>
+        <tr>
+          <td><code>mori</code></td>
+          <td>MoRI ROCm custom kernel</td><td>No</td><td>N/A (AMD)</td>
+        </tr>
+        <tr>
+          <td><code>nixl_ep</code></td>
+          <td>NIXL with dynamic peer connect/disconnect</td>
+          <td><b>Yes</b> &mdash; only elastic-aware backend</td>
+          <td>socket fallback (likely)</td>
+        </tr>
+        <tr>
+          <td><code>flashinfer_nvlink_two_sided</code></td>
+          <td>FlashInfer MNNVL two-sided</td><td>No</td><td>N/A</td>
+        </tr>
+        <tr>
+          <td><code>flashinfer_nvlink_one_sided</code></td>
+          <td>FlashInfer MNNVL one-sided (TRT-LLM style)</td><td>No</td><td>N/A</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>7.1 <code>AgRsAll2AllManager</code> walk-through</h3>
+
+    <p>The backend used in Exp A3 is <code>allgather_reducescatter</code>
+       (<span class="src">all2all.py:150&ndash;249</span>):</p>
+
+<pre>
+def dispatch(hidden_states, topk_weights, topk_ids):
+    # Concatenate inputs along dim 0
+    # Query per-rank token counts from DP metadata
+    chunk_sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
+    # Variable-size all-gather &mdash; each rank holds the global batch
+    gathered = self.dist_group.all_gatherv(
+        cat_input, chunk_sizes)
+    return split_gathered(gathered)           # &rarr; (h, w, ids)
+
+def combine(hidden_states):
+    # Variable-size reduce-scatter: expert outputs summed and
+    # scattered back to token owners
+    return self.dist_group.reduce_scatterv(
+        hidden_states, chunk_sizes)
+</pre>
+
+    <p>Under the hood, <code>all_gatherv</code> / <code>reduce_scatterv</code>
+       on a <code>StatelessGroupCoordinator</code> are grouped NCCL
+       collectives between <code>ncclGroupStart()</code>/<code>ncclGroupEnd()</code>
+       (<span class="src">pynccl.py:295&ndash;309</span>). Every forward pass
+       of every MoE layer touches this path.</p>
+
+    <h3>7.2 Why the EP group replacement is invisible to all2all managers</h3>
+
+    <p>A subtle but important design choice: the
+       <code>All2AllManagerBase</code> stores a reference to the
+       <i>current</i> EP communicator at construction time
+       (<span class="src">base_device_communicator.py:43&ndash;44</span>),
+       <i>not</i> a symbolic reference to &ldquo;the EP group&rdquo;. When
+       <code>_replace_active_groups()</code> swaps <code>_EP</code>, the
+       all2all manager still holds a reference to the old group object.</p>
+
+    <p>The code gets away with this because the manager&rsquo;s operations
+       are all method calls through the group reference
+       (<code>self.dist_group.all_gatherv(&hellip;)</code>), and the group
+       object itself is either a torch ProcessGroup or a
+       StatelessGroupCoordinator &mdash; no shared state between the two.
+       Once the active EP group is replaced, a <i>new</i>
+       <code>All2AllManager</code> is constructed against the new group in
+       <code>switch_and_prepare()</code>
+       (<span class="src">elastic_execute.py:409&ndash;414</span>). The old
+       manager is simply dereferenced.</p>
+
+    <div class="info-box">
+      <p><b>Only NixlEP is built for elastic scaling.</b> It stores a
+         class-level singleton buffer and calls
+         <code>buffer.connect_ranks()</code> /
+         <code>buffer.disconnect_ranks()</code>
+         (<span class="src">all2all.py:486&ndash;500</span>) to incrementally
+         adjust the peer set rather than rebuild. For the backends we use,
+         the group-swap-and-rebuild pattern is the norm.</p>
+    </div>
+
+
+    <!-- ============================================================ -->
+    <!-- 8. NCCL COMMUNICATOR LIFECYCLE                               -->
+    <!-- ============================================================ -->
+
+    <h2>8. NCCL Communicator Lifecycle (PyNccl)</h2>
+
+    <h3>8.1 Construction</h3>
+
+    <p><code>PyNcclCommunicator</code>
+       (<span class="src">pynccl.py:58&ndash;147</span>) is a thin Python
+       wrapper over <code>libnccl.so</code>. Construction is:</p>
+
+    <ol>
+      <li>Load <code>libnccl.so</code> via <code>NCCLLibrary</code>
+          (<span class="src">pynccl_wrapper.py:324&ndash;344</span>). Cached
+          per library path at class level.</li>
+      <li>Rank 0 calls <code>ncclGetUniqueId()</code>
+          (<span class="src">pynccl_wrapper.py:398&ndash;401</span>).</li>
+      <li>Rank 0 broadcasts the unique ID. For <b>stateless groups</b>
+          (<span class="src">pynccl.py:127</span>), this is
+          <code>group.broadcast_obj(unique_id, src=0)</code> routed through
+          the coord-store TCP group &mdash; <i>not</i> torch.distributed.
+          This is why container separation does not block NCCL init.</li>
+      <li>All ranks call
+          <code>ncclCommInitRank(world_size, unique_id, rank)</code>
+          (<span class="src">pynccl_wrapper.py:412&ndash;421</span>).</li>
+      <li>A warmup <code>all_reduce</code> on a 1-element tensor
+          sanity-checks the comm
+          (<span class="src">pynccl.py:141&ndash;146</span>).</li>
+    </ol>
+
+    <h3>8.2 Are multiple comms per GPU supported?</h3>
+
+    <p>Yes. <code>PyNcclCommunicator</code> is not a singleton, and nothing
+       in its construction prevents multiple instances on the same
+       <code>cuda:N</code> device. This is what makes standby groups
+       possible. Each instance owns its own <code>ncclComm_t</code>; there
+       is no communicator pool or shared buffer across instances.</p>
+
+    <h3>8.3 <code>ncclCommSplit</code> is not used</h3>
+
+    <p>NCCL 2.13+ supports <code>ncclCommSplit()</code>, which can cheaply
+       derive a sub-communicator from a parent. A grep across the vLLM tree
+       shows zero usages. Every new group is built via the full
+       <code>ncclGetUniqueId</code>&nbsp;+&nbsp;broadcast&nbsp;+&nbsp;<code>ncclCommInitRank</code>
+       sequence, which is the slowest option but the most robust to
+       arbitrary rank-set changes.</p>
+
+    <h3>8.4 Destruction is collective and explicit</h3>
+
+    <p><code>PyNcclCommunicator.destroy()</code>
+       (<span class="src">pynccl.py:148&ndash;153</span>) calls
+       <code>ncclCommDestroy(comm)</code>. This is <b>collective</b> &mdash;
+       all ranks must participate or deadlock. The code-base explicitly
+       avoids relying on Python GC for this
+       (<span class="src">pynccl_wrapper.py:287&ndash;290</span>); destruction
+       happens only from explicit code paths:</p>
+
+    <ul>
+      <li>Scale-up: old DP group destroyed at
+          <span class="src">elastic_state.py:510</span> after standby becomes
+          active.</li>
+      <li>Scale-down: same as above; departing ranks join the destroy
+          collective before their state-machines transition to COMPLETE.</li>
+      <li>Weight transfer engines: temporary comms are destroyed at the end
+          of <code>shutdown()</code>
+          (<span class="src">weight_transfer/nccl_engine.py:274&ndash;339</span>).</li>
+    </ul>
+
+    <p>This is the direct answer to v5 &sect;4.2&rsquo;s container-lifecycle
+       question: a container that dies abruptly <i>before</i> the destroy
+       collective fires will deadlock survivors. Graceful exit must cooperate
+       with the state machine.</p>
+
+
+    <!-- ============================================================ -->
+    <!-- 9. END-TO-END SCALE-UP SEQUENCE                              -->
+    <!-- ============================================================ -->
+
+    <h2>9. End-to-End Scale-Up Sequence in Code</h2>
+
+    <p>Putting all the pieces together for a 2&rarr;4 scale-up, with the
+       call graph and file references.</p>
+
+<pre>
+Client side (vllm/v1/engine/core_client.py)
+  _scale_up_elastic_ep():
+    # Phase 1: tell existing engines to reconfig
+    for each existing engine:
+      ReconfigureDistributedRequest(
+        new_data_parallel_size = 4,
+        new_data_parallel_rank = KEEP_CURRENT_RANK,      # -1
+        new_data_parallel_master_ip/port = &lt;addr&gt;,
+        coord_store_port = &lt;port&gt;,
+      )
+      _call_utility_async("reinitialize_distributed", req,
+                          engine=engine)                 # 1570
+
+    # Phase 2: spawn new Ray actors for ranks 2, 3
+    engine_manager.scale_up_elastic_ep(config, 4)        # 1578-1582
+      -> spawns DPMoEEngineCoreActor(dp_rank=2), DPMoEEngineCoreActor(dp_rank=3)
+
+    # Phase 3: wait for ready + setup-switch
+    wait for READY on input socket from new engines      # 1600-1615
+    await setup-switch completion from engine 0          # 1619
+    update parallel config, publish scale-up marker      # 1621-1628
+
+Engine side, EXISTING rank (ScaleUpExistingEngineState)
+  state 0  WAIT_NEW_CORE_ENGINES_INIT
+           - block on eep_barrier_engine_count
+  state 1  CREATE_STANDBY_GROUPS
+           - _staged_barrier() at elastic_state.py:241
+           - ElasticEPScalingExecutor.create_standby_groups()   [175-197]
+               -> standby_state.create_standby_groups()         [37-100]
+                  -> new StatelessGroupCoordinator for
+                     _STANDBY_WORLD, _STANDBY_DP, _STANDBY_EP, _STANDBY_EPLB
+  state 2  TRANSFER_EXPERT_MAPPING
+           - broadcast physical_to_logical_map via standby DP group [252]
+  state 3  WAIT_NEW_CORE_ENGINES_WEIGHTS_INIT
+  state 4  TRANSFER_WEIGHTS
+           - batch_transfer_weights()                    [elastic_execute.py:48-86]
+               -> PackedTensor producer on device_comm.batch_isend_irecv
+               -> non-expert params only (expert weights filtered [59-71])
+  state 5  SYNC_KV_CACHE_MEMORY_SIZE
+           - all_reduce max over KV reservation
+  state 6  SWITCH_AND_PREPARE                            [elastic_state.py:505-535]
+           - release CUDA graphs
+           - pop_standby_groups() -> _replace_active_groups()
+           - stateless_destroy_torch_distributed_process_group(old_dp_group)  [510]
+           - self.engine_core.dp_group = new_dp_group
+           - all_reduce (MAX) engine scalars on NEW group  [517-530]
+           - reconfigure MoE modules:
+               num_experts = num_local_experts * new_ep_size  [elastic_execute.py:333]
+               rebuild FusedMoEParallelConfig                [338-346]
+           - expand EPLB state:
+               pad physical_to_logical_map with -1          [362-371]
+               pad expert_load tensors with 0                [377-384]
+           - rebuild modular kernel + All2AllManager         [409-414]
+           - save/restore block tables around warmup         [437-453]
+           - send RECONFIGURE_FINISHED (rank 0)              [532]
+  state 7  EPLB_RESHUFFLE
+           - eplb_state.rearrange() on NEW group             [elastic_state.py:300]
+  state 8  COMPLETE
+
+Engine side, NEW rank (ScaleUpNewEngineState)
+  state 0  PRE_KV_INIT
+           - load_model(load_dummy_weights=True)            [elastic_execute.py:169]
+           - receive expert mapping broadcast
+           - init KV cache slot
+  state 1  PREPARE
+           - join SYNC_KV_CACHE_MEMORY_SIZE and SWITCH_AND_PREPARE
+           - participate in all_reduce (MAX) engine scalars
+  state 2  EPLB_RESHUFFLE
+           - receive inherited expert weights via eplb communicator
+  state 3  COMPLETE
+</pre>
+
+
+    <!-- ============================================================ -->
+    <!-- 10. CONTAINER-BOUNDARY MATRIX                                -->
+    <!-- ============================================================ -->
+
+    <h2>10. Container-Boundary Matrix &mdash; Where the Deep Dive Meets v5</h2>
+
+    <p>Every subsystem above makes specific assumptions about shared state
+       between participating ranks. Annotated against v5 &sect;4&rsquo;s
+       per-GPU container scenario:</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Subsystem</th>
+          <th>Shared-state assumptions</th>
+          <th>Per-GPU container outcome</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Stateless coordinator
+              (<code>stateless_coordinator.py</code>)</td>
+          <td>Only TCP reachability to
+              <code>coord_store_port</code>. No shmem, no hostname, no PID.</td>
+          <td style="color:#2e7d32;">Passes. Already used cross-container in
+              phase&nbsp;3.</td>
+        </tr>
+        <tr>
+          <td>PyNccl unique-ID broadcast</td>
+          <td>Uses the coord store for stateless groups, so no
+              <code>torch.distributed</code> rendezvous required.</td>
+          <td style="color:#2e7d32;">Passes.</td>
+        </tr>
+        <tr>
+          <td>NCCL data transport
+              (<code>ncclBroadcast</code>, <code>ncclAllGather</code>,
+              <code>ncclReduceScatter</code>, <code>ncclSend</code>/<code>ncclRecv</code>)</td>
+          <td>NCCL's three same-node gates must pass:
+              <code>hostHash</code>, <code>shmDev</code>, abstract-UDS.</td>
+          <td style="color:#e65100;"><b>Fails without shim.</b> All three
+              gates fail &rarr; NCCL picks <code>NET/Socket</code>
+              (measured: &minus;23% throughput, analysis-report &sect;5).
+              <i>v5 &sect;4.1 workaround plan:</i> inject
+              <code>common/shim/</code>.</td>
+        </tr>
+        <tr>
+          <td>Standby group creation (&sect;4)</td>
+          <td>Same as stateless coordinator + NCCL data transport.</td>
+          <td style="color:#e65100;">Passes architecturally, slow without
+              shim.</td>
+        </tr>
+        <tr>
+          <td>Weight transfer (&sect;5)</td>
+          <td>Same as NCCL data transport, plus expert-weight
+              <i>read from shared model dir</i> for newcomers.</td>
+          <td style="color:#e65100;">Slow without shim (NCCL over TCP).
+              Shared model dir bind-mount is already standard per phase-3
+              setup. <i>v5 &sect;4.5 investigates.</i></td>
+        </tr>
+        <tr>
+          <td>EPLB rebalance P2P
+              (<code>PyNcclEplbCommunicator</code>)</td>
+          <td>NCCL send/recv between ranks.</td>
+          <td style="color:#e65100;">Same as NCCL data transport.</td>
+        </tr>
+        <tr>
+          <td>Runtime all-to-all (&sect;7)</td>
+          <td>NCCL collectives on the EP group.</td>
+          <td style="color:#e65100;">Same as NCCL data transport &mdash;
+              this is the throughput-dominant hot path.</td>
+        </tr>
+        <tr>
+          <td><code>ncclCommDestroy</code> collective at atomic switch</td>
+          <td>All ranks must participate. A rank that crashed or its
+              container stopped without cooperating will hang survivors.</td>
+          <td style="color:#c62828;"><b>Design gap for v5 &sect;4.2.</b>
+              &ldquo;<code>docker stop ep-rank-3</code>&rdquo; is not safe
+              as-is; survivors wait indefinitely. Need a cooperative exit
+              hook before container termination.</td>
+        </tr>
+        <tr>
+          <td>EPLB invariant
+              (<code>num_physical &ge; num_logical</code>)</td>
+          <td>Per-rank proportional scaling formula
+              (&sect;6.4) is independent of container layout.</td>
+          <td>Orthogonal to containers. Bug still fires if hit from a
+              cold DP=N start with <code>num_redundant_experts=0</code>.
+              <i>v5 &sect;4.4.</i></td>
+        </tr>
+        <tr>
+          <td>Ray actor lifecycle</td>
+          <td><code>engine_manager.scale_up_elastic_ep</code> assumes Ray can
+              place new actors; <code>remove_run_refs_for_scale_down</code>
+              releases actor refs but leaves workers running.</td>
+          <td style="color:#c62828;">Ray worker != container. Under the
+              per-GPU model we need the worker&rsquo;s container to stop,
+              which Ray does not drive. <i>v5 &sect;4.2 &amp; 4.3.</i></td>
+        </tr>
+      </tbody>
+    </table>
+
+
+    <!-- ============================================================ -->
+    <!-- 11. OPEN QUESTIONS                                           -->
+    <!-- ============================================================ -->
+
+    <h2>11. Open Questions Raised by the Deep Dive</h2>
+
+    <p>Several design details deserve empirical confirmation before the next
+       phase of v5 exploration:</p>
+
+    <ol>
+      <li><b>Does the shim restore <code>ncclSend</code>/<code>ncclRecv</code>
+          bandwidth, not just <code>ncclAllReduce</code>?</b>
+          Exp&nbsp;A validated the shim on AllReduce and raw P2P bandwidth.
+          vLLM&rsquo;s weight transfer is <code>ncclBroadcast</code> over a
+          fresh comm; runtime all-to-all is grouped
+          <code>ncclAllGather</code>+<code>ncclReduceScatter</code>; EPLB
+          rebalance is grouped <code>ncclSend</code>/<code>ncclRecv</code>.
+          A micro-benchmark of each primitive with the shim loaded would
+          directly derisk v5 &sect;4.1.</li>
+      <li><b>What is the real cost of the double communicator during the
+          standby window?</b> The code does not audit peak GPU memory
+          during the transition. With a 30&nbsp;B model already at 85% GPU
+          util, an extra NCCL comm context is probably fine, but a
+          measurement would confirm it.</li>
+      <li><b>Is there any path to <code>ncclCommSplit</code> for scale-down?</b>
+          Scale-down from <code>N</code> to <code>N-k</code> ranks is
+          exactly the case that <code>ncclCommSplit</code> was designed for.
+          A patch to vLLM that detects &ldquo;pure subset&rdquo; transitions
+          and uses <code>ncclCommSplit</code> could cut group-reform time
+          from seconds to milliseconds &mdash; with no container interaction.</li>
+      <li><b>Can the destroy collective be made tolerant of a dead peer?</b>
+          Exactly the v5 &sect;4.2 question. NCCL 2.22 added
+          <code>ncclCommAbort</code> and <code>ncclCommFinalize</code>, which
+          allow non-blocking destruction. The vLLM path does not use them;
+          adopting them would soften the &ldquo;container must exit
+          cooperatively&rdquo; hard constraint.</li>
+      <li><b>Could expert-weight transport bypass NCCL entirely?</b>
+          The shared model volume is mounted in every per-GPU container by
+          construction (phase&nbsp;3 deployment). New ranks could load their
+          experts directly from disk &mdash; trading NCCL bandwidth for
+          page-cache I/O. Exp&nbsp;A3&rsquo;s 28&nbsp;GB at ~3&nbsp;GB/s
+          NVMe = ~10&nbsp;s; at ~10&nbsp;GB/s cached = ~3&nbsp;s. Either
+          beats TCP-fallback NCCL. <i>v5 &sect;4.5&rsquo;s fallback idea.</i></li>
+    </ol>
+
+
+    <!-- ============================================================ -->
+    <!-- APPENDIX: source file / line index                           -->
+    <!-- ============================================================ -->
+
+    <h2>Appendix: Source File / Line Index</h2>
+
+    <p>All paths relative to <code>3rdparty/vllm/vllm/</code>.</p>
+
+    <table>
+      <thead>
+        <tr><th>Function / symbol</th><th>File</th><th>Lines</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>StatelessGroupCoordinator</code></td>
+            <td><code>distributed/stateless_coordinator.py</code></td><td>61&ndash;194</td></tr>
+        <tr><td><code>_allocate_group_ports</code>, <code>_fetch_group_ports</code></td>
+            <td><code>distributed/stateless_coordinator.py</code></td><td>31&ndash;112</td></tr>
+        <tr><td><code>broadcast_object_list</code>, <code>send_tensor_dict</code></td>
+            <td><code>distributed/stateless_coordinator.py</code></td><td>213&ndash;340</td></tr>
+        <tr><td><code>_init_elastic_ep_world</code></td>
+            <td><code>distributed/parallel_state.py</code></td><td>1313&ndash;1345</td></tr>
+        <tr><td><code>_replace_active_groups</code></td>
+            <td><code>distributed/parallel_state.py</code></td><td>1205&ndash;1212</td></tr>
+        <tr><td>Four <code>ScaleXxxEngineState</code> IntEnums</td>
+            <td><code>distributed/elastic_ep/elastic_state.py</code></td><td>33&ndash;62</td></tr>
+        <tr><td><code>_staged_barrier</code></td>
+            <td><code>distributed/elastic_ep/elastic_state.py</code></td><td>182&ndash;225</td></tr>
+        <tr><td>Atomic-switch block (destroy &rarr; rebind &rarr; sync &rarr; notify)</td>
+            <td><code>distributed/elastic_ep/elastic_state.py</code></td><td>505&ndash;535</td></tr>
+        <tr><td><code>ElasticEPScalingExecutor.create_standby_groups</code></td>
+            <td><code>distributed/elastic_ep/elastic_execute.py</code></td><td>175&ndash;197</td></tr>
+        <tr><td><code>batch_transfer_weights</code></td>
+            <td><code>distributed/elastic_ep/elastic_execute.py</code></td><td>48&ndash;86</td></tr>
+        <tr><td>Sender/receiver pairing math</td>
+            <td><code>distributed/elastic_ep/elastic_execute.py</code></td><td>216&ndash;232, 501&ndash;535</td></tr>
+        <tr><td><code>switch_and_prepare</code>
+              (MoE rebuild, EPLB padding, block-table preserve)</td>
+            <td><code>distributed/elastic_ep/elastic_execute.py</code></td><td>285&ndash;456</td></tr>
+        <tr><td><code>_perform_eplb_reshuffle</code></td>
+            <td><code>distributed/elastic_ep/elastic_execute.py</code></td><td>457&ndash;487</td></tr>
+        <tr><td>Standby slots + <code>pop_standby_groups</code></td>
+            <td><code>distributed/elastic_ep/standby_state.py</code></td><td>14&ndash;123</td></tr>
+        <tr><td><code>PackedTensor</code> producer / consumer</td>
+            <td><code>distributed/weight_transfer/packed_tensor.py</code></td><td>13&ndash;216</td></tr>
+        <tr><td><code>NCCLWeightTransferEngine</code></td>
+            <td><code>distributed/weight_transfer/nccl_engine.py</code></td><td>97&ndash;339</td></tr>
+        <tr><td><code>EplbState</code> tensors
+              (physical_to_logical, logical_to_physical, logical_replica_count,
+              expert_load_pass, expert_load_window)</td>
+            <td><code>distributed/eplb/eplb_state.py</code></td><td>94&ndash;170</td></tr>
+        <tr><td><code>rearrange</code> with
+              <code>num_replicas // ep_group.size() * num_gpus</code></td>
+            <td><code>distributed/eplb/eplb_state.py</code></td><td>703&ndash;786</td></tr>
+        <tr><td><code>move_to_buffer</code> (4 phases)</td>
+            <td><code>distributed/eplb/rebalance_execute.py</code></td><td>144&ndash;319</td></tr>
+        <tr><td>Rank-mapping (<code>-1</code> for departed)</td>
+            <td><code>distributed/eplb/rebalance_execute.py</code></td><td>592&ndash;677</td></tr>
+        <tr><td><code>DefaultEplbPolicy.rebalance_experts</code></td>
+            <td><code>distributed/eplb/policy/default.py</code></td><td>275&ndash;332</td></tr>
+        <tr><td>Three <code>EplbCommunicator</code> backends</td>
+            <td><code>distributed/eplb/eplb_communicator.py</code></td><td>51&ndash;277</td></tr>
+        <tr><td>Eight all-to-all backends</td>
+            <td><code>distributed/device_communicators/all2all.py</code></td><td>41&ndash;865</td></tr>
+        <tr><td><code>AgRsAll2AllManager.dispatch</code>/<code>combine</code></td>
+            <td><code>distributed/device_communicators/all2all.py</code></td><td>150&ndash;249</td></tr>
+        <tr><td><code>NixlEPAll2AllManager</code> (elastic-aware)</td>
+            <td><code>distributed/device_communicators/all2all.py</code></td><td>443&ndash;556</td></tr>
+        <tr><td><code>PyNcclCommunicator.__init__</code>, <code>destroy</code></td>
+            <td><code>distributed/device_communicators/pynccl.py</code></td><td>58&ndash;153</td></tr>
+        <tr><td><code>NCCLLibrary.ncclGetUniqueId</code>,
+              <code>ncclCommInitRank</code>, <code>ncclCommDestroy</code></td>
+            <td><code>distributed/device_communicators/pynccl_wrapper.py</code></td><td>398&ndash;570</td></tr>
+        <tr><td><code>_scale_up_elastic_ep</code>, <code>_scale_down_elastic_ep</code></td>
+            <td><code>v1/engine/core_client.py</code></td><td>1542&ndash;1695</td></tr>
+        <tr><td><code>ReconfigureDistributedRequest</code>,
+              <code>ReconfigureRankType</code></td>
+            <td><code>v1/engine/__init__.py</code></td><td>246&ndash;262</td></tr>
+      </tbody>
+    </table>
+
+  </main>
+</body>
+</html>
