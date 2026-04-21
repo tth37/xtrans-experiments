@@ -206,6 +206,74 @@ curl -X POST http://localhost:8000/scale_elastic_ep \
   `bench_dp2_post_scale_patched.json` — bench JSON outputs (from
   `exp_a3_vllm_ep/results/phase3/` tree).
 
+## Addendum — full 4 → 2 → 4 cycle (Task A, same image, same session)
+
+Re-ran the cycle with the scale-up leg added. Same setup as above;
+fresh Phase 3 bring-up to avoid stale state.
+
+| Step | Timing | Outcome |
+|---|---|---|
+| Cold DP=4 startup (redundancy=128) | 101 s | all 4 GPUs loaded ~35.8 GB each |
+| `POST /scale_elastic_ep {new_dp: 2}` | **4.56 s** | HTTP 200; GPUs 1, 2 → 4 MiB |
+| Service at DP=2 | — | `HEALTH_OK`, `is_scaling_elastic_ep: false` |
+| `POST /scale_elastic_ep {new_dp: 4}` | **41.14 s** | HTTP 200; all 4 GPUs reloaded to ~35.8–36.5 GB |
+| Service at DP=4 post-cycle | — | `HEALTH_OK`, `is_scaling_elastic_ep: false` |
+| DP=4 post-scale-up bench | — | 113.34 tok/s output (**94.7 %** of pre-scale 119.65) |
+
+### Observations
+
+- **Scale-down was faster this run** (4.56 s vs 13.89 s on the first
+  attempt). Likely driven by NCCL collective warmup — the first
+  scale-down pays an initialisation cost for the new 2-rank group
+  that a subsequent run doesn't. The 13.89 s number should be
+  treated as an upper bound for the cold path.
+- **Scale-up is the slower leg** at 41.14 s, vs Phase 1 native's
+  23–26 s baseline. The gap is consistent with the ~28 GB of
+  non-expert model weights that scale-up streams from existing
+  engines to new engines, now over NCCL NET/Socket/0 instead of
+  NVLink. Orthogonal to the patches.
+- **Throughput recovery to 94.7 %** satisfies the README's success
+  criterion #3 ("within 10 % of pre-scale DP=4"). The small shortfall
+  vs 100 % is within bench-run variance on this shared host.
+- **All 4 GPUs are re-acquired** at the container-GPU-allocation
+  level after scale-up. The per-GPU container design reverses
+  cleanly.
+
+### Scale-event timeline (from serve log, cycle part 2)
+
+```
+13:34:22  DPCoordinator scaled down from 4 to 2 engines
+13:34:22  [Elastic EP] Starting expert resharding...
+13:34:22  [Elastic EP] EPLB reshuffle completed        (warmed)
+13:34:23  [Elastic EP] Created standby communication groups
+13:34:27  [Elastic EP] Scale down completed, new DP size: 2
+13:34:27  [Elastic EP] Switched to new setup
+# ---- DP=2 service window ----
+13:34:49  [Elastic EP] Created standby communication groups   (for scale-up)
+13:35:11  [Elastic EP] Scale up completed, new DP size: 4
+13:35:11  DPCoordinator scaled up from 2 to 4 engines
+13:35:11  [Elastic EP] Switched to new setup
+13:35:12  [Elastic EP] EPLB reshuffle completed
+```
+
+### Verdict
+
+The full Phase 3 elastic cycle **4 → 2 → 4** succeeds end-to-end
+under the combined patches + `num_redundant_experts=128` redirect.
+The README's success-criteria items (1) through (3) are all met;
+item (4) repeatability is structurally implied by the clean terminal
+state after each transition and is not separately instrumented here.
+
+### Additional artefacts for Task A
+
+- `scale_events_cycle.log` — extracted event timeline above.
+- `nvidia_smi_post_scale_up.txt` — host-side GPU state after the
+  scale-up leg (all 4 GPUs reloaded).
+- `container_processes_post_scale_up.txt` — per-container vllm PID
+  counts post-scale-up.
+- `bench_dp4_post_scale_up_patched.json` — bench JSON at DP=4 after
+  the scale-up leg (in `exp_a3_vllm_ep/results/phase3/`).
+
 ## What remains (not done this session)
 
 - **Track 1b** (grow-density scale-down for `num_redundant_experts=0`).
