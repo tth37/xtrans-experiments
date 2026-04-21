@@ -152,14 +152,18 @@ up() {
 
     # vllm serve inside ep-rank-0 -- background via bash -c so the exec
     # returns immediately; log file lives in the container at $SERVE_LOG_IN_CTN.
-    log "Launching vllm serve in ep-rank-0 at DP=2"
+    # Phase 3 starts at DP=4 directly (matches Ray cluster size). Elastic
+    # scaling via /scale_elastic_ep is known to brick the service in this
+    # topology (EPLB bug + cross-container teardown), so we don't cycle.
+    log "Launching vllm serve in ep-rank-0 at DP=4"
     docker exec -d ep-rank-0 /bin/bash -c "
         export RAY_ADDRESS=ep-rank-0:${RAY_PORT}
         export VLLM_LOGGING_LEVEL=INFO
         vllm serve ${MODEL_PATH_IN_CTN} \
+            --served-model-name ${SERVED_MODEL_NAME} \
             --host 0.0.0.0 --port ${VLLM_PORT} \
             --tensor-parallel-size 1 \
-            --data-parallel-size 2 \
+            --data-parallel-size 4 \
             --data-parallel-size-local 1 \
             --data-parallel-backend ray \
             --data-parallel-address ep-rank-0 \
@@ -277,7 +281,10 @@ usage: phase3_per_gpu.sh {up|down|bench LABEL [N] [C]|scale TARGET_DP|state [TAG
 
 subcommands:
     up                      bridge network + 4 per-GPU containers +
-                            Ray cluster + vllm serve at DP=2
+                            Ray cluster + vllm serve at DP=4
+                            (Phase 3 starts at DP=4 directly; elastic
+                            scaling via /scale_elastic_ep is known to
+                            brick the service in this topology.)
     down                    save per-container logs, stop containers
     bench LABEL [N] [C]     vllm bench from host
     scale TARGET_DP         POST /scale_elastic_ep (known to hit EPLB

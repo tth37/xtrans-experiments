@@ -35,6 +35,11 @@
 : "${MODEL_HOST:=/data/models--Qwen--Qwen3-30B-A3B}"
 : "${MODEL_SNAPSHOT:=$MODEL_HOST/snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39}"
 : "${MODEL_PATH_IN_CTN:=/models/qwen3-30b-a3b/snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39}"
+# Registered server name -- must be identical across phases so `vllm bench
+# serve --model $SERVED_MODEL_NAME` hits the right endpoint regardless of
+# whether the server is native (uses host paths) or containerised (uses
+# in-container paths).
+: "${SERVED_MODEL_NAME:=qwen3-30b-a3b}"
 : "${VLLM_IMAGE:=xtrans-vllm-ep:v0.19.0}"
 : "${RAY_PORT:=26379}"
 : "${VLLM_PORT:=8000}"
@@ -121,10 +126,13 @@ vllm_bench() {
     log "Bench[$label]: n=$num_prompts, concurrency=$concurrency"
     # --random-input-len / --random-output-len give reproducible shape.
     # --save-result writes the full JSON into OUT_DIR.
+    # --model is the name the bench client uses in the request payload; must
+    # match what the server registered. --tokenizer loads locally from the
+    # host filesystem for tokenisation during request generation.
     vllm bench serve \
         --backend vllm \
-        --model "$MODEL_SNAPSHOT" \
-        --served-model-name "$MODEL_SNAPSHOT" \
+        --model "$SERVED_MODEL_NAME" \
+        --tokenizer "$MODEL_SNAPSHOT" \
         --host "$host" \
         --port "$port" \
         --endpoint /v1/completions \

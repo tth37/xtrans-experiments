@@ -65,6 +65,7 @@ start() {
         --entrypoint /bin/bash \
         "$VLLM_IMAGE" \
         -c "vllm serve $MODEL_PATH_IN_CTN \
+             --served-model-name $SERVED_MODEL_NAME \
              --host 0.0.0.0 --port 8000 \
              --tensor-parallel-size 1 \
              --data-parallel-size 2 \
