@@ -17,8 +17,12 @@ venv/
 *.swp
 *.swo
 
-# Experiment outputs
-**/results/
+# Experiment outputs: ignore every file under results/ but keep the
+# directories themselves tracked so per-build analysis.md writeups
+# can be committed.
+**/results/**
+!**/results/**/
+!**/results/**/analysis.md
 **/logs/
 **/traces/
 *.csv
