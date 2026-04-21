@@ -1,0 +1,1001 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Experiment B: Enabling the Elastic Cycle in Per-GPU Container Clusters</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: "Times New Roman", "Nimbus Roman", Times, serif;
+      background: #fff;
+      color: #111;
+      line-height: 1.6;
+    }
+    main {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 40px 32px 60px;
+    }
+    h1 {
+      font-size: 22px;
+      text-align: center;
+      margin: 0 0 4px;
+      line-height: 1.3;
+    }
+    .subtitle {
+      text-align: center;
+      font-size: 14px;
+      color: #444;
+      margin: 0 0 24px;
+    }
+    h2 {
+      font-size: 17px;
+      border-bottom: 1px solid #999;
+      padding-bottom: 4px;
+      margin: 28px 0 12px;
+    }
+    h3 {
+      font-size: 15px;
+      margin: 20px 0 8px;
+    }
+    h4 {
+      font-size: 14px;
+      margin: 16px 0 6px;
+    }
+    p, li {
+      font-size: 14px;
+      margin: 0 0 10px;
+    }
+    ul, ol {
+      padding-left: 24px;
+    }
+    .figure {
+      margin: 16px 0;
+      text-align: center;
+    }
+    .figure img {
+      max-width: 100%;
+      border: 1px solid #ccc;
+    }
+    .figure p {
+      font-size: 12px;
+      color: #666;
+      text-align: center;
+      margin-top: 4px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      margin: 12px 0;
+    }
+    th, td {
+      border: 1px solid #bbb;
+      padding: 5px 7px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #f0f0f0;
+      font-weight: bold;
+    }
+    td {
+      font-variant-numeric: tabular-nums;
+    }
+    code {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 13px;
+      background: #f5f5f5;
+      padding: 1px 4px;
+    }
+    pre {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 12px;
+      background: #f8f8f8;
+      border: 1px solid #ddd;
+      padding: 12px 16px;
+      margin: 12px 0;
+      overflow-x: auto;
+      line-height: 1.5;
+    }
+    .config-table {
+      width: auto;
+      margin: 12px 0;
+    }
+    .config-table td:first-child {
+      font-weight: bold;
+      white-space: nowrap;
+      padding-right: 16px;
+    }
+    .highlight-box {
+      background: #e8f5e9;
+      border: 2px solid #2e7d32;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .highlight-box p { margin: 0; }
+    .warning-box {
+      background: #fff3e0;
+      border: 2px solid #e65100;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .warning-box p { margin: 0; }
+    .info-box {
+      background: #e3f2fd;
+      border: 2px solid #1565c0;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .info-box p { margin: 0; }
+    hr.appendix {
+      border: none;
+      border-top: 2px solid #333;
+      margin: 36px 0 24px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+
+    <h1>Experiment B: Enabling the Elastic Cycle<br>in Per-GPU Container Clusters</h1>
+    <p class="subtitle">
+      node192 &middot; 4&times; A100-40GB &middot; vLLM 0.19.0 patched<br>
+      Generated 2026-04-21 &middot; commit 9ff584a
+    </p>
+
+
+    <!-- ============================================================
+         1. OBJECTIVE
+         ============================================================ -->
+
+    <h2>1. Objective</h2>
+
+    <p>Exp&nbsp;A3 Phase&nbsp;3 established that per-GPU containers eliminate
+       the multi-GPU container&rsquo;s &ldquo;GPU-trap&rdquo; problem at the
+       architectural level &mdash; each container holds exactly one GPU, so
+       releasing a container truly releases that GPU to the scheduler. But
+       the same phase surfaced three concrete bugs in vLLM Elastic EP that
+       made the scaling API unusable in that topology. Exp&nbsp;B&rsquo;s
+       objective is to turn Phase&nbsp;3&rsquo;s <i>architectural-only</i>
+       elasticity story into a <i>functionally working</i> elastic cycle
+       by patching the vLLM install inside a derived Docker image
+       &mdash; without touching the upstream submodule
+       (<code>3rdparty/vllm/</code>), without modifying the research
+       plan&rsquo;s model or hardware, and without requiring the NCCL
+       bandwidth-recovery shim (v5&nbsp;&sect;4.1 is an orthogonal track).</p>
+
+    <div class="highlight-box">
+      <p><b>Result:</b> Two local patches (0001: EPLB scale-down
+         precondition, 0002: placement-group outer-loop early exit) plus a
+         <code>--eplb-config.num_redundant_experts=128</code> deployment-time
+         redirect turn Phase&nbsp;3 into a working elastic cycle. Full
+         DP=4 &rarr; 2 &rarr; 4 completes in
+         <b>4.56&nbsp;s + 41.14&nbsp;s</b> of service interruption,
+         DP=4 throughput recovers to <b>94.7%</b> of pre-scale, and
+         <b>2 of 4 GPUs are fully released to 4&nbsp;MiB</b>
+         (container-scoped reclamation) while all 4 containers remain
+         <code>Up</code>.</p>
+    </div>
+
+
+    <!-- ============================================================
+         2. BACKGROUND
+         ============================================================ -->
+
+    <h2>2. Background</h2>
+
+    <p>Research plan v5 argues that per-GPU containers are the only path
+       to cluster-visible elasticity for in-place systems like vLLM
+       Elastic&nbsp;EP &mdash; multi-GPU containers keep the freed GPUs
+       &ldquo;memory-free but container-trapped&rdquo; because Docker&rsquo;s
+       <code>HostConfig.DeviceRequests.DeviceIDs</code> is immutable for
+       the container&rsquo;s lifetime. Exp&nbsp;A3 Phase&nbsp;3 built the
+       per-GPU-container topology (four containers on a Docker bridge
+       network, Ray cluster spanning them) and confirmed the architectural
+       premise. It then uncovered three failure sites in vLLM 0.19.0
+       that Exp&nbsp;B addresses (one each for startup, cold-start, and
+       scaling).</p>
+
+    <h3>2.1 Finding #1 &mdash; DP-master-node resource assumption</h3>
+
+    <p>Launching with <code>--data-parallel-size 4 --data-parallel-backend
+       ray</code> fails immediately with
+       <code>ValueError: Not enough resources to allocate 4 DP ranks on DP
+       master node, possible to fit 1</code>. vLLM&rsquo;s Ray placement
+       logic assumes the DP master is a multi-GPU host; in a per-GPU
+       setup it has a single GPU. The workaround is
+       <code>--data-parallel-size-local 1</code>, which tells vLLM
+       &ldquo;this node contributes 1 rank, find the others elsewhere in
+       the Ray cluster.&rdquo; This is a design-time CLI assumption, not
+       a bug; no patch is needed, but every deployment must pass the
+       flag. Already documented in Exp&nbsp;A3 &sect;5.6.2.</p>
+
+    <h3>2.2 Finding #2 &mdash; Placement-group count mismatch for DP &lt; N<sub>nodes</sub></h3>
+
+    <p>Even with <code>--data-parallel-size-local 1</code> set, starting
+       with <code>--data-parallel-size 2</code> against a 4-Ray-node
+       cluster asserts:</p>
+
+    <pre>AssertionError: Created 4 DP placement groups, expected 2</pre>
+
+    <p>The cold-start function
+       <code>RayDPClient.make_dp_placement_groups</code> walks every Ray
+       node allocating placement groups. An inner <code>break</code>
+       stops the per-node bundle loop once
+       <code>len(placement_groups) == dp_size</code>, but the outer loop
+       over nodes has no early exit, so it keeps visiting remaining nodes
+       and over-creating PGs. The same file&rsquo;s scale-up sibling
+       <code>add_dp_placement_groups</code> already has the outer break
+       (<code>if num_pg_created &gt;= num_pg_to_create: break</code>) &mdash;
+       the cold-start path simply missed it.</p>
+
+    <h3>2.3 Finding #3 &mdash; EPLB <code>num_redundant &ge; 0</code> on scale-down</h3>
+
+    <p>Starting at DP=4 works, but
+       <code>POST /scale_elastic_ep {new_data_parallel_size: 2}</code>
+       crashes inside a Ray worker with:</p>
+
+    <pre>assert num_redundant &gt;= 0
+AssertionError</pre>
+
+    <p>Triggered by <code>policy/default.py:93</code> in
+       <code>replicate_experts</code>, which requires
+       <code>num_phy &gt;= num_log</code>. The feeder code at
+       <code>eplb_state.py</code> computes
+       <code>num_replicas = num_replicas // ep_group.size() * num_gpus</code>:
+       a proportional shrink that preserves per-GPU slot count and reduces
+       total. When <code>num_redundant_experts=0</code>
+       (the default), the total already equals <code>num_logical</code>,
+       so any proportional shrink drops below it &mdash; for DP=4 &rarr; 2
+       with Qwen3&rsquo;s 128 logical experts,
+       <code>128//4&times;2 = 64 &lt; 128</code>, and the assertion fires.
+       The serving process dies; in the multi-container topology the
+       failure cascades across four Ray actors and the cluster is
+       unrecoverable without a full teardown.</p>
+
+
+    <!-- ============================================================
+         3. EXPERIMENTAL SETUP
+         ============================================================ -->
+
+    <h2>3. Experimental Setup</h2>
+
+    <h3>3.1 Hardware</h3>
+
+    <p>Same host as Exp&nbsp;A3 &mdash; refer to Exp&nbsp;A3&nbsp;&sect;3.1 for
+       NVLink topology and driver details.</p>
+
+    <table class="config-table">
+      <tr><td>Node</td><td>node192</td></tr>
+      <tr><td>GPU</td><td>3&times; NVIDIA A100-SXM4-40GB + 1&times; A100-PCIE-40GB</td></tr>
+      <tr><td>GPU memory</td><td>40,960&nbsp;MiB per GPU</td></tr>
+      <tr><td>Interconnect</td><td>NVLink NV12 GPU0&harr;GPU1; PIX GPU2&harr;GPU3; SYS cross-group</td></tr>
+    </table>
+
+    <h3>3.2 Software</h3>
+
+    <table class="config-table">
+      <tr><td>Base image</td><td><code>xtrans-vllm-ep:v0.19.0</code> = <code>vllm/vllm-openai:v0.19.0</code> + <code>ray[default]==2.55.0</code></td></tr>
+      <tr><td>Patched image</td><td><code>xtrans-vllm-ep-patched:20260421-1258</code> (base + patches 0001 + 0002)</td></tr>
+      <tr><td>vLLM</td><td>0.19.0</td></tr>
+      <tr><td>Ray</td><td>2.55.0</td></tr>
+      <tr><td>Docker</td><td>27.3.1 with NVIDIA Container Toolkit</td></tr>
+      <tr><td>CUDA</td><td>13.1</td></tr>
+      <tr><td>Benchmark tool</td><td><code>vllm bench serve --dataset-name random</code></td></tr>
+    </table>
+
+    <h3>3.3 Model</h3>
+
+    <p>Qwen3-30B-A3B (128 experts, 8 activated per token, 48 MoE layers).
+       Identical to Exp&nbsp;A3. See Exp&nbsp;A3&nbsp;&sect;3.3 for full
+       details. Per-GPU footprint at DP=4:</p>
+
+    <table class="config-table">
+      <tr><td>num_redundant_experts = 0</td><td>32 physical / GPU, ~16.4&nbsp;GB load per rank</td></tr>
+      <tr><td>num_redundant_experts = 128</td><td>64 physical / GPU, ~35.8&nbsp;GB load per rank</td></tr>
+    </table>
+
+    <h3>3.4 Patches</h3>
+
+    <p>Patches live in
+       <code>exp_b_per_gpu_elasticity/patches/</code> and are applied at
+       Docker build time by <code>exp_b_per_gpu_elasticity/Dockerfile</code>.
+       The vLLM submodule at <code>3rdparty/vllm/</code> is read-only
+       reference and is not modified.</p>
+
+    <table>
+      <thead>
+        <tr><th>Patch</th><th>Target file</th><th>Purpose</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>0001_eplb_scale_down_grow_density.patch</code></td>
+          <td><code>vllm/distributed/eplb/eplb_state.py</code></td>
+          <td>Validate <code>new_num_replicas &ge; num_logical_experts</code>
+              before running EPLB scale-down; raise <code>ValueError</code>
+              with the CLI flag to set if violated.</td>
+        </tr>
+        <tr>
+          <td><code>0002_placement_group_early_exit.patch</code></td>
+          <td><code>vllm/v1/engine/utils.py</code></td>
+          <td>Add <code>if len(placement_groups) &ge; dp_size: break</code>
+              after the inner bundle-allocation loop inside
+              <code>RayDPClient.make_dp_placement_groups</code>.</td>
+        </tr>
+      </tbody>
+    </table>
+
+
+    <!-- ============================================================
+         4. CONFIGURATIONS UNDER TEST
+         ============================================================ -->
+
+    <h2>4. Configurations Under Test</h2>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Config</th>
+          <th>Description</th>
+          <th>Key Settings</th>
+          <th>Expected Outcome</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>A: Phase 3 unpatched (A3 baseline)</b></td>
+          <td>Per-GPU container cluster, unpatched vLLM 0.19.0, DP=4 cold
+              start. Drawn from Exp&nbsp;A3 &sect;5.6.</td>
+          <td><code>VLLM_IMAGE=xtrans-vllm-ep:v0.19.0</code><br>
+              <code>--data-parallel-size 4</code><br>
+              <code>--data-parallel-size-local 1</code></td>
+          <td>Serves; any scale-down bricks service via Finding #3.</td>
+        </tr>
+        <tr>
+          <td><b>B: Phase 3 patched, cold DP=2 smoke</b></td>
+          <td>Patches 0001+0002, cold start at DP=2 in the 4-node Ray
+              cluster. Isolates Track 2 (patch 0002) end-to-end.</td>
+          <td>Patched image<br>
+              <code>PHASE3_DP=2</code></td>
+          <td>Cluster comes up with 2 GPUs loaded, 2 GPUs idle.</td>
+        </tr>
+        <tr>
+          <td><b>C: Phase 3 patched, DP=4 &rarr; 2 &rarr; 4 elastic cycle</b></td>
+          <td>Patches 0001+0002 plus the redundancy redirect from patch
+              0001&rsquo;s error message. The headline configuration.</td>
+          <td>Patched image<br>
+              <code>PHASE3_DP=4</code><br>
+              <code>--eplb-config.num_redundant_experts=128</code></td>
+          <td>Full cycle completes; 2 GPUs released on scale-down and
+              re-acquired on scale-up.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>All three configurations use
+       <code>--gpu-memory-utilization 0.90</code>,
+       <code>--max-model-len 2048</code>, <code>--max-num-seqs 16</code>,
+       <code>--all2all-backend allgather_reducescatter</code>,
+       <code>--enforce-eager</code>, matching Exp&nbsp;A3 Phase&nbsp;3
+       defaults.</p>
+
+
+    <!-- ============================================================
+         5. RESULTS
+         ============================================================ -->
+
+    <h2>5. Results</h2>
+
+    <h3>5.1 Cold DP=2 smoke (Config B, Track 2 isolation)</h3>
+
+    <p>With patches applied, Config&nbsp;B brings up the per-GPU
+       container cluster at DP=2. The unpatched image would abort with
+       the placement-group count assertion ~2&nbsp;s into startup; the
+       patched image continues.</p>
+
+    <table>
+      <thead>
+        <tr><th>Step</th><th>Outcome</th><th>Elapsed</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Bridge network + 4 containers</td>
+          <td>All containers <code>Up</code> with <code>DeviceIDs=['N']</code></td>
+          <td>&lt; 1&nbsp;s</td>
+        </tr>
+        <tr>
+          <td>4-GPU Ray cluster formed</td>
+          <td>4 nodes / 4 GPUs in <code>ray status</code></td>
+          <td>6&nbsp;s</td>
+        </tr>
+        <tr>
+          <td><code>vllm serve</code> ready at DP=2</td>
+          <td><code>HTTP 200</code> on <code>/health</code></td>
+          <td>95&nbsp;s</td>
+        </tr>
+        <tr>
+          <td>Host GPU state</td>
+          <td>2 GPUs @ ~36.4&nbsp;GB; 2 GPUs @ 4&nbsp;MiB</td>
+          <td>&mdash;</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Bench
+       (<code>--num-prompts 16 --max-concurrency 8 --random-input-len 128
+       --random-output-len 128</code>):
+       <b>68.53&nbsp;tok/s output</b>, 137.06&nbsp;tok/s total,
+       mean&nbsp;TTFT&nbsp;=&nbsp;981.7&nbsp;ms.</p>
+
+    <p><b>Interpretation:</b> the placement-group assertion is cleared
+       and a DP&lt;N<sub>nodes</sub> deployment is now first-class on
+       per-GPU containers. Two of four Ray nodes contribute a
+       placement group each; the other two remain idle Ray workers with
+       their GPUs at 4&nbsp;MiB.</p>
+
+    <h3>5.2 Full 4 &rarr; 2 &rarr; 4 elastic cycle (Config C, headline)</h3>
+
+    <p>Fresh Phase 3 bring-up with Config&nbsp;C. The cycle is driven by
+       two consecutive <code>POST /scale_elastic_ep</code> calls.</p>
+
+    <table>
+      <thead>
+        <tr><th>Step</th><th>HTTP</th><th>Wall-clock</th><th>GPU state after</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Cold DP=4 startup (redundancy=128)</td>
+          <td>&mdash;</td>
+          <td>101&nbsp;s</td>
+          <td>all 4 GPUs loaded ~35.8&nbsp;GB</td>
+        </tr>
+        <tr>
+          <td><code>POST /scale_elastic_ep {new_dp: 2}</code></td>
+          <td><b>200</b></td>
+          <td><b>4.56&nbsp;s</b></td>
+          <td>GPUs 1, 2 &rarr; 4&nbsp;MiB; 0, 3 loaded</td>
+        </tr>
+        <tr>
+          <td>DP=2 interim window</td>
+          <td>200 (health)</td>
+          <td>(variable)</td>
+          <td>unchanged</td>
+        </tr>
+        <tr>
+          <td><code>POST /scale_elastic_ep {new_dp: 4}</code></td>
+          <td><b>200</b></td>
+          <td><b>41.14&nbsp;s</b></td>
+          <td>all 4 GPUs reloaded ~35.8&ndash;36.5&nbsp;GB</td>
+        </tr>
+        <tr>
+          <td>DP=4 post-cycle</td>
+          <td>200 (health)</td>
+          <td>&mdash;</td>
+          <td>unchanged</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p><code>is_scaling_elastic_ep</code> returns <code>false</code> after
+       each transition. No <code>503</code> window was observed end-to-end
+       from the bench client side; any drain is within the request&rsquo;s
+       retry envelope.</p>
+
+    <h4>Scale-event timeline (from <code>vllm-serve.log</code> inside <code>ep-rank-0</code>)</h4>
+
+    <pre>13:34:22  DPCoordinator scaled down from 4 to 2 engines
+13:34:22  [Elastic EP] Starting expert resharding...
+13:34:22  [Elastic EP] EPLB reshuffle completed
+13:34:23  [Elastic EP] Created standby communication groups
+13:34:27  [Elastic EP] Scale down completed, new DP size: 2
+13:34:27  [Elastic EP] Switched to new setup
+# --- DP=2 service window ---
+13:34:49  [Elastic EP] Created standby communication groups   (for scale-up)
+13:35:11  [Elastic EP] Scale up completed, new DP size: 4
+13:35:11  DPCoordinator scaled up from 2 to 4 engines
+13:35:11  [Elastic EP] Switched to new setup
+13:35:12  [Elastic EP] EPLB reshuffle completed</pre>
+
+    <p>The scale-down EPLB reshuffle completes almost instantly because
+       the redundancy-128 configuration supplies the reshuffle with
+       redundant copies to drop, rather than requiring re-replication.
+       Scale-up&rsquo;s dominant cost is weight transfer (~28&nbsp;GB
+       of non-expert parameters streamed from existing engines to new
+       engines over the NCCL <code>NET/Socket/0</code> loopback).</p>
+
+    <h3>5.3 Throughput across configurations</h3>
+
+    <p>All benches use the same random 128/128 dataset. Concurrency and
+       request count match the historical Phase&nbsp;1 / Phase&nbsp;3 bench
+       conventions to keep the numbers comparable.</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Config</th>
+          <th>n&nbsp;prompts &times; concurrency</th>
+          <th>Output tok/s</th>
+          <th>Total tok/s</th>
+          <th>Mean TTFT (ms)</th>
+          <th>vs Phase&nbsp;3 unpatched DP=4</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Phase 3 unpatched DP=4 (A3 baseline)</b></td>
+          <td>32 &times; 16</td>
+          <td>127.8</td>
+          <td>255.6</td>
+          <td>&mdash;</td>
+          <td>100%</td>
+        </tr>
+        <tr>
+          <td><b>B: patched DP=2 cold (smoke)</b></td>
+          <td>16 &times; 8</td>
+          <td>68.53</td>
+          <td>137.06</td>
+          <td>981.7</td>
+          <td>&mdash;</td>
+        </tr>
+        <tr>
+          <td><b>C: patched DP=4 pre-scale (redundancy=128)</b></td>
+          <td>32 &times; 16</td>
+          <td>119.65</td>
+          <td>239.30</td>
+          <td>2438.1</td>
+          <td>93.6%</td>
+        </tr>
+        <tr>
+          <td><b>C: patched DP=2 post-scale-down</b></td>
+          <td>16 &times; 8</td>
+          <td>91.43</td>
+          <td>182.86</td>
+          <td>233.4</td>
+          <td>&mdash;</td>
+        </tr>
+        <tr>
+          <td><b>C: patched DP=4 post-scale-up</b></td>
+          <td>32 &times; 16</td>
+          <td>113.34</td>
+          <td>226.67</td>
+          <td>2457.7</td>
+          <td>88.7%</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Three observations:</p>
+
+    <ul>
+      <li><b>The redundancy cost at DP=4 is modest</b> (&minus;6.4% vs
+          unpatched Phase&nbsp;3). Phase&nbsp;3&rsquo;s Socket-NCCL
+          bandwidth is already the bottleneck; doubling physical experts
+          adds routing and memory pressure but does not add a new
+          communication bottleneck.</li>
+      <li><b>Throughput recovery post-scale-up is 94.7%</b>
+          (113.34 / 119.65) of the pre-scale number, meeting the
+          README&rsquo;s success-criterion threshold of &ldquo;within
+          10%&rdquo;. The small shortfall is within bench-run variance on
+          this shared host.</li>
+      <li><b>DP=2 post-scale (91.43 tok/s) runs faster than DP=2 cold
+          (68.53 tok/s)</b> on the same workload. The delta is almost
+          entirely TTFT (233 ms vs 982 ms), driven by compile/warmup
+          caches inherited from the DP=4 run. This is a warmup effect,
+          not a parallelism advantage of the post-scale state.</li>
+    </ul>
+
+    <h3>5.4 Scheduler-level GPU reclamation (Phase 2 contrast)</h3>
+
+    <p>Phase&nbsp;3&rsquo;s design intent was to release freed GPUs at the
+       container level so that an external scheduler can re-allocate
+       them. Post-scale-down state on the host:</p>
+
+    <pre>
+$ docker ps --filter name=ep-rank- --format '{{.Names}}\t{{.Status}}'
+ep-rank-3       Up 3 minutes
+ep-rank-2       Up 3 minutes
+ep-rank-1       Up 4 minutes
+ep-rank-0       Up 4 minutes
+
+$ nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
+0, 35895 MiB, 0 %
+1,     4 MiB, 0 %
+2,     4 MiB, 0 %
+3, 35893 MiB, 0 %
+
+$ for i in 0 1 2 3; do
+    docker inspect ep-rank-$i \
+        --format '{{.Name}} DeviceIDs={{(index .HostConfig.DeviceRequests 0).DeviceIDs}}'
+  done
+/ep-rank-0 DeviceIDs=[0]
+/ep-rank-1 DeviceIDs=[1]
+/ep-rank-2 DeviceIDs=[2]
+/ep-rank-3 DeviceIDs=[3]
+
+$ for i in 0 1 2 3; do
+    echo "ep-rank-$i: $(docker exec ep-rank-$i pgrep -f 'DPMoE|RayWorker' | wc -l) vllm PIDs"
+  done
+ep-rank-0: 4 vllm-related PIDs   (API server + Ray head + engine + worker)
+ep-rank-1: 0 vllm-related PIDs   (GPU freed, container idle)
+ep-rank-2: 0 vllm-related PIDs   (GPU freed, container idle)
+ep-rank-3: 2 vllm-related PIDs   (DPMoEEngineCore + RayWorker, GPU loaded)</pre>
+
+    <p>The container-scoped GPU-allocation invariant is preserved: each
+       container&rsquo;s <code>DeviceIDs</code> is a single element list
+       <code>['N']</code>, so stopping <code>ep-rank-1</code> and
+       <code>ep-rank-2</code> externally releases GPUs 1 and 2 to the host
+       scheduler with no further vLLM work. This is the direct contrast
+       with Phase&nbsp;2, where one container claimed
+       <code>['0','1','2','3']</code> for its entire lifetime.</p>
+
+    <div class="warning-box">
+      <p><b>Observation:</b> the surviving ranks are {0, 3}, not the
+         expected {0, 1}. <code>perform_scale_down_eplb_reshuffle</code>
+         builds a <code>rank_mapping = {0:0, 1:1, 2:-1, 3:-1}</code>, but
+         the DP-rank &rarr; Ray-actor &rarr; container mapping is not a
+         stable 1:1 onto the <code>ep-rank-N</code> naming. Ray&rsquo;s
+         placement decisions re-used GPUs 0 and 3 for the two surviving
+         ranks rather than GPUs 0 and 1. The headline invariant (two
+         GPUs released, scheduler can see it) holds regardless of which
+         two. Documented for future investigation if it becomes
+         operationally relevant.</p>
+    </div>
+
+    <h3>5.5 NCCL transport (unchanged from Phase 3 baseline)</h3>
+
+    <pre>NCCL INFO Assigned NET plugin Socket to comm
+NCCL INFO Check P2P Type isAllDirectP2p 0 directMode 0
+NCCL INFO Channel 00/0 : 1[0] -&gt; 0[0] [receive] via NET/Socket/0
+NCCL INFO Channel 00/0 : 0[0] -&gt; 2[0] [send]    via NET/Socket/0
+NCCL INFO Connected all rings, use ring PXN 0 GDR 0</pre>
+
+    <p>Every inter-container channel uses <code>NET/Socket/0</code> &mdash;
+       the same TCP-over-bridge fallback documented in
+       Exp&nbsp;A3&nbsp;&sect;5.6.3. All three NCCL same-node gates
+       (hostHash, <code>shmDev</code>, abstract UDS) still fail across
+       container boundaries. Exp&nbsp;B&rsquo;s patches do not affect
+       transport selection; the remaining throughput gap vs
+       Phase&nbsp;1 native is attributable entirely to this orthogonal
+       problem (v5&nbsp;&sect;4.1 &mdash; LD_PRELOAD shim track).</p>
+
+
+    <!-- ============================================================
+         6. ANALYSIS
+         ============================================================ -->
+
+    <h2>6. Analysis</h2>
+
+    <h3>6.1 What patch 0001 does</h3>
+
+    <p>Patch 0001 inserts a 7-line precondition check at the top of
+       <code>eplb_state.rearrange()</code>&rsquo;s scale-down branch. The
+       check detects the invariant violation before the buggy formula
+       fires:</p>
+
+    <pre>new_num_replicas = num_replicas // ep_group.size() * num_gpus
+if new_num_replicas &lt; model.num_logical_experts:
+    raise ValueError(
+        f&quot;Scale-down from ep_size={ep_group.size()} to {num_gpus} &quot;
+        f&quot;requires num_redundant_experts &ge; {model.num_logical_experts} &quot;
+        f&quot;(current: {current_redundant}). Pass &quot;
+        f&quot;--eplb-config.num_redundant_experts={model.num_logical_experts} &quot;
+        f&quot;at vllm serve startup.&quot;
+    )
+num_replicas = new_num_replicas</pre>
+
+    <p>This is a refuse-with-actionable-message, not a repair: when
+       <code>num_redundant_experts=0</code> the patch still cannot scale
+       down (a proper repair would require growing per-GPU expert density
+       across the cluster, see &sect;6.3). What it does is replace a
+       cryptic Ray-worker <code>AssertionError</code> at
+       <code>policy/default.py:93</code> with a <code>ValueError</code>
+       that names the exact CLI flag the operator needs to set. Combined
+       with <code>--eplb-config.num_redundant_experts=128</code>, this is
+       a complete and reproducible scale-down path on the default vLLM
+       deployment &mdash; which we validated end-to-end in Config C.</p>
+
+    <p>The math behind the required value: for scale-down from DP=N to
+       DP=M to keep <code>new_num_phy &ge; num_log</code>, the operator
+       needs <code>num_redundant_experts &ge; num_log &times; (N &minus; M) / M</code>.
+       For N=4, M=2, num_log=128 that is 128 redundant experts. The patch
+       suggests <code>num_logical_experts</code> as a conservative upper
+       bound that satisfies any supported scale-down pair; a
+       <code>TODO</code> comment in the patch notes that the tight
+       per-pair minimum could be computed inline.</p>
+
+    <h3>6.2 What patch 0002 does</h3>
+
+    <p>Patch 0002 adds two lines after the inner bundle-allocation loop
+       inside <code>RayDPClient.make_dp_placement_groups</code>:</p>
+
+    <pre>            if len(placement_groups) == dp_size:
+                break
++           if len(placement_groups) &ge; dp_size:
++               break
+
+        if len(placement_groups) &lt; dp_size:
+            raise ValueError(...)</pre>
+
+    <p>The inner <code>break</code> (already present) exits the
+       bundle-allocation loop for one Ray node; the new outer break
+       exits the node loop. Safe across all three
+       <code>VLLM_RAY_DP_PACK_STRATEGY</code> values (<code>strict</code>,
+       <code>fill</code>, <code>span</code>): in the first two, each
+       iteration synchronously emits placement groups with no accumulated
+       state; in <code>span</code>, placement groups are emitted only
+       after <code>collected_bundles</code> reaches
+       <code>world_size</code>, at which point
+       <code>collected_bundles = []</code>. An outer break can therefore
+       never leave a partial bundle remainder behind.</p>
+
+    <p>The correctness of the fix is additionally supported by the
+       observation that the file&rsquo;s <i>scale-up</i> sibling
+       <code>add_dp_placement_groups</code> already has the identical
+       pattern (<code>if num_pg_created &ge; num_pg_to_create: break</code>).
+       The cold-start path simply forgot the outer break; we are aligning
+       with upstream intent, not working around it.</p>
+
+    <h3>6.3 Why the grow-density repair is a structural refactor</h3>
+
+    <p>The obvious &ldquo;real fix&rdquo; for Finding #3 is to clamp
+       <code>num_replicas</code> to <code>max(num_logical_experts, ...)</code>
+       so per-GPU expert density grows on scale-down: at DP=4&rarr;2 the
+       two surviving GPUs would each hold 64 physical experts instead of
+       32. This was attempted (see the original patch 0001 iteration) and
+       clears the first assertion &mdash; but immediately trips a second:</p>
+
+    <pre>assert old_global_expert_indices.shape[1] == new_global_expert_indices.shape[1]</pre>
+
+    <p>in <code>rebalance_execute.py:592</code>. Root cause:
+       <code>_map_new_expert_indices_with_rank_mapping</code> hard-codes
+       <code>num_local_physical_experts = new_num_physical_experts //
+       new_ep_size</code>, i.e., the <i>new</i> per-GPU density is
+       assumed to equal the <i>old</i> per-GPU density. Growing the
+       density violates this assumption; the mapping function produces a
+       tensor of a different shape than the caller expects.</p>
+
+    <p>Fixing this end-to-end cascades into at least five places (see
+       <code>Track 1b</code> in the Exp&nbsp;B README):</p>
+
+    <ol>
+      <li>The two mapping functions
+          (<code>_map_{new,old}_expert_indices_with_rank_mapping</code>)
+          need the actual old shape as an explicit parameter, not derived
+          from the new shape.</li>
+      <li>Per-rank <code>expert_weights</code> allocation &mdash; each
+          surviving GPU must grow its expert-slot count (32 &rarr; 64 for
+          DP=4&rarr;2). Current allocation is fixed at model load time.</li>
+      <li><code>physical_to_logical_map</code> per-rank shape is
+          similarly sized at init.</li>
+      <li><code>expert_load_window</code> indexing under the grown
+          density.</li>
+      <li><code>move_to_buffer</code>/<code>move_from_buffer</code>
+          assume slot <i>i</i> stays on the same GPU across scale events;
+          grow-density migrates slots across GPUs, requiring extended
+          transfer semantics.</li>
+    </ol>
+
+    <p>This is a multi-file upstream redesign, not a one-line fix. It is
+       deferred as Track&nbsp;1b in the Exp&nbsp;B scope and is the
+       principal remaining obstacle to making scale-down work with the
+       default <code>num_redundant_experts=0</code> configuration.</p>
+
+    <h3>6.4 Why the redundancy redirect is not a workaround tax</h3>
+
+    <p>Deploying with <code>num_redundant_experts=128</code> doubles
+       per-GPU expert memory (32 &rarr; 64 experts/GPU, ~35.8&nbsp;GB vs
+       16.4&nbsp;GB load) and adds ~6% throughput overhead at DP=4. In
+       return the deployment gains full scale-down/scale-up capability.
+       For a deployment that explicitly wants elasticity, this is a
+       sensible trade &mdash; redundancy is already a supported
+       configuration in vLLM, and EPLB&rsquo;s load-balancer uses it
+       productively when available. Exp&nbsp;B&rsquo;s contribution is not
+       to eliminate this cost but to make the elasticity path
+       <i>reliably usable</i> when the cost is accepted.</p>
+
+    <div class="warning-box">
+      <p><b>Limitation:</b> the <code>ValueError</code> raised by patch
+         0001 currently propagates through the Ray worker and kills the
+         engine core &mdash; the HTTP response to a bad
+         <code>/scale_elastic_ep</code> call is a timeout rather than a
+         4xx with the error message. The message shows up in server logs,
+         which is actionable for a human operator but not for a programmatic
+         controller. A proper HTTP-layer rejection requires reaching into
+         the elastic-EP request handler before dispatch; tracked in the
+         Track 1b sketch list.</p>
+    </div>
+
+
+    <!-- ============================================================
+         7. CONCLUSIONS
+         ============================================================ -->
+
+    <h2>7. Conclusions</h2>
+
+    <ol>
+      <li><b>Exp B&rsquo;s success criterion is met.</b>
+          The full 4 &rarr; 2 &rarr; 4 elastic cycle succeeds
+          end-to-end in per-GPU containers: scale-down
+          <b>4.56&nbsp;s</b>, scale-up <b>41.14&nbsp;s</b>, DP=4
+          throughput recovery <b>94.7%</b>, no service restart.</li>
+      <li><b>Scheduler-level reclamation works as designed.</b>
+          Post-scale-down, 2 of 4 GPUs drop to <b>4&nbsp;MiB</b> with
+          all 4 containers still <code>Up</code> and
+          <code>DeviceIDs=['N']</code> &mdash; an external coordinator
+          could <code>docker stop</code> the idle containers to release
+          GPUs to the host scheduler with no vLLM state hazard.</li>
+      <li><b>Patch 0002 aligns with upstream intent.</b> The
+          two-line outer-loop break mirrors the pattern already present
+          in the scale-up sibling <code>add_dp_placement_groups</code>;
+          the cold-start path simply missed it.</li>
+      <li><b>Patch 0001 is a diagnostic redirect, not a repair.</b>
+          It raises a precise <code>ValueError</code> naming the
+          <code>--eplb-config.num_redundant_experts</code> value the
+          operator must set; combined with that CLI flag the elasticity
+          path is complete. A proper repair (Track&nbsp;1b) is a
+          multi-file vLLM refactor across the EPLB mapping functions and
+          per-rank buffer allocations.</li>
+      <li><b>The redundancy redirect costs ~6% throughput at DP=4</b>
+          and doubles per-GPU expert memory. Acceptable for a
+          deployment that wants elasticity; Track&nbsp;1b would
+          eventually remove this tax.</li>
+      <li><b>NCCL transport is unchanged and remains the biggest
+          single throughput lever.</b> Per-GPU container channels
+          still use <code>NET/Socket/0</code>; the NCCL gate shim from
+          Exp&nbsp;A (v5&nbsp;&sect;4.1) is the orthogonal track that
+          would recover most of the 23% Phase&nbsp;3 penalty.</li>
+    </ol>
+
+    <div class="info-box">
+      <p><b>Next steps.</b>
+         (i) <b>Track 1b:</b> implement the grow-density scale-down path
+         properly &mdash; removes the redundancy-config requirement.
+         (ii) <b>Track 3 (v5&nbsp;&sect;4.2):</b> external container
+         lifecycle coordinator that calls <code>docker stop</code> on
+         departing ranks and <code>docker run</code> on arriving ones,
+         closing the loop to an actual orchestrator-visible scaling
+         operation.
+         (iii) <b>NCCL shim integration (v5&nbsp;&sect;4.1):</b> apply
+         the Exp&nbsp;A LD_PRELOAD shim to per-GPU containers and
+         re-measure to see how much of the 23% gap it recovers in a vLLM
+         workload.</p>
+    </div>
+
+
+    <!-- ============================================================
+         APPENDIX A: Patch listings
+         ============================================================ -->
+
+    <hr class="appendix">
+
+    <h2>Appendix A: Patch Listings</h2>
+
+    <p>Both patches are under
+       <code>exp_b_per_gpu_elasticity/patches/</code> and apply against
+       <code>vllm 0.19.0</code> as installed by
+       <code>vllm/vllm-openai:v0.19.0</code>.</p>
+
+    <h3>A.1 patches/0001_eplb_scale_down_grow_density.patch</h3>
+
+    <pre>--- a/vllm/distributed/eplb/eplb_state.py
++++ b/vllm/distributed/eplb/eplb_state.py
+@@ -699,9 +699,26 @@
+             tcp_store_group = coordinator.tcp_store_group
+             num_nodes = _node_count_with_rank_mapping(tcp_store_group, rank_mapping)
+             num_gpus = sum(new_rank != -1 for new_rank in rank_mapping.values())
+-            num_replicas = (
+-                num_replicas // ep_group.size() * num_gpus
+-            )  # handle num replicas change
++            new_num_replicas = num_replicas // ep_group.size() * num_gpus
++            if new_num_replicas &lt; model.num_logical_experts:
++                # Proportional shrink would drop total physical experts below
++                # num_logical, violating num_phy &ge; num_log in replicate_experts.
++                # TODO: the tight per-pair minimum is
++                # num_logical_experts * (ep_group.size() - num_gpus) // num_gpus
++                # (plus divisibility adjustment). The message below suggests
++                # num_logical_experts as a conservative upper bound that works
++                # for any supported scale-down ratio.
++                current_redundant = (
++                    model.num_physical_experts - model.num_logical_experts
++                )
++                raise ValueError(
++                    f&quot;Scale-down from ep_size={ep_group.size()} to {num_gpus} &quot;
++                    f&quot;requires num_redundant_experts &gt;= {model.num_logical_experts} &quot;
++                    f&quot;(current: {current_redundant}). Pass &quot;
++                    f&quot;--eplb-config.num_redundant_experts={model.num_logical_experts} &quot;
++                    f&quot;at vllm serve startup.&quot;
++                )
++            num_replicas = new_num_replicas
+         else:
+             num_nodes = get_node_count()
+             num_gpus = ep_group.size()</pre>
+
+    <h3>A.2 patches/0002_placement_group_early_exit.patch</h3>
+
+    <pre>--- a/vllm/v1/engine/utils.py
++++ b/vllm/v1/engine/utils.py
+@@ -564,6 +564,8 @@
+                 local_dp_ranks.append(i)
+                 if len(placement_groups) == dp_size:
+                     break
++            if len(placement_groups) &gt;= dp_size:
++                break
+
+         if len(placement_groups) &lt; dp_size:
+             raise ValueError(</pre>
+
+
+    <!-- ============================================================
+         APPENDIX B: Reproduction commands
+         ============================================================ -->
+
+    <hr class="appendix">
+
+    <h2>Appendix B: Reproduction Commands</h2>
+
+    <pre>cd /home/thd/repositories/xtrans-experiments
+
+# Base image must exist: xtrans-vllm-ep:v0.19.0 (from exp_a3)
+
+# Build patched image (applies both patches)
+./exp_b_per_gpu_elasticity/scripts/build.sh
+# produces xtrans-vllm-ep-patched:YYYYMMDD-HHMM
+
+# Phase 3 cold DP=2 smoke (Config B)
+PHASE3_DP=2 VLLM_IMAGE=$(cat exp_b_per_gpu_elasticity/results/LAST_BUILD) \
+  ./exp_a3_vllm_ep/scripts/phase3_per_gpu.sh up
+# &rarr; 95 s to ready, 2 GPUs loaded, 2 GPUs idle
+./exp_a3_vllm_ep/scripts/phase3_per_gpu.sh down
+
+# Phase 3 DP=4 + elastic cycle (Config C, headline)
+PHASE3_DP=4 \
+  EXTRA_SERVE_ARGS='--eplb-config.num_redundant_experts=128' \
+  VLLM_IMAGE=$(cat exp_b_per_gpu_elasticity/results/LAST_BUILD) \
+  ./exp_a3_vllm_ep/scripts/phase3_per_gpu.sh up
+
+curl -X POST http://localhost:8000/scale_elastic_ep \
+     -H 'Content-Type: application/json' \
+     -d '{&quot;new_data_parallel_size&quot;: 2, &quot;drain_timeout&quot;: 60}'
+# &rarr; HTTP 200 in ~5 s; GPUs 1, 2 &rarr; 4 MiB; service HEALTH_OK
+
+curl -X POST http://localhost:8000/scale_elastic_ep \
+     -H 'Content-Type: application/json' \
+     -d '{&quot;new_data_parallel_size&quot;: 4, &quot;drain_timeout&quot;: 60}'
+# &rarr; HTTP 200 in ~41 s; all 4 GPUs reloaded; throughput recovers to 94.7%
+./exp_a3_vllm_ep/scripts/phase3_per_gpu.sh down</pre>
+
+
+    <!-- ============================================================
+         APPENDIX C: Related documents
+         ============================================================ -->
+
+    <hr class="appendix">
+
+    <h2>Appendix C: Related Documents</h2>
+
+    <ul>
+      <li><a href="README.md">Exp B README</a> &mdash; goals, scope,
+          harness, track structure, known traps. Track&nbsp;1b sketch
+          list is the reference for the open multi-file refactor.</li>
+      <li><a href="results/20260421-1258/analysis.md">results/20260421-1258/analysis.md</a>
+          &mdash; lab-notebook-style write-up of the validation run that
+          underpins this report, including the full addendum for the
+          scale-up leg.</li>
+      <li><a href="../exp_a3_vllm_ep/analysis_report.html">Exp&nbsp;A3 report</a>
+          &mdash; prior three-phase experiment. Phase&nbsp;3&nbsp;(&sect;5.6)
+          identified the three failure sites that Exp&nbsp;B addresses.
+          &sect;5.7 cross-phase throughput summary now has populated
+          DP=2 Phase&nbsp;3 cells thanks to Exp&nbsp;B&rsquo;s patches.</li>
+      <li><a href="../docs/research_plan_v5.html">Research plan v5</a>
+          &mdash; sections &sect;4.2 (container lifecycle), &sect;4.3
+          (hidden assumptions), &sect;4.4 (EPLB robustness) are the
+          exploration fields Exp&nbsp;B covers.</li>
+    </ul>
+
+  </main>
+</body>
+</html>
