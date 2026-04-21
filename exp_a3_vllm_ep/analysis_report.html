@@ -1090,6 +1090,100 @@ ep-rank-3 DeviceIDs: ['3']</pre>
       </tbody>
     </table>
 
+    <h3>5.7 Cross-Phase Throughput Summary</h3>
+
+    <p>Consolidated view of output-token throughput at the three DP
+       configurations observed during a 2&rarr;4&rarr;2 cycle, reproduced
+       across the three containerisation regimes. Numbers are from a clean
+       re-run on 2026-04-21 using the refactored harness with
+       <code>vllm bench serve --dataset-name random --random-input-len 128
+       --random-output-len 128</code>; raw JSON output in
+       <code>exp_a3_vllm_ep/results/phase&lt;N&gt;/</code>.</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>DP configuration</th>
+          <th>Phase 1<br>(native, bare metal)</th>
+          <th>Phase 2<br>(single 4-GPU container)</th>
+          <th>Phase 3<br>(4 per-GPU containers)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>DP=2 initial</b> (cold-start baseline)</td>
+          <td>77.9 tok/s</td>
+          <td>65.5 tok/s</td>
+          <td><i>n/a</i> (see below)</td>
+        </tr>
+        <tr>
+          <td><b>DP=4</b> (post-scale-up for P1/P2, static for P3)</td>
+          <td><b>160.1 tok/s</b></td>
+          <td><b>127.8 tok/s</b></td>
+          <td><b>108.7 tok/s</b></td>
+        </tr>
+        <tr>
+          <td><b>DP=2 post-scale-down</b></td>
+          <td>69.0 tok/s</td>
+          <td>65.5 tok/s</td>
+          <td><i>n/a</i></td>
+        </tr>
+        <tr style="background:#f7f7f7;">
+          <td><b>DP=4 overhead vs Phase 1</b></td>
+          <td>&mdash; (reference)</td>
+          <td>&minus;20.2%</td>
+          <td>&minus;32.1%</td>
+        </tr>
+        <tr style="background:#f7f7f7;">
+          <td><b>Mean TPOT at DP=4</b></td>
+          <td>97.9 ms</td>
+          <td>107.0 ms</td>
+          <td>123.0 ms</td>
+        </tr>
+        <tr style="background:#f7f7f7;">
+          <td><b>Mean TTFT at DP=4</b></td>
+          <td>348 ms</td>
+          <td>2431 ms</td>
+          <td>3152 ms</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p><i>Why DP=2 cells are n/a for Phase&nbsp;3:</i> the per-GPU container
+       topology has 4 Ray nodes (one GPU each). With
+       <code>--data-parallel-size-local 1</code>, Ray greedily creates one
+       placement group per available node, forcing DP = cluster size. Asking
+       for <code>--data-parallel-size 2</code> in a 4-node cluster triggers
+       <code>AssertionError: Created 4 DP placement groups, expected 2</code>
+       before model load. Reaching DP=2 from DP=4 via
+       <code>/scale_elastic_ep</code> is also blocked in this topology by
+       the EPLB <code>num_redundant&nbsp;&ge;&nbsp;0</code> bug (Section
+       5.6.4). Phase 3 therefore observes DP=4 static.</p>
+
+    <p>Three readings of the same table:</p>
+
+    <ul>
+      <li><b>Down the Phase 1 column:</b> within-process 2&rarr;4&rarr;2
+          cycling works, with near-linear scaling (DP=4/DP=2 = 2.06&times;).
+          The DP=2 post-down figure (69.0) is slightly below DP=2 initial
+          (77.9) &mdash; run-to-run variance dominates at this sample size;
+          EPLB has also had time to rebalance based on observed traffic.</li>
+      <li><b>Across any row:</b> Phase 2 pays ~16&ndash;20% for
+          containerisation overhead (shm-size caps, Ray-inside-container
+          init), even though it keeps the same NCCL same-node transport as
+          Phase 1. Phase 3 pays another ~15% on top of Phase 2 because NCCL
+          falls to <code>NET/Socket/0</code>. The compounding is visible in
+          TTFT: 348&nbsp;ms native &rarr; 2431&nbsp;ms multi-GPU container
+          &rarr; 3152&nbsp;ms per-GPU containers.</li>
+      <li><b>The missing cells are the story:</b> Phase 3&rsquo;s n/a entries
+          are not a measurement gap &mdash; they encode the observation that
+          vLLM&rsquo;s elastic-EP implementation does not straightforwardly
+          support dynamic rank counts in a per-GPU-container cluster under
+          current flags and EPLB defaults. This is part of what Section 4
+          of v5 proposes to address (lifecycle-driven scaling, EPLB
+          redundancy, placement audits).</li>
+    </ul>
+
 
     <!-- ============================================================
          6. ANALYSIS: ELASTIC EP INTERNAL MECHANICS
