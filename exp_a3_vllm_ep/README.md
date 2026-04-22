@@ -331,27 +331,21 @@ the GPU. **The trap from the multi-GPU-container regime is eliminated.**
 **Results:** `results/per_gpu_containers/`
 **Analysis:** `analysis_report.html` section 5.6
 
-**Patches.** The per-GPU container regime ships with two local vLLM
-0.19.0 patches in `patches/`, applied at Docker build time by
+**Patches.** The per-GPU container regime ships with one local vLLM
+0.19.0 patch in `patches/`, applied at Docker build time by
 `Dockerfile.per_gpu_containers` to produce
 `xtrans-vllm-ep-patched:v0.19.0` (auto-built on first use by
 `per_gpu_containers.sh up`):
 
-- `0001_eplb_scale_down_grow_density.patch` — EPLB scale-down
-  precondition check. Converts the cryptic `num_redundant >= 0`
-  Ray-worker crash into an actionable `ValueError` naming
-  `--eplb-config.num_redundant_experts`. Off the critical path of the
-  primary 2→4→2 cycle (which uses R=0); matters only for operators
-  that cold-start above their minimum DP.
-- `0002_placement_group_early_exit.patch` — two-line outer-loop break
+- `0001_placement_group_early_exit.patch` — two-line outer-loop break
   in `RayDPClient.make_dp_placement_groups`. Load-bearing for the
   primary cycle: without it, cold DP=2 in a 4-Ray-node cluster trips
   `Created 4 DP placement groups, expected 2`. Mirrors the pattern
   already present in the scale-up sibling `add_dp_placement_groups`.
 
-With both patches applied, the full 2→4→2 cycle works end-to-end in
-per-GPU containers with `R=0`, matching native's cycle convention.
-See `analysis_report.html` §6.7 for mechanism detail.
+With this patch applied, the full 2→4→2 cycle works end-to-end in
+per-GPU containers with `num_redundant_experts=0`, matching native's
+cycle convention. See `analysis_report.html` §5.6 for mechanism detail.
 
 **Next:** apply the `common/shim/` LD_PRELOAD shim to the per-GPU container
 setup. Expected: NCCL gates pass, NVLink P2P recovered, throughput jumps

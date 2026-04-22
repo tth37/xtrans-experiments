@@ -1,15 +1,15 @@
-# exp_a3 patch 0002: placement-group outer-loop early exit
+# exp_a3 patch 0001: placement-group outer-loop early exit
 #
 # Against: vllm 0.19.0
 # Target file: vllm/v1/engine/utils.py
-# Applied by: Dockerfile.phase3 (produces xtrans-vllm-ep-patched:v0.19.0)
+# Applied by: Dockerfile.per_gpu_containers (produces xtrans-vllm-ep-patched:v0.19.0)
 #
 # Problem: RayDPClient.make_dp_placement_groups iterates all Ray nodes in
 # an outer loop and per-node allocates bundles into an inner loop. The
 # inner loop has a break at `if len(placement_groups) == dp_size: break`,
 # but that break only exits the inner loop -- the outer loop keeps
 # visiting subsequent nodes and creating extra placement groups. With
-# dp_size < len(nodes) (e.g. the Phase 3 per-GPU container setup:
+# dp_size < len(nodes) (e.g. the per-GPU container setup:
 # dp_size=2 against a 4-Ray-node cluster), this overshoots and trips
 # `assert len(placement_groups) == dp_size` a few lines below with
 # "Created 4 DP placement groups, expected 2".

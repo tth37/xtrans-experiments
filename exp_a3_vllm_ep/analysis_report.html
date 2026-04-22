@@ -1099,10 +1099,14 @@ ep-rank-3 DeviceIDs: ['3']</pre>
     <p>Consolidated view of output-token throughput at the three DP
        configurations observed during a 2&rarr;4&rarr;2 cycle, reproduced
        across the three containerisation regimes. Numbers are from a clean
-       re-run on 2026-04-21 using the refactored harness with
+       same-session re-run on 2026-04-22 using the unified harness
+       (<code>native.sh cycle</code>, <code>multi_gpu_container.sh cycle</code>,
+       <code>per_gpu_containers.sh cycle</code>) with
        <code>vllm bench serve --dataset-name random --random-input-len 128
        --random-output-len 128</code>; raw JSON output in
-       <code>exp_a3_vllm_ep/results/&lt;regime&gt;/</code>.</p>
+       <code>exp_a3_vllm_ep/results/&lt;regime&gt;/</code>. All three
+       regimes ran back-to-back in a single session to keep host-load
+       variance comparable.</p>
 
     <table>
       <thead>
@@ -1110,103 +1114,93 @@ ep-rank-3 DeviceIDs: ['3']</pre>
           <th>DP configuration</th>
           <th>Native<br>(bare metal)</th>
           <th>Multi-GPU container<br>(single 4-GPU container)</th>
-          <th>Per-GPU containers<br>(4 per-GPU containers)</th>
+          <th>Per-GPU containers<br>(4 per-GPU containers)<sup>&dagger;</sup></th>
         </tr>
       </thead>
       <tbody>
         <tr>
           <td><b>DP=2 initial</b> (cold-start baseline)</td>
-          <td>77.9 tok/s</td>
-          <td>65.5 tok/s</td>
-          <td>62.21 tok/s<sup>&dagger;</sup></td>
+          <td>73.07 tok/s</td>
+          <td>65.73 tok/s</td>
+          <td>66.63 tok/s</td>
         </tr>
         <tr>
-          <td><b>DP=4</b> (post-scale-up, or static for the per-GPU regime)</td>
-          <td><b>160.1 tok/s</b></td>
-          <td><b>127.8 tok/s</b></td>
-          <td><b>108.7 tok/s</b></td>
+          <td><b>DP=4 post-scale-up</b></td>
+          <td><b>171.23 tok/s</b></td>
+          <td><b>130.62 tok/s</b></td>
+          <td><b>103.35 tok/s</b></td>
         </tr>
         <tr>
           <td><b>DP=2 post-scale-down</b></td>
-          <td>69.0 tok/s</td>
-          <td>65.5 tok/s</td>
-          <td>67.53 tok/s<sup>&dagger;</sup></td>
+          <td>96.35 tok/s</td>
+          <td>70.43 tok/s</td>
+          <td>69.64 tok/s</td>
         </tr>
         <tr style="background:#f7f7f7;">
           <td><b>DP=4 overhead vs native</b></td>
           <td>&mdash; (reference)</td>
-          <td>&minus;20.2%</td>
-          <td>&minus;32.1%</td>
+          <td>&minus;23.7%</td>
+          <td>&minus;39.6%</td>
         </tr>
         <tr style="background:#f7f7f7;">
           <td><b>Mean TPOT at DP=4</b></td>
-          <td>97.9 ms</td>
-          <td>107.0 ms</td>
-          <td>123.0 ms</td>
+          <td>91.1 ms</td>
+          <td>109.4 ms</td>
+          <td>105.4 ms</td>
         </tr>
         <tr style="background:#f7f7f7;">
           <td><b>Mean TTFT at DP=4</b></td>
-          <td>348 ms</td>
-          <td>2431 ms</td>
-          <td>3152 ms</td>
+          <td>387 ms</td>
+          <td>1777 ms</td>
+          <td>6405 ms</td>
         </tr>
       </tbody>
     </table>
 
-    <p><sup>&dagger;</sup> <i>Per-GPU-container DP=2 cells were originally
-       &ldquo;n/a&rdquo; and have been populated via local vLLM&nbsp;0.19.0
-       patches 0001 + 0002 (<code>exp_a3_vllm_ep/patches/</code>, applied
-       at Docker-build time by <code>Dockerfile.per_gpu_containers</code>).
-       Numbers measured during a full
-       2&thinsp;&rarr;&thinsp;4&thinsp;&rarr;&thinsp;2 cycle with
-       <code>num_redundant_experts=0</code> (matching the native
-       convention).</i> At the time of this report&rsquo;s initial writing,
-       both were blocked: the per-GPU container topology has 4 Ray nodes
-       (one GPU each); with <code>--data-parallel-size-local 1</code>, Ray
-       greedily created one placement group per available node, so asking
-       for <code>--data-parallel-size 2</code> triggered
+    <p><sup>&dagger;</sup> <i>The per-GPU-container regime runs on a
+       patched vLLM 0.19.0 image
+       (<code>xtrans-vllm-ep-patched:v0.19.0</code>, built via
+       <code>Dockerfile.per_gpu_containers</code>) that applies one local
+       patch: <code>patches/0001_placement_group_early_exit.patch</code>.
+       Without this patch, cold DP=2 in a 4-Ray-node cluster trips
        <code>AssertionError: Created 4 DP placement groups, expected 2</code>
-       before model load (fixed by patch 0002, which was the
-       load-bearing patch for reaching DP=2 in a per-GPU cluster). The
-       subsequent scale-down back to DP=2 via
-       <code>/scale_elastic_ep</code> worked at <code>R=0</code> because
-       scale-up had built up the redundancy that scale-down then consumed
-       &mdash; patch 0001&rsquo;s <code>num_redundant &ge; 0</code> guard
-       and <code>--eplb-config.num_redundant_experts</code> redirect were
-       not on the critical path (they matter for an alternate cold-DP=4
-       deployment pattern).</p>
+       before model load &mdash; Ray greedily creates one placement group
+       per available node instead of stopping at <code>dp_size</code>.
+       The patch mirrors the early-exit pattern already present in
+       the scale-up sibling <code>add_dp_placement_groups</code>. With
+       it, the full 2&rarr;4&rarr;2 cycle runs at
+       <code>num_redundant_experts=0</code>, matching the native
+       convention.</i></p>
 
     <p>Three readings of the same table:</p>
 
     <ul>
       <li><b>Down the native column:</b> within-process 2&rarr;4&rarr;2
-          cycling works, with near-linear scaling (DP=4/DP=2 = 2.06&times;).
-          The DP=2 post-down figure (69.0) is slightly below DP=2 initial
-          (77.9) &mdash; run-to-run variance dominates at this sample size;
-          EPLB has also had time to rebalance based on observed traffic.</li>
+          cycling works, with near-linear scaling (DP=4 / DP=2 initial
+          = 2.34&times;). The DP=2 post-down figure (96.35) is higher
+          than DP=2 initial (73.07) &mdash; warmup effect: TTFT drops
+          from 1096&nbsp;ms (cold) to 165&nbsp;ms (warm) once EPLB has
+          rebalanced and CUDA graphs are primed.</li>
       <li><b>Across any row:</b> the multi-GPU-container regime pays
-          ~16&ndash;20% for containerisation overhead (shm-size caps,
+          ~24% for containerisation overhead at DP=4 (shm-size caps,
           Ray-inside-container init), even though it keeps the same NCCL
           same-node transport as native. Per-GPU containers pay another
-          ~15% on top of the multi-GPU container because NCCL falls to
+          ~20% on top of the multi-GPU container because NCCL falls to
           <code>NET/Socket/0</code>. The compounding is visible in TTFT:
-          348&nbsp;ms native &rarr; 2431&nbsp;ms multi-GPU container
-          &rarr; 3152&nbsp;ms per-GPU containers.</li>
+          387&nbsp;ms native &rarr; 1777&nbsp;ms multi-GPU container
+          &rarr; 6405&nbsp;ms per-GPU containers.</li>
       <li><b>The DP=2 cells for the per-GPU-container regime are now
           populated:</b> the original n/a entries encoded the observation
           that vLLM&rsquo;s elastic-EP implementation did not
           straightforwardly support dynamic rank counts in a
-          per-GPU-container cluster under default flags. The two local
-          patches in <code>patches/</code> are enough &mdash;
-          62.21&nbsp;tok/s cold DP=2 and 67.53&nbsp;tok/s post-scale-down
+          per-GPU-container cluster under default flags. The single
+          placement-group patch is enough &mdash;
+          66.63&nbsp;tok/s cold DP=2 and 69.64&nbsp;tok/s post-scale-down
           &mdash; using the same <code>num_redundant_experts=0</code>
-          convention as native. The per-GPU-container regime&rsquo;s ~20%
-          DP=2 throughput shortfall vs native comes from the NCCL
-          <code>NET/Socket/0</code> fallback (v5&nbsp;&sect;4.1 shim
-          track), not from the patches. The cold-DP=4 deployment pattern
-          (requiring <code>--eplb-config.num_redundant_experts</code>
-          pre-allocation) remains open as a grow-density refactor across
-          five vLLM sites.</li>
+          convention as native. The per-GPU-container regime&rsquo;s
+          ~9&ndash;28% DP=2 throughput shortfall vs native comes from the
+          NCCL <code>NET/Socket/0</code> fallback (v5&nbsp;&sect;4.1
+          shim track), not from the patch.</li>
     </ul>
 
 

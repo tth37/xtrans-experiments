@@ -230,11 +230,11 @@ bench() {
 }
 
 # ─── Subcommand: scale ────────────────────────────────────────────────
-# With the patched image (default), scale-down from a cold DP=N start still
-# hits the EPLB num_redundant>=0 invariant unless the operator passed
-# --eplb-config.num_redundant_experts at startup via EXTRA_SERVE_ARGS.
-# The 2->4->2 cycle that starts at DP=2 (default) works without
-# additional redundancy because scale-up builds it internally.
+# Use with the default 2->4->2 cycle: scale up from DP=2 first, which
+# grows per-GPU expert count via EPLB (building redundancy), then scale
+# down consumes that redundancy cleanly. Calling `scale 2` from a cold
+# DP=N>2 start will hit vLLM's EPLB `num_redundant>=0` assertion because
+# no redundancy has been pre-built; don't do that in this harness.
 scale() {
     local new_dp=${1:?target DP size required}
     trigger_scale "http://localhost:$VLLM_PORT" "$new_dp" \
@@ -285,6 +285,28 @@ nccl_grep() {
     echo "Full capture saved to $RESULTS_DIR/nccl_transport.log"
 }
 
+# ─── Subcommand: cycle ────────────────────────────────────────────────
+# Full reference cycle matching native.sh / multi_gpu_container.sh:
+# DP=2 baseline -> scale 4 -> bench -> scale 2 -> bench. Assumes `up`
+# was called with PER_GPU_DP=2 (default) and R=0 -- see analysis_report
+# §5.7 for why the 2->4->2 pattern works at R=0 (scale-up builds
+# redundancy that scale-down consumes).
+cycle() {
+    state "pre_cycle"
+    bench dp2_initial 16 8
+    scale 4
+    sleep 3
+    state "post_scale_up"
+    bench dp4_post_up 32 16
+    scale 2
+    sleep 3
+    state "post_scale_down"
+    bench dp2_post_down 16 8
+    state "post_cycle"
+    nccl_grep > /dev/null 2>&1 || true  # capture NCCL transport evidence
+    log "Cycle complete. Results in $RESULTS_DIR/"
+}
+
 # ─── Dispatch ─────────────────────────────────────────────────────────
 cmd=${1:-}; shift || true
 case "$cmd" in
@@ -293,10 +315,11 @@ case "$cmd" in
     bench)      bench "$@" ;;
     scale)      scale "$@" ;;
     state)      state "$@" ;;
+    cycle)      cycle ;;
     nccl-grep)  nccl_grep ;;
     *)
         cat <<'EOF' >&2
-usage: per_gpu_containers.sh {up|down|bench LABEL [N] [C]|scale TARGET_DP|state [TAG]|nccl-grep}
+usage: per_gpu_containers.sh {up|down|bench LABEL [N] [C]|scale TARGET_DP|state [TAG]|cycle|nccl-grep}
 
 subcommands:
     up                      bridge network + 4 per-GPU containers +
@@ -307,11 +330,14 @@ subcommands:
                             on first run.
     down                    save per-container logs, stop containers
     bench LABEL [N] [C]     vllm bench from host
-    scale TARGET_DP         POST /scale_elastic_ep (cold-DP=N scale-down
-                            needs --eplb-config.num_redundant_experts
-                            via EXTRA_SERVE_ARGS at startup; 2->4->2
-                            cycle from default DP=2 works with R=0)
+    scale TARGET_DP         POST /scale_elastic_ep. Use with the
+                            default 2->4->2 pattern (scale up from
+                            DP=2 first, then back down); cold-DP=N>2
+                            scale-down hits vLLM's EPLB invariant.
     state [TAG]             per-container DeviceIDs + host nvidia-smi
+    cycle                   full DP=2 → 4 → 2 reference cycle with benchmarks
+                            (matches native.sh / multi_gpu_container.sh
+                            cycle semantics). Assumes PER_GPU_DP=2 default.
     nccl-grep               extract NCCL transport selection from
                             vllm-serve log (the NET/Socket/0 headline)
 
