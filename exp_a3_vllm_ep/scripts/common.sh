@@ -1,6 +1,6 @@
 # shellcheck shell=bash
-# Shared helpers for Exp A3 phase scripts (phase1_native.sh, phase2_container.sh,
-# phase3_per_gpu.sh). Source this file; do not execute it.
+# Shared helpers for Exp A3 regime scripts (native.sh, multi_gpu_container.sh,
+# per_gpu_containers.sh). Source this file; do not execute it.
 #
 # Exported vars (may be overridden by caller before sourcing):
 #   PROJECT_ROOT        absolute path to the xtrans-experiments checkout
@@ -41,8 +41,9 @@
 # in-container paths).
 : "${SERVED_MODEL_NAME:=qwen3-30b-a3b}"
 : "${VLLM_IMAGE:=xtrans-vllm-ep:v0.19.0}"
-# Phase 3 uses the patched image by default (see Dockerfile.phase3);
-# auto-built on first use by ensure_patched_image().
+# Per-GPU containers regime uses the patched image by default (see
+# Dockerfile.per_gpu_containers); auto-built on first use by
+# ensure_patched_image().
 : "${VLLM_IMAGE_PATCHED:=xtrans-vllm-ep-patched:v0.19.0}"
 : "${RAY_PORT:=26379}"
 : "${VLLM_PORT:=8000}"
@@ -228,8 +229,8 @@ docker_ensure_image() {
 }
 
 # Ensure VLLM_IMAGE_PATCHED exists locally; build it if not.
-# Used by phase3_per_gpu.sh to auto-build the patched image on first run.
-# Requires xtrans-vllm-ep:v0.19.0 (the base, built from Dockerfile.phase2)
+# Used by per_gpu_containers.sh to auto-build the patched image on first run.
+# Requires xtrans-vllm-ep:v0.19.0 (the base, built from Dockerfile.base)
 # to already exist.
 ensure_patched_image() {
     if docker image inspect "$VLLM_IMAGE_PATCHED" > /dev/null 2>&1; then
@@ -238,14 +239,14 @@ ensure_patched_image() {
     if ! docker image inspect "xtrans-vllm-ep:v0.19.0" > /dev/null 2>&1; then
         log "ERROR: base image xtrans-vllm-ep:v0.19.0 not found; build it first:"
         log "    docker build -t xtrans-vllm-ep:v0.19.0 \\"
-        log "        -f $PROJECT_ROOT/exp_a3_vllm_ep/Dockerfile.phase2 \\"
+        log "        -f $PROJECT_ROOT/exp_a3_vllm_ep/Dockerfile.base \\"
         log "        $PROJECT_ROOT/exp_a3_vllm_ep"
         return 1
     fi
-    log "Patched image $VLLM_IMAGE_PATCHED not found; building from Dockerfile.phase3..."
+    log "Patched image $VLLM_IMAGE_PATCHED not found; building from Dockerfile.per_gpu_containers..."
     docker build \
         -t "$VLLM_IMAGE_PATCHED" \
-        -f "$PROJECT_ROOT/exp_a3_vllm_ep/Dockerfile.phase3" \
+        -f "$PROJECT_ROOT/exp_a3_vllm_ep/Dockerfile.per_gpu_containers" \
         "$PROJECT_ROOT/exp_a3_vllm_ep" \
         || { log "ERROR: build failed"; return 1; }
     log "Built $VLLM_IMAGE_PATCHED"

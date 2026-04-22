@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
-# Exp A3 Phase 2: vLLM Elastic EP inside a single multi-GPU container.
+# Exp A3 Multi-GPU container regime: vLLM Elastic EP inside a single
+# multi-GPU container.
 #
 # Container is launched with --gpus '"device=0,1,2,3"', mounts the HF cache
 # read-only, and starts vllm serve at DP=2. Bench benchmarks use the same
-# `vllm bench serve` command as Phase 1, run from the host against port
-# ${VLLM_PORT}. The benchmark produces comparable numbers to Phase 1.
+# `vllm bench serve` command as the native regime, run from the host
+# against port ${VLLM_PORT}. The benchmark produces comparable numbers to
+# native.
 #
-# Key Phase 2 observations captured by `state`:
+# Key multi-GPU-container observations captured by `state`:
 #     container's HostConfig.DeviceRequests.DeviceIDs  (what Docker claims)
 #     host-side nvidia-smi                              (what's actually in use)
 # The delta between these is the "orchestrator trap" finding.
 #
 # Usage:
-#   ./scripts/phase2_container.sh start         # run container + vllm serve
-#   ./scripts/phase2_container.sh bench LABEL   # vllm bench from host
-#   ./scripts/phase2_container.sh scale NEW_DP  # /scale_elastic_ep
-#   ./scripts/phase2_container.sh state [TAG]   # GPU + docker inspect snapshot
-#   ./scripts/phase2_container.sh cycle         # full 2->4->2 cycle
-#   ./scripts/phase2_container.sh stop
+#   ./scripts/multi_gpu_container.sh start         # run container + vllm serve
+#   ./scripts/multi_gpu_container.sh bench LABEL   # vllm bench from host
+#   ./scripts/multi_gpu_container.sh scale NEW_DP  # /scale_elastic_ep
+#   ./scripts/multi_gpu_container.sh state [TAG]   # GPU + docker inspect snapshot
+#   ./scripts/multi_gpu_container.sh cycle         # full 2->4->2 cycle
+#   ./scripts/multi_gpu_container.sh stop
 
 set -euo pipefail
 
@@ -25,17 +27,17 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
 
-CONTAINER_NAME="xtrans-exp-a3-phase2"
+CONTAINER_NAME="xtrans-exp-a3-multi-gpu"
 MODEL_MOUNT_IN_CTN="/models/qwen3-30b-a3b"  # parent dir for HF blob+snapshot layout
-RESULTS_DIR="$PROJECT_ROOT/exp_a3_vllm_ep/results/phase2"
+RESULTS_DIR="$PROJECT_ROOT/exp_a3_vllm_ep/results/multi_gpu_container"
 
 # ─── Liveness & diagnostics ──────────────────────────────────────────
-phase2_liveness() {
+multi_gpu_container_liveness() {
     # Container still running (not Exited)
     [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" = "true" ]
 }
 
-phase2_diag() {
+multi_gpu_container_diag() {
     log "docker inspect State:"
     docker inspect -f '    Status={{.State.Status}} ExitCode={{.State.ExitCode}} Error={{.State.Error}}' \
         "$CONTAINER_NAME" 2>&1 >&2 || true
@@ -83,7 +85,7 @@ start() {
 
     # Container-side logs persist; we also dump to results/ at stop.
     wait_for_ready "http://localhost:${VLLM_PORT}/health" 600 \
-        phase2_liveness phase2_diag
+        multi_gpu_container_liveness multi_gpu_container_diag
 }
 
 stop() {
@@ -113,11 +115,11 @@ scale() {
 
 # ─── Subcommand: state ────────────────────────────────────────────────
 # Snapshots both what vLLM sees and what Docker still claims -- this is
-# the Phase 2 signature finding (DeviceIDs don't change).
+# the multi-GPU-container signature finding (DeviceIDs don't change).
 state() {
     local tag=${1:-snapshot}
     {
-        echo "=== Phase 2 state ($tag) at $(date) ==="
+        echo "=== Multi-GPU container state ($tag) at $(date) ==="
         echo ""
         echo "## Container ##"
         docker ps --filter "name=$CONTAINER_NAME" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
@@ -163,7 +165,7 @@ case "$cmd" in
     cycle)  cycle ;;
     *)
         cat <<'EOF' >&2
-usage: phase2_container.sh {start|stop|bench LABEL [N] [C]|scale TARGET_DP|state [TAG]|cycle}
+usage: multi_gpu_container.sh {start|stop|bench LABEL [N] [C]|scale TARGET_DP|state [TAG]|cycle}
 
 subcommands:
     start                   launch container + start vllm serve inside
@@ -175,7 +177,7 @@ subcommands:
     cycle                   full DP=2 → 4 → 2 reference cycle with benchmarks
 
 prerequisites:
-    * image `xtrans-vllm-ep:v0.19.0` built (see Dockerfile.phase2)
+    * image `xtrans-vllm-ep:v0.19.0` built (see Dockerfile.base)
     * Qwen3-30B-A3B downloaded to /data/models--Qwen--Qwen3-30B-A3B/
     * all 4 GPUs free on the host
 EOF

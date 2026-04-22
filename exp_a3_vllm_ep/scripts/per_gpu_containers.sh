@@ -1,25 +1,26 @@
 #!/usr/bin/env bash
-# Exp A3 Phase 3: one vLLM Elastic EP rank per container.
+# Exp A3 Per-GPU containers regime: one vLLM Elastic EP rank per container.
 #
 # Four containers (ep-rank-0 ... ep-rank-3) on a Docker bridge network
 # ${NETWORK}. Each container owns exactly one GPU via --gpus device=N.
 # ep-rank-0 runs a Ray head + vllm serve; ep-rank-1..3 run Ray workers.
 # `vllm bench serve` runs from the host against ep-rank-0's exposed port.
 #
-# Key Phase 3 observations:
+# Key per-GPU-container observations:
 #     each container's DeviceIDs is ['N'] (not ['0','1','2','3']) -- the
-#     Phase 2 trap is gone, but NCCL falls back to NET/Socket/0 because all
-#     three same-node gates (hostname, /dev/shm, abstract UDS) fail.
+#     multi-GPU-container trap is gone, but NCCL falls back to
+#     NET/Socket/0 because all three same-node gates (hostname, /dev/shm,
+#     abstract UDS) fail.
 #
 # Usage:
-#   ./scripts/phase3_per_gpu.sh up            # full launch: network + all 4
-#                                             # containers + vllm serve
-#   ./scripts/phase3_per_gpu.sh bench LABEL   # vllm bench from host
-#   ./scripts/phase3_per_gpu.sh nccl-grep     # extract NCCL transport
-#                                             # selection from vllm log
-#   ./scripts/phase3_per_gpu.sh state [TAG]   # per-container DeviceIDs +
-#                                             # host nvidia-smi
-#   ./scripts/phase3_per_gpu.sh down          # teardown
+#   ./scripts/per_gpu_containers.sh up            # full launch: network + all 4
+#                                                 # containers + vllm serve
+#   ./scripts/per_gpu_containers.sh bench LABEL   # vllm bench from host
+#   ./scripts/per_gpu_containers.sh nccl-grep     # extract NCCL transport
+#                                                 # selection from vllm log
+#   ./scripts/per_gpu_containers.sh state [TAG]   # per-container DeviceIDs +
+#                                                 # host nvidia-smi
+#   ./scripts/per_gpu_containers.sh down          # teardown
 
 set -euo pipefail
 
@@ -27,9 +28,9 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
 
-NETWORK="xtrans-phase3"
+NETWORK="xtrans-per-gpu"
 MODEL_MOUNT_IN_CTN="/models/qwen3-30b-a3b"
-RESULTS_DIR="$PROJECT_ROOT/exp_a3_vllm_ep/results/phase3"
+RESULTS_DIR="$PROJECT_ROOT/exp_a3_vllm_ep/results/per_gpu_containers"
 SERVE_LOG_IN_CTN="/tmp/vllm-serve.log"
 
 # ─── Internal helpers ─────────────────────────────────────────────────
@@ -80,7 +81,7 @@ launch_rank_container() {
 # Check that all 4 ep-rank-N containers are still Running AND that the
 # vllm-serve process inside ep-rank-0 is still alive (crashes inside the
 # backgrounded docker exec are silent otherwise).
-phase3_liveness() {
+per_gpu_containers_liveness() {
     for i in 0 1 2 3; do
         local state
         state=$(docker inspect -f '{{.State.Running}}' "ep-rank-$i" 2>/dev/null)
@@ -91,7 +92,7 @@ phase3_liveness() {
     return 0
 }
 
-phase3_diag() {
+per_gpu_containers_diag() {
     log "Container states:"
     for i in 0 1 2 3; do
         echo "    ep-rank-$i: $(docker inspect -f 'Status={{.State.Status}} ExitCode={{.State.ExitCode}}' ep-rank-$i 2>/dev/null || echo 'missing')" >&2
@@ -104,8 +105,8 @@ phase3_diag() {
 up() {
     mkdir -p "$RESULTS_DIR"
 
-    # Phase 3 uses the patched vLLM image by default (fixes the EPLB
-    # scale-down + placement-group bugs that otherwise brick per-GPU
+    # Per-GPU containers use the patched vLLM image by default (fixes the
+    # EPLB scale-down + placement-group bugs that otherwise brick per-GPU
     # container scaling; see patches/ and analysis_report.html).
     # Operator can override by setting VLLM_IMAGE explicitly.
     if [ -z "${VLLM_IMAGE:-}" ] || [ "${VLLM_IMAGE}" = "xtrans-vllm-ep:v0.19.0" ]; then
@@ -163,10 +164,11 @@ up() {
 
     # vllm serve inside ep-rank-0 -- background via bash -c so the exec
     # returns immediately; log file lives in the container at $SERVE_LOG_IN_CTN.
-    # Default is DP=4; override with PHASE3_DP=<N> to start at a smaller
-    # size (used by Exp B to isolate the placement-group patch). Extra
-    # serve flags (e.g. --eplb-config) can be passed via EXTRA_SERVE_ARGS.
-    local dp_size=${PHASE3_DP:-4}
+    # Default starts at DP=2 (matching the other regimes' 2->4->2 cycle);
+    # override with PER_GPU_DP=<N> (e.g. 2, 4) to cold-start at a different
+    # size. Extra serve flags (e.g. --gpu-memory-utilization 0.95) can be
+    # passed via EXTRA_SERVE_ARGS.
+    local dp_size=${PER_GPU_DP:-2}
     local extra=${EXTRA_SERVE_ARGS:-}
     log "Launching vllm serve in ep-rank-0 at DP=${dp_size} (extra=${extra:-none})"
     docker exec -d ep-rank-0 /bin/bash -c "
@@ -197,7 +199,7 @@ up() {
     # otherwise pgrep fires before the process exists and we falsely abort.
     sleep 15
     wait_for_ready "http://localhost:${VLLM_PORT}/health" 600 \
-        phase3_liveness phase3_diag
+        per_gpu_containers_liveness per_gpu_containers_diag
 }
 
 down() {
@@ -228,8 +230,11 @@ bench() {
 }
 
 # ─── Subcommand: scale ────────────────────────────────────────────────
-# Note: known to hit the EPLB num_redundant>=0 assertion when scaling down
-# from a cold DP=N start. Expect unrecoverable failure in that path.
+# With the patched image (default), scale-down from a cold DP=N start still
+# hits the EPLB num_redundant>=0 invariant unless the operator passed
+# --eplb-config.num_redundant_experts at startup via EXTRA_SERVE_ARGS.
+# The 2->4->2 cycle that starts at DP=2 (default) works without
+# additional redundancy because scale-up builds it internally.
 scale() {
     local new_dp=${1:?target DP size required}
     trigger_scale "http://localhost:$VLLM_PORT" "$new_dp" \
@@ -240,7 +245,7 @@ scale() {
 state() {
     local tag=${1:-snapshot}
     {
-        echo "=== Phase 3 state ($tag) at $(date) ==="
+        echo "=== Per-GPU containers state ($tag) at $(date) ==="
         echo ""
         echo "## Containers ##"
         docker ps --filter "name=ep-rank-" --format 'table {{.Names}}\t{{.Status}}'
@@ -265,7 +270,7 @@ state() {
 
 # ─── Subcommand: nccl-grep ────────────────────────────────────────────
 # Pull the NCCL transport-selection lines out of the vllm serve log. The
-# Phase 3 headline finding is "NET/Socket/0" on every channel.
+# per-GPU-container headline finding is "NET/Socket/0" on every channel.
 nccl_grep() {
     if ! docker exec ep-rank-0 test -f "$SERVE_LOG_IN_CTN" 2>/dev/null; then
         log "vllm-serve log not found in ep-rank-0"
@@ -291,24 +296,27 @@ case "$cmd" in
     nccl-grep)  nccl_grep ;;
     *)
         cat <<'EOF' >&2
-usage: phase3_per_gpu.sh {up|down|bench LABEL [N] [C]|scale TARGET_DP|state [TAG]|nccl-grep}
+usage: per_gpu_containers.sh {up|down|bench LABEL [N] [C]|scale TARGET_DP|state [TAG]|nccl-grep}
 
 subcommands:
     up                      bridge network + 4 per-GPU containers +
-                            Ray cluster + vllm serve at DP=4
-                            (Phase 3 starts at DP=4 directly; elastic
-                            scaling via /scale_elastic_ep is known to
-                            brick the service in this topology.)
+                            Ray cluster + vllm serve at DP=2
+                            (override with PER_GPU_DP=<N>). Uses
+                            the patched vLLM image by default;
+                            auto-builds from Dockerfile.per_gpu_containers
+                            on first run.
     down                    save per-container logs, stop containers
     bench LABEL [N] [C]     vllm bench from host
-    scale TARGET_DP         POST /scale_elastic_ep (known to hit EPLB
-                            num_redundant bug; use at your own risk)
+    scale TARGET_DP         POST /scale_elastic_ep (cold-DP=N scale-down
+                            needs --eplb-config.num_redundant_experts
+                            via EXTRA_SERVE_ARGS at startup; 2->4->2
+                            cycle from default DP=2 works with R=0)
     state [TAG]             per-container DeviceIDs + host nvidia-smi
     nccl-grep               extract NCCL transport selection from
                             vllm-serve log (the NET/Socket/0 headline)
 
 prerequisites:
-    * image `xtrans-vllm-ep:v0.19.0` built
+    * base image `xtrans-vllm-ep:v0.19.0` built (from Dockerfile.base)
     * Qwen3-30B-A3B at /data/models--Qwen--Qwen3-30B-A3B/
     * all 4 GPUs free on the host
 EOF

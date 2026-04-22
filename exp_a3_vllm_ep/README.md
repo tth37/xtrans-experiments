@@ -73,53 +73,54 @@ tail -f /tmp/qwen3-moe-download.log
 
 ### 3. Reproduce end-to-end with the refactored scripts
 
-All three phases use the shared harness in `scripts/common.sh` (venv
+All three regimes use the shared harness in `scripts/common.sh` (venv
 activation, `vllm bench serve` invocation, `/scale_elastic_ep` driver,
-`nvidia-smi` snapshots, container inspection). Each phase entry point
+`nvidia-smi` snapshots, container inspection). Each regime entry point
 shares a common subcommand surface.
 
-**Phase 1 (native, reference baseline):**
+**Native (reference baseline):**
 ```bash
-./scripts/phase1_native.sh start    # Ray head + vllm serve at DP=2
-./scripts/phase1_native.sh cycle    # bench DP=2 → scale 4 → bench DP=4
-                                    # → scale 2 → bench DP=2 (post)
-./scripts/phase1_native.sh stop
+./scripts/native.sh start    # Ray head + vllm serve at DP=2
+./scripts/native.sh cycle    # bench DP=2 → scale 4 → bench DP=4
+                             # → scale 2 → bench DP=2 (post)
+./scripts/native.sh stop
 ```
 
-**Phase 2 (multi-GPU container):**
+**Multi-GPU container:**
 ```bash
-./scripts/phase2_container.sh start
-./scripts/phase2_container.sh cycle # same cycle, inside container
-./scripts/phase2_container.sh stop
+./scripts/multi_gpu_container.sh start
+./scripts/multi_gpu_container.sh cycle  # same cycle, inside container
+./scripts/multi_gpu_container.sh stop
 # state snapshots capture docker DeviceIDs -- the trap signature
 ```
 
-**Phase 3 (per-GPU containers, static DP=4):**
+**Per-GPU containers:**
 ```bash
-./scripts/phase3_per_gpu.sh up      # bridge network + 4 containers +
-                                    # Ray cluster + vllm serve at DP=4
-./scripts/phase3_per_gpu.sh bench dp4 32 16
-./scripts/phase3_per_gpu.sh nccl-grep   # extract the NET/Socket/0 finding
-./scripts/phase3_per_gpu.sh down
+./scripts/per_gpu_containers.sh up      # bridge network + 4 containers +
+                                        # Ray cluster + vllm serve at DP=2
+                                        # (auto-builds patched image)
+./scripts/per_gpu_containers.sh bench dp2 16 8
+./scripts/per_gpu_containers.sh nccl-grep  # extract the NET/Socket/0 finding
+./scripts/per_gpu_containers.sh down
 ```
 
 All subcommands produce timestamped, progress-reporting output. The
 `wait_for_ready` helper aborts fast if the backing process dies and
 dumps diagnostics instead of polling to timeout. Results land in
-`results/<phase>/` (gitignored); each `bench_<label>.json` is a
+`results/<regime>/` (gitignored); each `bench_<label>.json` is a
 standard `vllm bench serve` output with TTFT/TPOT/ITL percentiles plus
 throughput. Hard prerequisite: all 4 GPUs free on the host; override
 with `ALLOW_BUSY_GPUS=1` at your own risk.
 
-**2026-04-21 re-run (refactored scripts):** all three phases produced
+**2026-04-21 re-run (refactored scripts):** all three regimes produced
 results consistent with the original numbers in this README. Output
 throughput at DP=4 under `vllm bench serve --dataset-name random`:
-Phase&nbsp;1 ≈ 160&nbsp;tok/s, Phase&nbsp;2 ≈ 128&nbsp;tok/s,
-Phase&nbsp;3 ≈ 109&nbsp;tok/s — same ranking as original, absolute
+native ≈ 160&nbsp;tok/s, multi-GPU container ≈ 128&nbsp;tok/s,
+per-GPU containers ≈ 109&nbsp;tok/s — same ranking as original, absolute
 numbers slightly lower because the new bench uses a stricter
 random-prompt shape (input 128 / output 128) vs. the original ad-hoc
-benchmark. The qualitative findings (Phase 2 DeviceIDs trap, Phase 3
-NCCL TCP fallback) are identical.
+benchmark. The qualitative findings (multi-GPU-container DeviceIDs
+trap, per-GPU-container NCCL TCP fallback) are identical.
 
 ### Legacy direct invocation (for reference)
 
@@ -162,9 +163,9 @@ curl -X POST http://localhost:8000/scale_elastic_ep \
 curl http://localhost:8000/is_scaling_elastic_ep
 ```
 
-## Experiment Phases
+## Experiment Regimes
 
-### Phase 1: vLLM Elastic EP Native (Baseline) — COMPLETE
+### Native (Baseline Regime) — COMPLETE
 
 Ran 2026-04-19 on node192 with Qwen3-30B-A3B, vLLM 0.19.0, Ray 2.55.0.
 
@@ -203,31 +204,31 @@ from a cold DP=4 start hits an EPLB assertion with `num_redundant_experts=0`):
 - No request migration — 503 is instant reject, client must retry
 - Round-trip (2→4→2) is repeatable
 
-**Script:** `scripts/phase1_native.sh`
-**Results:** `results/phase1/` (including `phase1_results.json`, `round2.json`, `serve.log`)
+**Script:** `scripts/native.sh`
+**Results:** `results/native/` (including `native_results.json`, `round2.json`, `serve.log`)
 **Analysis:** `analysis_report.html` sections 5.0–5.4
 
-### Phase 2: Multi-GPU Container (The In-Place Barrier) — COMPLETE
+### Multi-GPU Container (The In-Place Barrier) — COMPLETE
 
 Ran 2026-04-20 on the same hardware with the same 2→4→2 cycle, but
 inside a single Docker container launched with `--gpus '"device=0,1,2,3"'`.
 
-**Image:** `xtrans-vllm-ep:v0.19.0` — built via `Dockerfile.phase2` which
+**Image:** `xtrans-vllm-ep:v0.19.0` — built via `Dockerfile.base` which
 adds `ray[default]==2.55.0` to `vllm/vllm-openai:v0.19.0` (the upstream
 image does not include Ray, and elastic EP requires it).
 
-**Throughput (Phase 1 ↔ Phase 2):**
+**Throughput (native ↔ multi-GPU container):**
 
-| Config | Phase 1 (native) | Phase 2 (container) | Container overhead |
-|--------|------------------|---------------------|--------------------|
+| Config | Native | Multi-GPU container | Container overhead |
+|--------|--------|---------------------|--------------------|
 | DP=2 initial | 87.4 tok/s | 66.7 tok/s | −23.7% |
 | DP=4 post-scale-up | 166.6 tok/s | 154.1 tok/s | −7.5% |
 | DP=2 post-scale-down | 91.6 tok/s | 69.2 tok/s | −24.5% |
 
-**Rescaling (Phase 1 ↔ Phase 2):**
+**Rescaling (native ↔ multi-GPU container):**
 
-| Operation | Phase 1 | Phase 2 |
-|-----------|---------|---------|
+| Operation | Native | Multi-GPU container |
+|-----------|--------|---------------------|
 | Startup → first request | 70 s | 110 s |
 | Scale-up 2→4 | 22.97–25.81 s | 39.18 s |
 | Scale-down 4→2 | 4.05–9.64 s | 4.65 s |
@@ -237,7 +238,7 @@ image does not include Ray, and elastic EP requires it).
 `docker inspect HostConfig.DeviceRequests.DeviceIDs` is **immutable at
 `['0','1','2','3']`** throughout the entire container lifetime. Host-side
 `nvidia-smi` confirms the memory actually releases (GPU 2–3 drop to 4 MiB
-within ~10s of scale-down, same as Phase 1). So the container releases
+within ~10s of scale-down, same as native). So the container releases
 **memory** but not **GPU allocation** at the orchestrator level. In a K8s
 deployment, the Pod would still be charged for all 4 `nvidia.com/gpu`
 requests even when vLLM has internally scaled down to 2 engines.
@@ -248,22 +249,22 @@ process during reshape, so the container can be recreated with a different
 indefinitely — no such window exists. **The trap persists for the entire
 serving lifetime.**
 
-**Script:** `scripts/phase2_container.sh`
-**Results:** `results/phase2/` (including `phase2_results.json`, `start.log`, host view snapshots)
+**Script:** `scripts/multi_gpu_container.sh`
+**Results:** `results/multi_gpu_container/` (including `multi_gpu_container_results.json`, `start.log`, host view snapshots)
 **Analysis:** `analysis_report.html` section 5.5
 
-### Phase 3: Per-GPU Containers — COMPLETE (with friction, as expected)
+### Per-GPU Containers — COMPLETE (with friction, as expected)
 
-Ran 2026-04-20: 4 containers (one per GPU), Docker bridge network `xtrans-phase3`,
+Ran 2026-04-20: 4 containers (one per GPU), Docker bridge network `xtrans-per-gpu`,
 Ray cluster across containers, `vllm serve` exec'd in `ep-rank-0` with 4 engines
-placed via Ray. The point of Phase 3 was to *surface* the friction of per-GPU
-deployment; friction is the finding.
+placed via Ray. The point of the per-GPU regime was to *surface* the friction of
+per-GPU deployment; friction is the finding.
 
 **Setup actually worked:**
 - Docker bridge network + 4 containers (~1 s)
 - Ray cluster formation across 4 containers (~5 s)
 - vLLM serve across the Ray cluster (92 s to ready, after workaround below)
-- Inference at DP=4: **127.8 tok/s** (−23% vs. Phase 1's 166.6 tok/s)
+- Inference at DP=4: **127.8 tok/s** (−23% vs. native's 166.6 tok/s)
 
 **Three problems (each a research finding):**
 
@@ -294,13 +295,15 @@ Result: NVLink NV12 (~600 GB/s) bypassed, traffic goes over Docker bridge
 TCP. 23% throughput loss on single-node. **This directly validates the
 motivation for the NCCL shim (`common/shim/`) from Exp A.**
 
-**3. `/scale_elastic_ep` 4→2 kills the service.** Same EPLB
-`num_redundant >= 0` bug we documented in Phase 1 (cold DP=4 start). In
-Phase 1/2 the process got stuck in 503 state. In Phase 3 the 4-container
-coordination means partial Ray actor teardown; all 4 GPUs drop to 4 MiB;
-restarting `vllm serve` alone doesn't recover (stale Ray actors / connections).
+**3. `/scale_elastic_ep` 4→2 kills the service (unpatched).** Same EPLB
+`num_redundant >= 0` bug documented in native mode (cold DP=4 start). In
+the native / multi-GPU-container regimes the process got stuck in 503 state.
+In per-GPU containers the 4-container coordination means partial Ray actor
+teardown; all 4 GPUs drop to 4 MiB; restarting `vllm serve` alone doesn't
+recover (stale Ray actors / connections). **Fixed by the patches in
+`patches/` — see below.**
 
-**The intended Phase 3 benefit confirmed:**
+**Per-GPU container benefit confirmed:**
 
 Each container's `HostConfig.DeviceRequests.DeviceIDs` contains only its own
 GPU:
@@ -311,27 +314,50 @@ ep-rank-2 DeviceIDs: ['2']
 ep-rank-3 DeviceIDs: ['3']
 ```
 
-Contrast Phase 2 where one container claimed `['0','1','2','3']` for its
-lifetime. Stopping `ep-rank-N` would truly free GPU N at both levels — vLLM
-releases CUDA context AND orchestrator reclaims the GPU. **The trap from
-Phase 2 is eliminated.**
+Contrast the multi-GPU-container regime where one container claimed
+`['0','1','2','3']` for its lifetime. Stopping `ep-rank-N` would truly free
+GPU N at both levels — vLLM releases CUDA context AND orchestrator reclaims
+the GPU. **The trap from the multi-GPU-container regime is eliminated.**
 
-**Throughput summary across all three phases:**
+**Throughput summary across all three regimes:**
 
 | Config | Transport | DP=4 tok/s | vs. native |
 |--------|-----------|-----------|-----------|
-| Phase 1 (native) | NVLink / CUDA IPC / SHM | 166.6 | 100% |
-| Phase 2 (4-GPU container) | NVLink / CUDA IPC / SHM | 154.1 | −7.5% |
-| Phase 3 (per-GPU containers) | **TCP sockets** | **127.8** | **−23.3%** |
+| Native | NVLink / CUDA IPC / SHM | 166.6 | 100% |
+| Multi-GPU container | NVLink / CUDA IPC / SHM | 154.1 | −7.5% |
+| Per-GPU containers | **TCP sockets** | **127.8** | **−23.3%** |
 
-**Script:** `scripts/phase3_per_gpu.sh`
-**Results:** `results/phase3/`
+**Script:** `scripts/per_gpu_containers.sh`
+**Results:** `results/per_gpu_containers/`
 **Analysis:** `analysis_report.html` section 5.6
+
+**Patches.** The per-GPU container regime ships with two local vLLM
+0.19.0 patches in `patches/`, applied at Docker build time by
+`Dockerfile.per_gpu_containers` to produce
+`xtrans-vllm-ep-patched:v0.19.0` (auto-built on first use by
+`per_gpu_containers.sh up`):
+
+- `0001_eplb_scale_down_grow_density.patch` — EPLB scale-down
+  precondition check. Converts the cryptic `num_redundant >= 0`
+  Ray-worker crash into an actionable `ValueError` naming
+  `--eplb-config.num_redundant_experts`. Off the critical path of the
+  primary 2→4→2 cycle (which uses R=0); matters only for operators
+  that cold-start above their minimum DP.
+- `0002_placement_group_early_exit.patch` — two-line outer-loop break
+  in `RayDPClient.make_dp_placement_groups`. Load-bearing for the
+  primary cycle: without it, cold DP=2 in a 4-Ray-node cluster trips
+  `Created 4 DP placement groups, expected 2`. Mirrors the pattern
+  already present in the scale-up sibling `add_dp_placement_groups`.
+
+With both patches applied, the full 2→4→2 cycle works end-to-end in
+per-GPU containers with `R=0`, matching native's cycle convention.
+See `analysis_report.html` §6.7 for mechanism detail.
 
 **Next:** apply the `common/shim/` LD_PRELOAD shim to the per-GPU container
 setup. Expected: NCCL gates pass, NVLink P2P recovered, throughput jumps
-from 127.8 tok/s toward Phase 2's 154.1 tok/s while keeping the Phase 3
-scheduler-level elasticity. That's the payoff of the whole v4 research plan.
+from 127.8 tok/s toward the multi-GPU-container regime's 154.1 tok/s while
+keeping the per-GPU regime's scheduler-level elasticity. That's the payoff
+of the whole v4 research plan.
 
 ## Smoke Test Findings (2026-04-17, on GPUs 0-1 only)
 
@@ -362,13 +388,13 @@ is stuck in "scaling" state (middleware returns 503 indefinitely) and must be
 killed. **Scale targets must be ≥2 for the default EPLB config.** vLLM's own
 test suite (`tests/distributed/test_elastic_ep.py::test_elastic_ep_scaling`)
 exercises 2→4 and 4→2 with `num_redundant_experts=0` and passes, so our
-Phase 1 plan (4→2→4) should work.
+native-regime plan (4→2→4) should work.
 
 **2. Memory is tight with EP=2 on A100-40GB.** Qwen3-30B-A3B is ~61GB in BF16
 → ~30.5GB/GPU at EP=2. With `--gpu-memory-utilization 0.85` (34GB budget),
 only ~4GB remains for KV cache per GPU → max concurrency ~2x for 4K-token
 requests. With EP=4, each GPU has ~15.25GB weights + ~19GB KV cache → much
-more headroom. **Phase 1 at DP=4 should be comfortable.**
+more headroom. **The native regime at DP=4 should be comfortable.**
 
 ### Smoke-test artifacts
 - Log: `results/smoke/serve.log` (successful DP=2 startup and inference)
@@ -415,7 +441,7 @@ WAIT_NEW_CORE_ENGINES_INIT → CREATE_STANDBY_GROUPS → TRANSFER_EXPERT_MAPPING
 | vLLM v0.19.0 | Installed | `.venv/`, `uv pip install vllm` |
 | Ray v2.55.0 | Installed | `.venv/`, `uv pip install "ray[default]"` |
 | Qwen3-30B-A3B | Downloading | `/data/models--Qwen--Qwen3-30B-A3B/`, ~60GB |
-| NCCL shim | Available | `common/shim/` (may be needed for Phase 3) |
+| NCCL shim | Available | `common/shim/` (may be needed for per-GPU containers) |
 | Docker | Available | 27.3.1 with NVIDIA Container Toolkit |
 
 ## Hardware
@@ -440,7 +466,7 @@ GPU3    SYS     SYS     PIX      X      ← NUMA 1
 **Impact on EP:** All-to-All communication for expert dispatch will have mixed
 bandwidth. GPU0-1 experts can communicate fast (NVLink), but cross-group
 communication (expert on GPU0 routing to GPU3) traverses QPI. This is the
-baseline topology constraint — same for all phases.
+baseline topology constraint — same for all regimes.
 
 ## References
 

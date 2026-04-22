@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
-# Exp A3 Phase 1: vLLM Elastic EP running natively on bare metal.
+# Exp A3 Native regime: vLLM Elastic EP running natively on bare metal.
 #
-# Native reference for all subsequent phases. Uses a dedicated Ray head on
-# port ${RAY_PORT} to avoid conflicts with other Ray instances on the host.
+# Native reference for the other two regimes (multi-GPU container and
+# per-GPU containers). Uses a dedicated Ray head on port ${RAY_PORT} to
+# avoid conflicts with other Ray instances on the host.
 #
 # Starts vLLM at DP=2 (required to make scale-down work under the
 # num_redundant_experts=0 EPLB invariant -- scaling up first builds the
 # redundancy that scale-down later consumes).
 #
 # Usage:
-#   ./scripts/phase1_native.sh start          # bring up Ray + vllm serve
-#   ./scripts/phase1_native.sh bench LABEL NP C
-#                                             # run vllm bench serve
-#   ./scripts/phase1_native.sh scale NEW_DP   # trigger /scale_elastic_ep
-#   ./scripts/phase1_native.sh state          # snapshot GPU + serving state
-#   ./scripts/phase1_native.sh cycle          # full 2->4->2 reference cycle
-#   ./scripts/phase1_native.sh stop           # shut everything down
+#   ./scripts/native.sh start          # bring up Ray + vllm serve
+#   ./scripts/native.sh bench LABEL NP C
+#                                      # run vllm bench serve
+#   ./scripts/native.sh scale NEW_DP   # trigger /scale_elastic_ep
+#   ./scripts/native.sh state          # snapshot GPU + serving state
+#   ./scripts/native.sh cycle          # full 2->4->2 reference cycle
+#   ./scripts/native.sh stop           # shut everything down
 
 set -euo pipefail
 
@@ -23,18 +24,18 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
 
-RESULTS_DIR="$PROJECT_ROOT/exp_a3_vllm_ep/results/phase1"
-SERVE_SESSION="a3-phase1-serve"
+RESULTS_DIR="$PROJECT_ROOT/exp_a3_vllm_ep/results/native"
+SERVE_SESSION="a3-native-serve"
 SERVE_LOG="$RESULTS_DIR/serve.log"
 
 # ─── Liveness & diagnostics ──────────────────────────────────────────
 # Check the tmux session that holds `vllm serve` is still running. If it
 # died (OOM, bad flag, crash) there is no point continuing to poll /health.
-phase1_liveness() {
+native_liveness() {
     tmux has-session -t "$SERVE_SESSION" 2>/dev/null
 }
 
-phase1_diag() {
+native_diag() {
     log "Last 30 lines of vllm serve log:"
     tail -30 "$SERVE_LOG" 2>/dev/null | sed 's/^/    /' >&2
 }
@@ -82,7 +83,7 @@ start() {
              2>&1 | tee $SERVE_LOG"
 
     wait_for_ready "http://localhost:${VLLM_PORT}/health" 300 \
-        phase1_liveness phase1_diag
+        native_liveness native_diag
 }
 
 stop() {
@@ -114,7 +115,7 @@ scale() {
 state() {
     local tag=${1:-snapshot}
     {
-        echo "=== Phase 1 state ($tag) at $(date) ==="
+        echo "=== Native state ($tag) at $(date) ==="
         echo ""
         echo "## GPU memory + utilisation ##"
         gpu_snapshot
@@ -156,7 +157,7 @@ case "$cmd" in
     cycle)  cycle ;;
     *)
         cat <<'EOF' >&2
-usage: phase1_native.sh {start|stop|bench LABEL [N] [C]|scale TARGET_DP|state [TAG]|cycle}
+usage: native.sh {start|stop|bench LABEL [N] [C]|scale TARGET_DP|state [TAG]|cycle}
 
 subcommands:
     start                   bring up Ray head + vllm serve at DP=2
