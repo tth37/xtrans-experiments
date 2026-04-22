@@ -103,7 +103,18 @@ phase3_diag() {
 # ─── Ray cluster + vLLM launch ────────────────────────────────────────
 up() {
     mkdir -p "$RESULTS_DIR"
-    docker_ensure_image "$VLLM_IMAGE"
+
+    # Phase 3 uses the patched vLLM image by default (fixes the EPLB
+    # scale-down + placement-group bugs that otherwise brick per-GPU
+    # container scaling; see patches/ and analysis_report.html).
+    # Operator can override by setting VLLM_IMAGE explicitly.
+    if [ -z "${VLLM_IMAGE:-}" ] || [ "${VLLM_IMAGE}" = "xtrans-vllm-ep:v0.19.0" ]; then
+        VLLM_IMAGE="$VLLM_IMAGE_PATCHED"
+        export VLLM_IMAGE
+        ensure_patched_image || return 1
+    else
+        docker_ensure_image "$VLLM_IMAGE" || return 1
+    fi
 
     require_gpus_free || return 1
 

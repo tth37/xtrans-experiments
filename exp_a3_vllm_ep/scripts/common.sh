@@ -41,6 +41,9 @@
 # in-container paths).
 : "${SERVED_MODEL_NAME:=qwen3-30b-a3b}"
 : "${VLLM_IMAGE:=xtrans-vllm-ep:v0.19.0}"
+# Phase 3 uses the patched image by default (see Dockerfile.phase3);
+# auto-built on first use by ensure_patched_image().
+: "${VLLM_IMAGE_PATCHED:=xtrans-vllm-ep-patched:v0.19.0}"
 : "${RAY_PORT:=26379}"
 : "${VLLM_PORT:=8000}"
 
@@ -222,6 +225,30 @@ docker_ensure_image() {
         log "ERROR: image $image not found locally"
         return 1
     fi
+}
+
+# Ensure VLLM_IMAGE_PATCHED exists locally; build it if not.
+# Used by phase3_per_gpu.sh to auto-build the patched image on first run.
+# Requires xtrans-vllm-ep:v0.19.0 (the base, built from Dockerfile.phase2)
+# to already exist.
+ensure_patched_image() {
+    if docker image inspect "$VLLM_IMAGE_PATCHED" > /dev/null 2>&1; then
+        return 0
+    fi
+    if ! docker image inspect "xtrans-vllm-ep:v0.19.0" > /dev/null 2>&1; then
+        log "ERROR: base image xtrans-vllm-ep:v0.19.0 not found; build it first:"
+        log "    docker build -t xtrans-vllm-ep:v0.19.0 \\"
+        log "        -f $PROJECT_ROOT/exp_a3_vllm_ep/Dockerfile.phase2 \\"
+        log "        $PROJECT_ROOT/exp_a3_vllm_ep"
+        return 1
+    fi
+    log "Patched image $VLLM_IMAGE_PATCHED not found; building from Dockerfile.phase3..."
+    docker build \
+        -t "$VLLM_IMAGE_PATCHED" \
+        -f "$PROJECT_ROOT/exp_a3_vllm_ep/Dockerfile.phase3" \
+        "$PROJECT_ROOT/exp_a3_vllm_ep" \
+        || { log "ERROR: build failed"; return 1; }
+    log "Built $VLLM_IMAGE_PATCHED"
 }
 
 # Returns 0 (success) if all 4 GPUs look idle (memory used < 100 MiB each).
