@@ -1508,6 +1508,200 @@ each holds the global batch         back to the rank that owns each token.
        architectural container-readiness of stateless groups actually
        translates into throughput parity.</p>
 
+    <h3>6.7 The placement-group patch (patches/0001)</h3>
+
+    <p>One local vLLM&nbsp;0.19.0 patch is applied to the per-GPU-containers
+       regime&rsquo;s Docker image
+       (<code>patches/0001_placement_group_early_exit.patch</code>,
+       applied by <code>Dockerfile.per_gpu_containers</code> to produce
+       <code>xtrans-vllm-ep-patched:v0.19.0</code>). Without it, cold
+       startup at <code>--data-parallel-size 2</code> in a 4-Ray-node
+       cluster trips
+       <code>AssertionError: Created 4 DP placement groups, expected 2</code>
+       before model load.</p>
+
+    <p><b>Mechanism.</b>
+       <code>RayDPClient.make_dp_placement_groups</code> walks every Ray
+       node allocating placement groups in an inner per-node bundle loop.
+       An inner <code>break</code> stops the bundle loop once
+       <code>len(placement_groups) == dp_size</code>, but the outer node
+       loop has no early exit, so it keeps visiting remaining nodes and
+       over-creating placement groups. The patch adds a two-line outer
+       break after the inner loop:</p>
+
+    <pre>            for i in range(dp_size_to_allocate):
+                ...
+                if len(placement_groups) == dp_size:
+                    break
++           if len(placement_groups) &ge; dp_size:
++               break
+
+        if len(placement_groups) &lt; dp_size:
+            raise ValueError(...)</pre>
+
+    <p><b>Mirror of upstream intent.</b> The scale-up counterpart in the
+       same file, <code>add_dp_placement_groups</code>, already has the
+       same pattern:</p>
+
+    <pre>        for node in nodes:
+            if num_pg_created &gt;= num_pg_to_create:
+                break
+            ...</pre>
+
+    <p>The cold-start path simply missed it. The patch is not a
+       workaround against upstream design &mdash; it aligns the cold
+       path with the scale-up path&rsquo;s idiom.</p>
+
+    <p><b>Safety across pack_strategy branches.</b> Three
+       <code>VLLM_RAY_DP_PACK_STRATEGY</code> values are supported
+       upstream: <code>strict</code>, <code>fill</code>, <code>span</code>.
+       The outer break is safe for all three:</p>
+
+    <ul>
+      <li><b>strict</b> / <b>fill</b>: each outer iteration synchronously
+          emits placement groups with no accumulated state. Exiting
+          early strands nothing.</li>
+      <li><b>span</b>: placement groups are emitted only when
+          <code>collected_bundles == world_size</code>, and the emission
+          resets <code>collected_bundles = []</code> immediately.
+          <code>len(placement_groups) == dp_size</code> can only be
+          reached right after a reset, so the outer break never leaves
+          a partial-bundle remainder behind.</li>
+    </ul>
+
+    <p>The secondary assertion
+       <code>assert len(local_dp_ranks) == dp_size</code> holds because
+       <code>local_dp_ranks</code> is appended in lock-step with
+       <code>placement_groups</code>. The <code>ValueError</code> for
+       insufficient resources still fires correctly when the outer loop
+       genuinely exhausts all nodes without reaching
+       <code>dp_size</code>.</p>
+
+    <h3>6.8 Expert placement under scale events: the per-GPU invariant</h3>
+
+    <p>This subsection answers a question the Section&nbsp;5 numbers do
+       not directly explain: <i>why does the 2&rarr;4&rarr;2 cycle work
+       at <code>num_redundant_experts=0</code>?</i> The surface-level
+       view (&ldquo;scale-up adds GPUs, scale-down removes them&rdquo;)
+       hides a structural invariant that the EPLB rearrange formula
+       enforces across every scale event.</p>
+
+    <h4>The per-GPU invariant</h4>
+
+    <p>The scale-down path in
+       <code>vllm/distributed/eplb/eplb_state.py:rearrange</code>
+       computes:</p>
+
+    <pre>num_physical_new = num_physical_old // old_ep_size * new_ep_size</pre>
+
+    <p>Rearranging to per-GPU terms:</p>
+
+    <pre>per_gpu_new  =  num_physical_new / new_ep_size
+             =  (num_physical_old // old_ep_size * new_ep_size) / new_ep_size
+             =  num_physical_old / old_ep_size  =  per_gpu_old</pre>
+
+    <p>The formula <b>preserves per-GPU physical-expert count</b> across
+       scale events. Scale-up applies the symmetric direction: new GPUs
+       each receive <code>per_gpu</code> expert slots, which EPLB
+       populates by replicating logical experts via load-aware bin
+       packing (uniformly at cold start, when no load statistics have
+       been observed yet). The invariant is not a performance choice
+       &mdash; every downstream buffer in vLLM
+       (<code>expert_weights</code>, <code>physical_to_logical_map</code>,
+       <code>expert_load_window</code>, the shape assertions in
+       <code>rebalance_execute.py</code>) is sized against
+       <code>per_gpu</code>.</p>
+
+    <p><b>How the invariant is enforced.</b>
+       <code>elastic_ep_execute.switch_and_prepare</code> runs during
+       every scale event. On scale-up it
+       <code>F.pad</code>s <code>expert_load_pass</code> and
+       <code>expert_load_window</code> from the old to the new
+       <code>num_local &times; ep_size</code>, and mutates
+       <code>parallel_config.eplb_config.num_redundant_experts</code>
+       in place so subsequent <code>rearrange()</code> calls see the
+       grown total. On scale-down it slices the same buffers down
+       symmetrically. The formula above lives inside
+       <code>rearrange()</code>; <code>switch_and_prepare</code> is
+       what makes the new <code>num_physical_experts</code> value
+       visible to the rest of the model state.</p>
+
+    <h4>Scenario: 2 &rarr; 4 &rarr; 2 cycle at R=0 (the validated cycle)</h4>
+
+    <p>With Qwen3-30B-A3B (128 logical experts), all three regimes run
+       this cycle at <code>num_redundant_experts=0</code>:</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>State</th>
+          <th>num_log</th>
+          <th>num_redundant</th>
+          <th>num_phy</th>
+          <th>ep_size</th>
+          <th>per_gpu</th>
+          <th>Mechanism note</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>cold DP=2, R=0</td>
+          <td>128</td>
+          <td>0</td>
+          <td>128</td>
+          <td>2</td>
+          <td>64</td>
+          <td>Initial state: each of 2 GPUs holds 64 of the 128 logical
+              experts, one copy each.</td>
+        </tr>
+        <tr>
+          <td>scale-up to DP=4</td>
+          <td>128</td>
+          <td><b>128</b></td>
+          <td><b>256</b></td>
+          <td>4</td>
+          <td>64</td>
+          <td><code>switch_and_prepare</code> sets
+              <code>num_physical = 64 &times; 4 = 256</code> and pads
+              per-rank buffers. <code>rearrange()</code> populates the
+              256 slots by bin-packing logical experts; each GPU still
+              holds 64. <b>Scale-up conjures 128 redundant copies</b>
+              to preserve <code>per_gpu = 64</code>.</td>
+        </tr>
+        <tr>
+          <td>scale-down to DP=2</td>
+          <td>128</td>
+          <td>0</td>
+          <td>128</td>
+          <td>2</td>
+          <td>64</td>
+          <td>Formula: <code>256 // 4 &times; 2 = 128</code>.
+              <b>Scale-down consumes exactly the 128 copies scale-up
+              built.</b> Back to the start state.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>The cycle is symmetric and closes cleanly with no operator-supplied
+       redundancy. Scale-up <i>conjures</i> redundancy to hold
+       <code>per_gpu</code> stable; scale-down <i>consumes</i> exactly
+       what scale-up built. This is why the 2&rarr;4&rarr;2 cycle works
+       at <code>R=0</code> across all three regimes, and why it is the
+       pattern Section&nbsp;5.7&rsquo;s cross-regime comparison uses.</p>
+
+    <div class="info-box">
+      <p><b>What happens without scale-up to pre-build redundancy.</b>
+         A cold <i>DP=4</i> start with <code>R=0</code> has
+         <code>num_phy = 128</code>, <code>per_gpu = 32</code>. Attempting
+         <code>POST /scale_elastic_ep {new_dp: 2}</code> computes
+         <code>num_phy_new = 128 // 4 &times; 2 = 64 &lt; num_log = 128</code>,
+         which violates <code>replicate_experts</code>&rsquo; invariant
+         <code>num_phy &ge; num_log</code> and crashes inside a Ray
+         worker. This deployment pattern is not exercised in this report;
+         the 2&rarr;4&rarr;2 cycle sidesteps it by going through DP=4 as
+         an intermediate state with its redundancy built up implicitly.</p>
+    </div>
+
 
     <!-- ============================================================
          7. CONCLUSIONS
