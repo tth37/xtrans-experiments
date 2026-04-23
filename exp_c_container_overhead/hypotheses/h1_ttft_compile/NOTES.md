@@ -1,19 +1,25 @@
 # H1: TTFT / compile / CUDA-graph cold-path cost dominates the gap
 
-**Status:** Closed with a refined picture. The cold TTFT blow-up the
-hypothesis targeted (4.6× at DP=4 in §5.7) is real but is entirely
-**one-time setup cost** — warm TTFT inside the container (390 ms) is
-within 4% of warm TTFT on native (376 ms). However, the original H1
-narrative ("the TTFT blow-up is the gap") is only partly right:
-warming up closes the TTFT gap but does **not** close the overall
-throughput gap. A −14% warm gap remains at DP=4 out=128, driven
-**entirely by TPOT** (+17% per-token cost inside the container).
-The long-output test (out=1024) rules out TTFT-amortization as the
-explanation for the throughput gap. So the §5.7 cold-bench headline
-conflates two distinct container overheads: (a) a one-time TTFT
-blow-up and (b) a persistent warm TPOT gap. Next hypotheses to
-investigate: H3 (shm-size) and H4 (ipc=host), both candidates for
-the per-forward TPOT overhead.
+**Status:** Partially closed, then reopened by a warmup-trajectory
+finding. The cold TTFT blow-up (4.6× at DP=4 in §5.7) is real but is
+entirely **one-time setup cost** — warm TTFT inside the container
+(390 ms after 3 benches, ~200 ms after 5) is within 4% of warm native
+TTFT. But **MGC TPOT does not plateau after 2–3 benches**. With a
+longer protocol (2 warmups + 3 measurements), MGC TPOT continues
+dropping monotonically through all 5 benches:
+118 → 111 → 109 → 97 → 88 ms. The "warm TPOT = 117.71 ms" that H1
+session 1 measured after 3 benches was **not the plateau**; with
+more warmup MGC actually reaches ~88 ms TPOT — possibly *below*
+native's warm TPOT (100.93 ms from the same protocol). This
+invalidates H1's headline "+17% warm TPOT gap" finding.
+
+H3/H4 triage is therefore confounded: variant-to-variant TPOT
+differences at bench 3 are indistinguishable from warmup-curve
+variance. Either I need many replicates per variant to average out
+warmup position, or I need a protocol that reliably reaches
+steady-state (possibly 8+ benches, or a long-sustained-load warmup
+via out=1024). The investigation is going to need a tighter
+methodology before H3/H4 can be discriminated.
 
 ## Hypothesis
 
@@ -251,11 +257,131 @@ improvement for Exp A3, not part of Exp C's mandate.
 
 ### Status
 
-- **H1 closed.** Cold TTFT blow-up confirmed, but is one-time
-  setup cost — does not explain the throughput gap. Warm gap is
-  TPOT-driven, at −14% throughput / +17% per-token.
-- **Next:** H3 (shm-size) and H4 (ipc=host) are the candidates for
-  the warm TPOT overhead. H2 (NCCL init) is likely part of the
-  cold TTFT blow-up but doesn't affect the warm gap, so I'll
-  triage H2 briefly and move to H3/H4 as the primary remaining
-  investigation.
+- **H1 partially closed.** Cold TTFT blow-up confirmed and it IS
+  one-time setup cost. But the "warm gap is +17% TPOT" headline
+  from this session is an artifact of taking the measurement before
+  TPOT plateaus. Actual steady-state TPOT comparison awaits more
+  data.
+- **Next:** H3/H4 triage is blocked on getting a reliable
+  steady-state measurement protocol. Methodology improvement comes
+  first.
+
+### 2026-04-23 01:14 — Warmup trajectory discovery invalidates H1's "+17% TPOT" finding
+
+Ran a more-benches protocol (`variant_baseline_n3`: shm=16g,
+ipc=host, same as MGC, with 2 warmup benches + 3 back-to-back
+measurement benches at DP=4 out=128). Per-bench TPOT:
+
+| Bench | tok/s | TTFT (ms) | TPOT (ms) |
+|---|---:|---:|---:|
+| warmup1 | 121.87 | 1737.8 | 118.57 |
+| warmup2 | 142.79 |  274.8 | 110.71 |
+| meas1 | 145.38 | 252.2 | 108.87 |
+| meas2 | 163.33 | 222.1 | **96.92** |
+| meas3 | 180.67 | 198.5 | **87.64** |
+
+TPOT dropped monotonically across all 5 benches, from 118 → 88 ms.
+The 3 "measurement" benches have σ 10.6 ms — comparable to the
+original regime gap itself. There's no plateau within 5 benches.
+
+**Where this puts H1's earlier numbers:**
+
+- H1 session 1 MGC warm_out128 at bench 4-overall measured TPOT
+  117.71 ms. baseline_n3's 4th bench (`meas2`) measured TPOT
+  96.92 ms. **Same config, same bench position, 22% different**.
+  So either the true variance is huge, or the warmup trajectory
+  depends on other hidden state.
+- H1 session 1 native warm_out128 measured TPOT 100.93 ms at bench
+  4-overall. That might also not be plateaued — more native benches
+  could plateau lower.
+- **If MGC reaches ~88 ms TPOT at bench 5 (vs native warm
+  100.93 at bench 4), the container might actually be equal or
+  faster at true steady state.** That's the opposite of H1's
+  headline and §5.7's headline — the whole "container overhead"
+  story could collapse at true steady state.
+
+**Why was this missed in H1 session 1?**
+
+H1's warm bench was run after 4 prior benches (dp2_initial,
+dp4_post_up, dp2_post_down, then dp4_warmup equivalent during the
+scale-back-and-up). But the `cycle` command cycles through
+DP=2→4→2 with scale events between benches. Each scale event may
+spawn NEW engine actors and RESET some cache state for those
+actors. So the cold/warm distinction is not linear in bench count
+when scale events intervene.
+
+Under a simpler "no scale events between benches" protocol (used
+in baseline_n3), TPOT descends more smoothly — but it descends for
+longer than I expected.
+
+**Candidate explanations for the long warmup:**
+
+1. **GPU clock scaling / thermal management.** A100 idles at lower
+   clock; sustained compute ramps clocks up, potentially over tens
+   of seconds. If the ramp is slow on this host, first several
+   benches run below peak clock and TPOT reports are inflated.
+2. **CPU frequency / power governor.** Same idea on the host CPUs;
+   bench's client-side request overhead interacts.
+3. **Page-cache warmup.** Model weights are mmapped from disk;
+   first N forwards may page in rarely-touched expert weights on
+   first use.
+4. **Triton autotune cache convergence.** Each Triton kernel has
+   several configs; autotuning may pick a better one as it sees
+   more invocations. Though this usually completes within 1-2
+   benches.
+
+Options 1-2 would be host-wide and affect native identically, so
+would not create a native-vs-container gap. Option 3 is a
+container-vs-native differentiator if the bind mount in the
+container has different page cache state than native. Option 4 is
+also container/native-neutral.
+
+**Methodology improvement required before H3/H4 can be tested.**
+
+The variant script and its short 2-bench protocol are not reliable
+enough to attribute TPOT differences to shm-size or ipc mode —
+shm64m_single showed TPOT 94.30 after 2 benches, but
+baseline_n3_meas1 (third bench, same config as baseline) showed
+108.87. Single-variant readings at mismatched warmup positions
+can produce spurious variant-vs-variant differences of 15 ms.
+
+**Plan for next session:**
+
+1. **Calibrate native's warmup trajectory under the same 5-bench
+   protocol.** Is native plateaued at bench 3? Bench 5? Bench 10?
+   If native plateaus quickly (say bench 3, TPOT ~100) and MGC
+   doesn't plateau even at bench 5, that's itself a container
+   finding ("containers warm up slower"), separate from H3/H4.
+2. **Extend protocol to 8 or 10 benches** for both regimes until
+   TPOT flat-lines with stddev ≤ 3%. Use the trailing 3 as the
+   "steady state" measurement.
+3. **Investigate GPU clock state during a run.**
+   `nvidia-smi --query-gpu=clocks.gr,clocks.mem,power.draw,temperature.gpu
+   --format=csv -l 1` during a bench, compare native vs MGC.
+   If clocks ramp differently, option 1 is confirmed and we can
+   work around by adding a warmup bench or waiting for steady
+   clock before measuring.
+4. **Once warmup-matched, redo H3/H4** with n≥3 measurements per
+   variant and only compare TPOT in the same bench-position
+   window.
+
+Also consider: if this methodology work ends up valuable, it could
+be back-ported into `exp_a3_vllm_ep/scripts/` as a
+`bench_steady_state` helper that auto-warms and reports a more
+trustworthy TPOT. (Per user suggestion, refine in Exp C first,
+then merge back.)
+
+### 2026-04-23 01:24 — Paused on host contention
+
+All 4 GPUs occupied (~36 GB each) by another user's workload.
+Will resume when host is idle. Partial data preserved under
+`exp_c_container_overhead/results/variants/`:
+
+- `baseline/`   — 16g/host, 1 warmup + 1 measurement (pre-trajectory-discovery)
+- `shm64m/`     — 64m/host, 1 warmup + 1 measurement (pre-trajectory-discovery)
+- `ipcprivate/` — 16g/private, 2 warmups + 1 measurement
+- `baseline_n3/` — 16g/host, 2 warmups + 3 measurements (the trajectory-reveal run)
+
+The first three runs' measurements are unreliable due to unknown
+warmup position; leaving them as archival evidence but not citing
+them for H3/H4 conclusions.

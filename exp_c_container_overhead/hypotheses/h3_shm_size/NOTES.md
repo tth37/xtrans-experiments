@@ -1,6 +1,18 @@
 # H3: `--shm-size` sensitivity
 
-**Status:** Open, not yet measured.
+**Status:** Triage attempted; blocked on a methodology problem
+discovered during the attempt. See H1 NOTES ("Warmup trajectory
+discovery") for details. Briefly: MGC TPOT does not plateau within
+5 benches of sustained load (descends 118 → 88 ms in baseline_n3),
+so a 2-bench single-variant measurement can easily report a 15 ms
+TPOT difference purely from bench-position mismatch between
+variants. Need a steady-state protocol before H3 can be
+discriminated. Initial 64m-vs-16g single-shot readings (94 vs 110
+TPOT) are suggestive but unreliable — the faster 64m measurement
+likely reflects a later warmup-state rather than a real shm
+effect. Two variant archives preserved under
+`results/variants/shm64m/` and `results/variants/baseline/` as
+pre-methodology data; don't cite them for conclusions.
 
 ## Hypothesis
 

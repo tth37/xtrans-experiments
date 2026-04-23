@@ -1,6 +1,12 @@
 # H4: `--ipc=host` vs alternatives
 
-**Status:** Open, not yet measured.
+**Status:** Triage attempted; blocked on the same methodology problem
+as H3. See H1 NOTES ("Warmup trajectory discovery") and H3 NOTES for
+details. Single-shot `ipc=private` reading (TPOT 111.90 after 3
+benches) is within the warmup-trajectory band (baseline_n3 bench 3
+was 108.87) — can't distinguish real ipc effect from warmup-position
+noise. Variant archive preserved under `results/variants/ipcprivate/`
+as pre-methodology data.
 
 ## Hypothesis
 
