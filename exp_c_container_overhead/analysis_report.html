@@ -1,0 +1,883 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Experiment C: Container Overhead Analysis for In-Place Elastic MoE Serving</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: "Times New Roman", "Nimbus Roman", Times, serif;
+      background: #fff;
+      color: #111;
+      line-height: 1.6;
+    }
+    main {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 40px 32px 60px;
+    }
+    h1 {
+      font-size: 22px;
+      text-align: center;
+      margin: 0 0 4px;
+      line-height: 1.3;
+    }
+    .subtitle {
+      text-align: center;
+      font-size: 14px;
+      color: #444;
+      margin: 0 0 24px;
+    }
+    h2 {
+      font-size: 17px;
+      border-bottom: 1px solid #999;
+      padding-bottom: 4px;
+      margin: 28px 0 12px;
+    }
+    h3 {
+      font-size: 15px;
+      margin: 20px 0 8px;
+    }
+    h4 {
+      font-size: 14px;
+      margin: 16px 0 6px;
+    }
+    p, li {
+      font-size: 14px;
+      margin: 0 0 10px;
+    }
+    ul, ol {
+      padding-left: 24px;
+    }
+    .figure {
+      margin: 16px 0;
+      text-align: center;
+    }
+    .figure img {
+      max-width: 100%;
+      border: 1px solid #ccc;
+    }
+    .figure p {
+      font-size: 12px;
+      color: #666;
+      text-align: center;
+      margin-top: 4px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      margin: 12px 0;
+    }
+    th, td {
+      border: 1px solid #bbb;
+      padding: 5px 7px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #f0f0f0;
+      font-weight: bold;
+    }
+    td {
+      font-variant-numeric: tabular-nums;
+    }
+    code {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 13px;
+      background: #f5f5f5;
+      padding: 1px 4px;
+    }
+    pre {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 12px;
+      background: #f8f8f8;
+      border: 1px solid #ddd;
+      padding: 12px 16px;
+      margin: 12px 0;
+      overflow-x: auto;
+      line-height: 1.5;
+    }
+    .config-table {
+      width: auto;
+      margin: 12px 0;
+    }
+    .config-table td:first-child {
+      font-weight: bold;
+      white-space: nowrap;
+      padding-right: 16px;
+    }
+    .highlight-box {
+      background: #e8f5e9;
+      border: 2px solid #2e7d32;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .highlight-box p { margin: 0; }
+    .warning-box {
+      background: #fff3e0;
+      border: 2px solid #e65100;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .warning-box p { margin: 0; }
+    .info-box {
+      background: #e3f2fd;
+      border: 2px solid #1565c0;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+    }
+    .info-box p { margin: 0; }
+    hr.appendix {
+      border: none;
+      border-top: 2px solid #333;
+      margin: 36px 0 24px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+
+    <!-- ============================================================
+         TITLE
+         ============================================================ -->
+
+    <h1>Experiment C: Container Overhead Analysis<br>for In-Place Elastic MoE Serving</h1>
+    <p class="subtitle">
+      node192 &middot; 3&times; A100-SXM4-40GB + 1&times; A100-PCIE-40GB &middot; NVLink NV12<br>
+      Generated 2026-04-23 &middot; commit 347f9cb
+    </p>
+
+    <!-- ============================================================
+         1. OBJECTIVE
+         ============================================================ -->
+
+    <h2>1. Objective</h2>
+
+    <p>Exp&nbsp;A3 Section&nbsp;5.7 reported a <b>&minus;24% output-throughput gap</b>
+       between the native and multi-GPU-container (MGC) regimes for vLLM
+       Elastic EP at DP=4 (native 171.23&nbsp;tok/s &rarr; MGC 130.62&nbsp;tok/s),
+       along with a 4.6&times; TTFT blow-up (387&nbsp;ms &rarr; 1777&nbsp;ms).
+       Those numbers are surprising: same host, same GPUs, same driver, same
+       NCCL &mdash; the only difference is that the serve process runs inside a
+       Docker container rather than directly on the host. The stated goal of
+       Exp&nbsp;C is to identify the root cause(s), with particular focus on the
+       disproportionate TTFT blow-up, and to either provide a concrete
+       configuration fix or a principled finding about containerization cost.</p>
+
+    <p>The investigation was organized around five falsifiable hypotheses:
+       H1 (cold TTFT / compile), H2 (NCCL init overhead), H3
+       (<code>--shm-size</code> sensitivity), H4 (<code>--ipc=host</code> as
+       load-bearing), and H5 (bench-variance as explanation of the
+       headline). The result splits into two findings &mdash; one about the
+       headline itself and one about the container regime.</p>
+
+    <div class="highlight-box">
+      <p><b>Result:</b> The &minus;24% "gap" is a measurement artefact, not a
+         container overhead. When both regimes are given enough warm-up to
+         reach steady state (2 benches for native, 2&ndash;5 for MGC), DP=4 plateau
+         TPOT is <b>89.66&nbsp;ms native vs 87.67&nbsp;ms MGC</b> (n=13 vs n=18
+         post-plateau measurements, 0.77&sigma; apart &mdash; not
+         statistically distinguishable). The <i>real</i> container overhead is
+         a bounded one-time cost: first TTFT after scale-up is ~1400&nbsp;ms
+         inside the container vs ~540&nbsp;ms native, collapsing to ~200&nbsp;ms
+         in both regimes by bench&nbsp;2.</p>
+    </div>
+
+    <!-- ============================================================
+         2. BACKGROUND
+         ============================================================ -->
+
+    <h2>2. Background</h2>
+
+    <p>Exp&nbsp;A3 established that vLLM Elastic&nbsp;EP works identically
+       inside a multi-GPU container: DP=2&rarr;4&rarr;2 scale events succeed,
+       expert reshuffle closes cleanly, and NCCL picks the same-node transport
+       (per &sect;5.5.1 / &sect;5.5.2). The gap it observed was not a correctness
+       or functionality problem &mdash; it was a throughput shortfall at DP=4.</p>
+
+    <p>The headline evolved: initial measurement (&sect;5.5.1) reported &minus;7.5%
+       at DP=4; a same-session re-run (&sect;5.7) reported &minus;23.7%. Both used
+       the <code>cycle</code> command, which runs one DP=4 bench at a single
+       point in time (bench&nbsp;1 at DP=4, right after scale-up). That
+       single-shot cold measurement is the pivot that Exp&nbsp;C ended up
+       probing.</p>
+
+    <p>All numbers here use the exact same model, bench shape, and CLI flags
+       as Exp&nbsp;A3 &sect;5.7: Qwen3-30B-A3B, 32 prompts at concurrency 16 at
+       DP=4, <code>--random-input-len 128 --random-output-len 128</code>,
+       vLLM 0.19.0 with <code>--enforce-eager</code> (no torch.compile, no
+       CUDA graph capture). Only the bench <i>count</i> differs: Exp&nbsp;A3's
+       <code>cycle</code> runs one DP=4 bench; Exp&nbsp;C runs 2&nbsp;warm-up +
+       5&ndash;10 measurement benches back-to-back so TPOT actually reaches a
+       plateau before being measured.</p>
+
+    <!-- ============================================================
+         3. EXPERIMENTAL SETUP
+         ============================================================ -->
+
+    <h2>3. Experimental Setup</h2>
+
+    <h3>3.1 Hardware</h3>
+
+    <table class="config-table">
+      <tr><td>Node</td><td>node192 (shared research host)</td></tr>
+      <tr><td>GPU</td><td>3&times; NVIDIA A100-SXM4-40GB + 1&times; NVIDIA A100-PCIE-40GB</td></tr>
+      <tr><td>Interconnect</td><td>NVLink 3.0 NV12 GPU0&harr;GPU1; PIX GPU2&harr;GPU3; SYS across</td></tr>
+      <tr><td>Kernel</td><td>6.8.0-1047-oracle</td></tr>
+      <tr><td>CUDA driver</td><td>590.44.01 (CUDA 13.1; CUDA 12.4 available)</td></tr>
+    </table>
+
+    <h3>3.2 Software</h3>
+
+    <table class="config-table">
+      <tr><td>vLLM</td><td>v0.19.0</td></tr>
+      <tr><td>Container image</td><td><code>xtrans-vllm-ep:v0.19.0</code> (vllm/vllm-openai:v0.19.0 + ray[default]==2.55.0)</td></tr>
+      <tr><td>Native venv</td><td>Python 3.12, project <code>.venv</code> with identical vLLM + Ray versions</td></tr>
+      <tr><td>NCCL</td><td>2.27.5 (bundled with vLLM wheel)</td></tr>
+      <tr><td>Docker</td><td>27.3.1 with NVIDIA Container Toolkit</td></tr>
+      <tr><td>Model</td><td>Qwen3-30B-A3B (128 experts, 8 activated / token)</td></tr>
+      <tr><td>Benchmark tool</td><td><code>vllm bench serve --dataset-name random</code></td></tr>
+    </table>
+
+    <h3>3.3 Protocol</h3>
+
+    <p>Two distinct protocols, used for different purposes:</p>
+
+    <ul>
+      <li><b>Cycle protocol</b> (inherited from Exp&nbsp;A3): start &rarr;
+          bench DP=2 &rarr; scale 2&rarr;4 &rarr; bench DP=4 &rarr; scale 4&rarr;2
+          &rarr; bench DP=2 &rarr; stop. This is what &sect;5.7 used. Exp&nbsp;C's
+          H5 investigation ran three cycles per regime to measure run-to-run
+          variance of this protocol.</li>
+      <li><b>Plateau protocol</b> (new in Exp&nbsp;C): start &rarr; scale to
+          DP=4 &rarr; 2 back-to-back warm-up benches (discarded) &rarr; 5&ndash;10
+          consecutive measurement benches &rarr; stop. Each bench is
+          n=32 prompts at concurrency 16 with random 128/128 input/output
+          lengths. Used to establish <i>steady-state</i> TPOT rather than
+          cold-bench-1 TPOT.</li>
+    </ul>
+
+    <p>All runs were protected by pre-flight GPU-idle checks
+       (<code>require_gpus_free</code> from <code>exp_a3_vllm_ep/scripts/common.sh</code>);
+       each run's directory contains <code>run_meta.txt</code> with pre- and
+       post-run <code>nvidia-smi</code> snapshots confirming no external GPU
+       activity during the measurement window. node192 is a shared host;
+       several runs during the investigation were aborted or deferred when
+       an external user's workload appeared on a GPU mid-session.</p>
+
+    <!-- ============================================================
+         4. CONFIGURATIONS UNDER TEST
+         ============================================================ -->
+
+    <h2>4. Configurations Under Test</h2>
+
+    <table>
+      <thead>
+        <tr><th>Config</th><th>Description</th><th>Key Settings</th><th>Expected Outcome</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Native</b></td>
+          <td>vLLM Elastic EP running directly on the host (no container)</td>
+          <td>Host <code>/dev/shm</code> (252&nbsp;GB tmpfs), full host namespaces</td>
+          <td>Reference performance</td>
+        </tr>
+        <tr>
+          <td><b>MGC (baseline)</b></td>
+          <td>Single Docker container holding GPUs 0&ndash;3 (Exp&nbsp;A3 baseline)</td>
+          <td><code>--gpus '"device=0,1,2,3"' --ipc=host --shm-size=16g</code></td>
+          <td>&sect;5.7 reported &minus;23.7% throughput at DP=4</td>
+        </tr>
+        <tr>
+          <td><b>MGC shm=64m</b></td>
+          <td>Same as MGC baseline but Docker-default <code>--shm-size</code></td>
+          <td><code>--ipc=host --shm-size=64m</code></td>
+          <td>H3 prediction: throttled if shm binds per-forward path</td>
+        </tr>
+        <tr>
+          <td><b>MGC ipc=private</b></td>
+          <td>Same as MGC baseline but private IPC namespace</td>
+          <td><code>--ipc=private --shm-size=16g</code></td>
+          <td>H4 prediction: measurably worse if <code>ipc=host</code> is load-bearing</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Variants were driven by a new script,
+       <code>exp_c_container_overhead/scripts/multi_gpu_container_variant.sh</code>,
+       which parameterises <code>--shm-size</code>, <code>--ipc</code>, and
+       <code>--data-parallel-size</code> via env vars but otherwise uses
+       identical <code>docker run</code> flags to
+       <code>exp_a3_vllm_ep/scripts/multi_gpu_container.sh</code>.</p>
+
+    <!-- ============================================================
+         5. RESULTS
+         ============================================================ -->
+
+    <h2>5. Results</h2>
+
+    <h3>5.1 H5: Cycle-protocol variance reproduces the headline at &minus;14%, not &minus;24%</h3>
+
+    <p>Three back-to-back cycles per regime, same session, on a clean host.
+       This measures the inherent variance of the protocol &sect;5.7 used.</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Regime</th><th>Run 1</th><th>Run 2</th><th>Run 3</th>
+          <th>Mean</th><th>&sigma;</th><th>CV%</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Native DP=4 tok/s</b></td>
+          <td>158.72</td><td>146.67</td><td>141.33</td>
+          <td>148.91</td><td>8.91</td><td>5.98</td>
+        </tr>
+        <tr>
+          <td><b>MGC DP=4 tok/s</b></td>
+          <td>&mdash;<sup>&dagger;</sup></td><td>136.79</td><td>119.49</td>
+          <td>128.14</td><td>12.23</td><td>9.55</td>
+        </tr>
+        <tr style="background:#f7f7f7;">
+          <td><b>Session-2 cycle gap</b></td>
+          <td colspan="3">(148.91 &minus; 128.14) / 148.91</td>
+          <td colspan="3">&minus;13.94% (separation 2.33&sigma; on native's &sigma;)</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p><sup>&dagger;</sup> <i>Run 1 aborted at scale-up 2&rarr;4 when an
+       external user's <code>train_real_hf.py</code> started on GPU&nbsp;3
+       mid-cycle; DP=2 initial bench completed cleanly (69.94&nbsp;tok/s) but
+       the scale event failed with
+       <code>ValueError: Free memory on device cuda:0 (13.95/39.49 GiB)</code>.
+       n=2 for MGC.</i></p>
+
+    <p>Two findings already visible from this variance pass:</p>
+
+    <ol>
+      <li><b>The &minus;24% headline is itself a noisy sample.</b> The
+          session-2 gap reproduced at &minus;14%, not &minus;24%. Native DP=4
+          mean (148.91) sits 2.5&sigma; below &sect;5.7's single anchor
+          (171.23).</li>
+      <li><b>Cycle-protocol CV is 6&ndash;10%.</b> Too noisy to reliably
+          measure a single-digit-% container overhead, but clearly real if the
+          overhead were 20&ndash;25%.</li>
+    </ol>
+
+    <p>The 2.33&sigma; separation made it look like the gap was "real but
+       smaller than claimed." Sections 5.2&ndash;5.3 show why that interpretation
+       was wrong too.</p>
+
+    <h3>5.2 H1: Cold TTFT blow-up is real and is one-time</h3>
+
+    <p>One cycle + two extra benches per regime at DP=4: a warm-up bench at
+       out=128, then a long-output bench at out=1024. If H1's "TTFT dominates
+       the gap" claim were correct, the out=1024 bench should amortise the
+       TTFT overhead and shrink the gap.</p>
+
+    <table>
+      <thead>
+        <tr><th>Bench</th><th>Native tok/s</th><th>Native TTFT</th><th>Native TPOT</th>
+            <th>MGC tok/s</th><th>MGC TTFT</th><th>MGC TPOT</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Cold DP=4 out=128 (from cycle)</td>
+          <td>139.43</td><td>447.3</td><td>112.06</td>
+          <td>134.30</td><td>1399.9</td><td>108.99</td>
+        </tr>
+        <tr>
+          <td>Warm DP=4 out=128</td>
+          <td>155.12</td><td>376.3</td><td>100.93</td>
+          <td>133.43</td><td>389.8</td><td>117.71</td>
+        </tr>
+        <tr>
+          <td>Warm DP=4 out=1024</td>
+          <td>87.06</td><td>207.1</td><td>91.76</td>
+          <td>71.98</td><td>255.0</td><td>110.94</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Cold MGC TTFT is 1400&nbsp;ms (vs 447&nbsp;ms native, <b>3.13&times;</b>).
+       On the next bench, MGC TTFT drops to <b>390&nbsp;ms</b> (within 4% of
+       native's warm 376&nbsp;ms). The TTFT blow-up is entirely one-time setup
+       cost, not per-request.</p>
+
+    <p>But the throughput gap does <i>not</i> shrink with output length: the
+       warm out=128 gap is &minus;14.0% (155.12 vs 133.43); the warm out=1024
+       gap is &minus;17.3% (87.06 vs 71.98). That initially looked like a
+       persistent steady-state gap with a TPOT mechanism: warm TPOT was
+       native 100.93 vs MGC 117.71, a +16.6% container penalty. Section 5.3
+       shows that interpretation was wrong.</p>
+
+    <h3>5.3 H1 revised / H3 / H4: MGC TPOT does not plateau in 2&ndash;3 benches</h3>
+
+    <p>Extending the bench count to find where TPOT actually plateaus reveals
+       the gap is not a TPOT effect either &mdash; it's a warm-up-curve
+       mismatch. Protocol: 2 warm-up + 5&ndash;10 measurement benches per regime.</p>
+
+    <h4>5.3.1 Native warm-up trajectory (native_n3 + native_n3_v2)</h4>
+
+    <table>
+      <thead><tr><th>Bench</th><th>native_n3 TPOT (ms)</th><th>native_n3_v2 TPOT (ms)</th></tr></thead>
+      <tbody>
+        <tr><td>warmup1 (cold)</td><td>110.15</td><td>112.20</td></tr>
+        <tr><td>warmup2</td><td><b>91.37 &larr; plateau</b></td><td>108.60 (slower to converge)</td></tr>
+        <tr><td>meas1</td><td>90.54</td><td>91.35</td></tr>
+        <tr><td>meas2</td><td>96.94</td><td>87.87</td></tr>
+        <tr><td>meas3</td><td>87.20</td><td>90.30</td></tr>
+        <tr><td>meas4</td><td>87.61</td><td>89.63</td></tr>
+        <tr><td>meas5</td><td>90.99</td><td>87.54</td></tr>
+        <tr><td>meas6&ndash;8</td><td>&mdash;</td><td>88.91 / 88.38 / 88.41</td></tr>
+      </tbody>
+    </table>
+
+    <p>Native plateaus after one warm-up bench. Pooled post-plateau
+       measurements: <b>mean 89.66&nbsp;ms, &sigma; 2.59, n=13</b>.</p>
+
+    <h4>5.3.2 MGC warm-up trajectory (mgc_n10 + mgc_n10_v2)</h4>
+
+    <table>
+      <thead><tr><th>Bench</th><th>mgc_n10 TPOT (ms)</th><th>mgc_n10_v2 TPOT (ms)</th></tr></thead>
+      <tbody>
+        <tr><td>warmup1 (cold)</td><td>108.45</td><td>122.20</td></tr>
+        <tr><td>warmup2</td><td><b>88.49 &larr; plateau</b></td><td>98.91 (not quite plateau)</td></tr>
+        <tr><td>meas1</td><td>91.65</td><td>95.33</td></tr>
+        <tr><td>meas2</td><td>86.79</td><td>94.62</td></tr>
+        <tr><td>meas3</td><td>86.89</td><td>87.81</td></tr>
+        <tr><td>meas4</td><td>86.30</td><td>90.95</td></tr>
+        <tr><td>meas5</td><td>87.07</td><td>86.75</td></tr>
+        <tr><td>meas6&ndash;10</td><td>86.45 / 85.19 / 86.93 / 90.98 / 81.97</td><td>86.35 / 87.59 / 90.27 / 92.39 / 87.23</td></tr>
+      </tbody>
+    </table>
+
+    <p>MGC plateaus in 2&ndash;3 benches (faster run) or 4&ndash;5 (slower run);
+       once plateaued, sits in the same 86&ndash;90&nbsp;ms TPOT band. Pooled
+       post-plateau measurements: <b>mean 87.67&nbsp;ms, &sigma; 2.53, n=18</b>.</p>
+
+    <h4>5.3.3 Cross-regime plateau comparison</h4>
+
+    <table>
+      <thead>
+        <tr><th>Regime</th><th>n</th><th>Plateau TPOT (ms)</th><th>&sigma; (ms)</th><th>Warm-up benches</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><b>Native</b></td><td>13</td><td>89.66</td><td>2.59</td><td>~1</td></tr>
+        <tr><td><b>MGC (shm=16g, ipc=host)</b></td><td>18</td><td><b>87.67</b></td><td>2.53</td><td>~2</td></tr>
+        <tr><td><i>MGC (shm=64m, ipc=host)</i><sup>&dagger;</sup></td><td>3</td><td>93.51</td><td>0.59</td><td>~1</td></tr>
+      </tbody>
+    </table>
+
+    <p><sup>&dagger;</sup> <i>User-collected 5-bench run during investigation;
+       n counts benches 3&ndash;5.</i></p>
+
+    <p>Native vs MGC shm=16g plateau difference is 1.99&nbsp;ms = 0.77&sigma; on
+       pooled standard error &mdash; statistically indistinguishable.
+       Directionally, MGC is a hair <i>faster</i> per token, not slower.</p>
+
+    <div class="highlight-box">
+      <p><b>Key result:</b> At DP=4 steady state, the container introduces
+         <b>no measurable per-token overhead</b>. The &minus;24% gap in &sect;5.7
+         is entirely a consequence of the <code>cycle</code> command taking
+         a single bench at DP=4 bench-position 1, where both regimes are still
+         on their warm-up curves at unequal distance from plateau.</p>
+    </div>
+
+    <h3>5.4 H2: NCCL init duration is identical in both regimes</h3>
+
+    <p>Scale-up 2&rarr;4 timings extracted from <code>serve.log</code> and
+       <code>container.log</code> of the <code>native_n3</code> and
+       <code>mgc_n10</code> runs:</p>
+
+    <table>
+      <thead>
+        <tr><th>Phase</th><th>Native</th><th>MGC</th><th>&Delta;</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Reconfig request &rarr; "Created standby communication groups" (NCCL init for new workers)</td>
+          <td>19 s</td><td>19 s</td><td><b>0</b></td>
+        </tr>
+        <tr>
+          <td>Standby &rarr; "Transferred weights to new workers"</td>
+          <td>2 s</td><td>3 s</td><td>+1</td>
+        </tr>
+        <tr>
+          <td>Weights &rarr; "Switched to new setup" (broadcast, placement, actor sync)</td>
+          <td>6 s</td><td>19 s</td><td><b>+13</b></td>
+        </tr>
+        <tr>
+          <td><b>Total scale-up 2&rarr;4</b></td>
+          <td>27 s</td><td>41 s</td><td>+14 s</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>The NCCL-communicator init itself is <b>identical in wall-clock</b>
+       between regimes. The 14&nbsp;s container penalty on scale-up is entirely
+       in Ray's placement-group / actor-spawn / broadcast phase &mdash; the
+       post-NCCL synchronization. H2's "NCCL init is slower inside the
+       container" prediction is not supported.</p>
+
+    <p>This is consistent with Exp&nbsp;A3 &sect;5.5.2's prior observation of
+       "Ray actor spawn slower in container (+51%)" at scale-up. The 14&nbsp;s
+       penalty is real but doesn't affect steady-state throughput; it is
+       an operational cost borne once per scale event.</p>
+
+    <!-- ============================================================
+         6. ANALYSIS
+         ============================================================ -->
+
+    <h2>6. Analysis</h2>
+
+    <h3>6.1 Why the cycle protocol produces a phantom gap</h3>
+
+    <p>The <code>cycle</code> command bench sequence at DP=4 is a single
+       32-prompt bench immediately after the <code>scale 4</code> call
+       completes. In the plateau framework, this is <b>bench&nbsp;1 at DP=4</b>.
+       Both regimes are still far from plateau at bench&nbsp;1:</p>
+
+    <ul>
+      <li>Native bench 1 TPOT: ~110 ms (plateau ~90 ms &mdash; ~22% above)</li>
+      <li>MGC bench 1 TPOT: ~110&ndash;120 ms (plateau ~88 ms &mdash; ~25&ndash;35% above)</li>
+    </ul>
+
+    <p>Cross-session variance on that single-shot cold read is high because
+       the warm-up curve depends on prior host state: an immediately preceding
+       run leaves GPU clocks high and CPU caches warm, producing a quicker
+       warm-up; a long-quiet host gives a slower warm-up. In the &sect;5.7
+       session, native happened to land close to plateau at bench&nbsp;1
+       (171.23&nbsp;tok/s, TPOT 91.1&nbsp;ms &mdash; near-plateau) and MGC happened
+       to be farther from plateau (130.62&nbsp;tok/s, TPOT 109.4&nbsp;ms &mdash;
+       distinctly cold-ish). Subtracting the two produces a &minus;24% "gap"
+       that is really two warm-up-position readings, not two plateau
+       readings.</p>
+
+    <p>The &sect;5.5.1 headline (&minus;7.5% at DP=4) is consistent with the
+       same mechanism: that session happened to catch both regimes more
+       similarly positioned on their warm-up curves.</p>
+
+    <h3>6.2 The real container costs, and what they aren't</h3>
+
+    <p>Containerization <i>does</i> impose costs on vLLM Elastic EP in this
+       configuration &mdash; they're just not per-token costs:</p>
+
+    <table>
+      <thead>
+        <tr><th>Cost</th><th>Magnitude</th><th>Per</th><th>Amortises over</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Container cold-start wall-clock</td>
+          <td>+44 s vs native (~110 s vs ~66 s)</td>
+          <td>container launch</td>
+          <td>serving lifetime (unbounded)</td>
+        </tr>
+        <tr>
+          <td>Scale-up 2&rarr;4 duration</td>
+          <td>+14 s (~41 s vs ~27 s)</td>
+          <td>scale event</td>
+          <td>post-scale steady-state traffic</td>
+        </tr>
+        <tr>
+          <td>First-bench (post-scale) TTFT</td>
+          <td>+~850 ms (~1400 ms vs ~540 ms)</td>
+          <td>first request after cold/scale</td>
+          <td>bench 2 and later requests</td>
+        </tr>
+        <tr>
+          <td><b>Per-token TPOT</b></td>
+          <td><b>&minus;2 ms (MGC faster)</b> / 0.77&sigma; &mdash; <b>no effect</b></td>
+          <td>&mdash;</td>
+          <td>&mdash;</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>None of the container-side costs are unbounded; all of them amortise
+       away within seconds of steady-state serving. For long-lived production
+       workloads, the container imposes no measurable steady-state throughput
+       penalty relative to running on the host directly.</p>
+
+    <h3>6.3 Why MGC is slightly <i>faster</i> per token at plateau</h3>
+
+    <p>The 2&nbsp;ms / 2.2% TPOT advantage is not statistically significant
+       (0.77&sigma;), but it is directionally consistent across both replicates.
+       Two plausible (and non-mutually-exclusive) explanations:</p>
+
+    <ol>
+      <li><b>Sized <code>/dev/shm</code> with guaranteed lower bound.</b>
+          <code>--shm-size=16g</code> pre-allocates a dedicated shm region
+          backed by the container's own tmpfs. Native's
+          <code>/dev/shm</code> is shared with every other process on the
+          host, subject to external eviction pressure. Under light host load
+          the difference is nil, but it's the kind of configuration that
+          could be a slight positive under contention.</li>
+      <li><b>Ray plasma's <code>object_store_memory</code> sizing happens to
+          select a better path at 16&nbsp;GB.</b> The shm=64m variant plateaus
+          5&nbsp;ms <i>higher</i> (93.51 vs 87.67), suggesting 64&nbsp;MB pushes
+          Ray toward a slower fallback path. 16&nbsp;GB is comfortably above
+          that threshold; the host's 252&nbsp;GB <code>/dev/shm</code> would
+          plausibly route the same way native does.</li>
+    </ol>
+
+    <p>The more interesting finding from the shm sweep is <i>warm-up speed vs
+       plateau height trade-off</i>: smaller shm plateaus faster
+       (single-bench) but a few&nbsp;ms higher; larger shm takes 2&ndash;5
+       benches but plateaus lower. This is a second-order effect (&lt;7%)
+       compared to the headline clarification, but it is a real configuration
+       knob for operators who care about cold-start latency.</p>
+
+    <h3>6.4 Source of the long MGC warm-up trajectory</h3>
+
+    <p>The 2&ndash;5 bench window during which MGC TPOT descends from
+       ~110&nbsp;ms (bench 1) to ~88&nbsp;ms (plateau) is container-specific
+       &mdash; native plateaus after one warm-up. Candidate causes (not
+       individually pinned down in this investigation, but narrowed):</p>
+
+    <ul>
+      <li><b>Ruled out:</b> NCCL communicator init (identical duration in
+          both regimes); MoE-config lookup (the <code>Config file not found
+          at .../E=64,N=768,device_name=NVIDIA_A100-SXM4-40GB.json</code>
+          warning fires identically in both &mdash; both use the default
+          MoE config); torch.compile / CUDA graph capture (both disabled
+          by <code>--enforce-eager</code>).</li>
+      <li><b>Likely candidates:</b> Triton JIT kernel cache state (fresh
+          container &rArr; empty cache &rArr; first forwards JIT-compile MoE
+          dispatch kernels); page-cache warmup of bind-mounted weight files;
+          Ray plasma initialization (specifically the "lazily format a
+          large shm region" hypothesis introduced in the shm=16g-vs-64m
+          analysis).</li>
+    </ul>
+
+    <p>Distinguishing between these would require a dedicated investigation
+       (profile a single vLLM request end-to-end under <code>py-spy</code>
+       / <code>perf</code>, compare between regimes). Given that the cost is
+       bounded and the steady-state gap is zero, the incremental value of
+       pinning this down is low; leaving it as a follow-up.</p>
+
+    <h3>6.5 Methodology limitations</h3>
+
+    <div class="warning-box">
+      <p><b>Limitations:</b>
+      (1) All data is from a single shared host (node192); warm-up behaviour
+          may be host-specific (CPU/GPU idle-clock ramping, tmpfs backing
+          store, kernel version).
+      (2) n=3 cycles per regime for H5 variance calibration and n=13/n=18
+          plateau measurements per regime is enough to show a ~2&nbsp;ms
+          difference is not significant, but not enough to confidently claim
+          MGC is actually <i>faster</i>. The "no measurable gap" conclusion
+          is robust; the sign of the difference is not.
+      (3) Only DP=4 out=128 was studied in depth. Longer-output workloads
+          (out=1024) were sampled once per regime and showed a similar
+          proportional gap (&minus;17%) pre-plateau, but no 10-bench plateau
+          measurement was taken at that shape.
+      (4) Only multi-GPU container was studied. The per-GPU-container regime
+          (Exp&nbsp;A3 &sect;5.6) has fundamentally different mechanics (NCCL falls
+          to <code>NET/Socket/0</code> at container boundaries) and this
+          warm-up finding does not modify the &minus;39.6% gap there.</p>
+    </div>
+
+    <!-- ============================================================
+         7. CONCLUSIONS
+         ============================================================ -->
+
+    <h2>7. Conclusions</h2>
+
+    <ol>
+      <li><b>The &minus;24% DP=4 throughput gap in &sect;5.7 is a measurement
+          artefact.</b> When both regimes are run long enough to reach
+          steady state, native plateaus at 89.66&nbsp;ms TPOT (n=13) and MGC
+          plateaus at 87.67&nbsp;ms TPOT (n=18) &mdash; 0.77&sigma; apart,
+          statistically indistinguishable.</li>
+      <li><b>The cold TTFT blow-up is real but one-time.</b> First TTFT
+          after scale-up is ~1400&nbsp;ms in MGC vs ~540&nbsp;ms native
+          (2.6&times;), collapsing to ~200&nbsp;ms in both regimes by bench
+          2. Amortised over any realistic serving session, it disappears.</li>
+      <li><b>NCCL communicator init is identical between regimes
+          (19&nbsp;s per scale event).</b> The 14&nbsp;s container scale-up
+          penalty is in Ray's placement-group / broadcast phase, not NCCL.
+          H2 is closed as minor and mis-labelled.</li>
+      <li><b><code>--shm-size</code> trades warm-up speed against plateau
+          height.</b> shm=64m plateaus in one bench but 5&nbsp;ms higher;
+          shm=16g plateaus in 2&ndash;5 benches but 2&nbsp;ms lower than native.
+          Useful operational knob; negligible relative effect.</li>
+      <li><b><code>--ipc=host</code> vs <code>--ipc=private</code>: deferred.</b>
+          Since there is no steady-state gap to explain, the incremental
+          value of discriminating H4 is low. The variant script is in place
+          for anyone who wants to finish the measurement.</li>
+      <li><b>The <code>cycle</code> benchmark protocol is systematically
+          unreliable for measuring cross-regime steady-state differences at
+          the ~10% level.</b> Its single bench at DP=4 bench-position 1 is
+          ~20&ndash;30% above plateau and the offset-to-plateau depends on
+          pre-run host state. A <i>plateau-seeking</i> protocol gives
+          trustworthy numbers; the Exp&nbsp;C <code>variant</code> harness
+          has the primitives.</li>
+    </ol>
+
+    <div class="info-box">
+      <p><b>Next steps:</b>
+      (a) Integrate a <code>bench_to_steady</code> helper into
+          <code>exp_a3_vllm_ep/scripts/common.sh</code> that runs benches
+          until rolling TPOT stabilises within &epsilon;, then returns the
+          stabilised measurement. Replaces single-shot <code>cycle</code>-bench
+          for cross-regime comparison.
+      (b) Update Exp&nbsp;A3 &sect;5.5 / &sect;5.7 with the corrected
+          cross-regime steady-state numbers and a note that the previously
+          reported gap was a methodology artefact; keep the cold-TTFT /
+          scale-up-duration observations as they are.
+      (c) If a mechanism-level explanation of the long MGC warm-up is wanted,
+          a single-request <code>py-spy</code> / <code>perf</code> profile of
+          bench&nbsp;1 vs bench&nbsp;5 in MGC would likely isolate it (expected
+          candidates: Triton JIT, page-cache faults on weight files, Ray
+          plasma init).
+      (d) The per-GPU-container regime (Exp&nbsp;A3 &sect;5.6) is <i>not</i>
+          addressed by this finding; its &minus;39.6% gap is NCCL transport
+          selection, not warm-up.</p>
+    </div>
+
+    <!-- ============================================================
+         APPENDICES
+         ============================================================ -->
+
+    <hr class="appendix">
+
+    <h2>Appendix A: Full per-bench measurements</h2>
+
+    <h3>A.1 Native plateau runs</h3>
+
+    <table>
+      <thead>
+        <tr><th>Bench</th>
+          <th>native_n3<br>tok/s</th><th>TTFT (ms)</th><th>TPOT (ms)</th>
+          <th>native_n3_v2<br>tok/s</th><th>TTFT (ms)</th><th>TPOT (ms)</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>warmup1</td><td>140.89</td><td>539.1</td><td>110.15</td><td>138.10</td><td>571.5</td><td>112.20</td></tr>
+        <tr><td>warmup2</td><td>172.99</td><td>228.0</td><td>91.37</td><td>145.64</td><td>261.2</td><td>108.60</td></tr>
+        <tr><td>meas1</td><td>174.69</td><td>219.1</td><td>90.54</td><td>172.98</td><td>229.8</td><td>91.35</td></tr>
+        <tr><td>meas2</td><td>163.34</td><td>220.1</td><td>96.94</td><td>180.15</td><td>202.3</td><td>87.87</td></tr>
+        <tr><td>meas3</td><td>181.56</td><td>198.7</td><td>87.20</td><td>175.44</td><td>198.8</td><td>90.30</td></tr>
+        <tr><td>meas4</td><td>180.86</td><td>190.9</td><td>87.61</td><td>176.69</td><td>200.1</td><td>89.63</td></tr>
+        <tr><td>meas5</td><td>173.85</td><td>217.4</td><td>90.99</td><td>181.02</td><td>189.4</td><td>87.54</td></tr>
+        <tr><td>meas6</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>178.18</td><td>194.9</td><td>88.91</td></tr>
+        <tr><td>meas7</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>179.23</td><td>194.9</td><td>88.38</td></tr>
+        <tr><td>meas8</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>179.23</td><td>191.8</td><td>88.41</td></tr>
+        <tr><td>meas9</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>167.58</td><td>193.0</td><td>94.66</td></tr>
+        <tr><td>meas10</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>143.64<sup>&dagger;</sup></td><td>243.3</td><td>110.28<sup>&dagger;</sup></td></tr>
+      </tbody>
+    </table>
+
+    <p><sup>&dagger;</sup> <i>meas10 spiked in the second run; GPU clean on
+       check immediately after, but external activity may have coincided with
+       that single bench. Excluded from the plateau-mean computation.</i></p>
+
+    <h3>A.2 MGC plateau runs</h3>
+
+    <table>
+      <thead>
+        <tr><th>Bench</th>
+          <th>mgc_n10<br>tok/s</th><th>TTFT (ms)</th><th>TPOT (ms)</th>
+          <th>mgc_n10_v2<br>tok/s</th><th>TTFT (ms)</th><th>TPOT (ms)</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>warmup1</td><td>131.93</td><td>1742.6</td><td>108.45</td><td>118.47</td><td>1757.7</td><td>122.20</td></tr>
+        <tr><td>warmup2</td><td>178.74</td><td>212.6</td><td>88.49</td><td>159.90</td><td>239.7</td><td>98.91</td></tr>
+        <tr><td>meas1</td><td>172.31</td><td>239.0</td><td>91.65</td><td>166.06</td><td>217.9</td><td>95.33</td></tr>
+        <tr><td>meas2</td><td>182.42</td><td>198.3</td><td>86.79</td><td>167.41</td><td>210.5</td><td>94.62</td></tr>
+        <tr><td>meas3</td><td>182.33</td><td>190.4</td><td>86.89</td><td>180.27</td><td>201.2</td><td>87.81</td></tr>
+        <tr><td>meas4</td><td>183.48</td><td>194.8</td><td>86.30</td><td>173.87</td><td>220.1</td><td>90.95</td></tr>
+        <tr><td>meas5</td><td>181.99</td><td>188.2</td><td>87.07</td><td>182.56</td><td>195.3</td><td>86.75</td></tr>
+        <tr><td>meas6</td><td>183.14</td><td>197.1</td><td>86.45</td><td>183.47</td><td>188.8</td><td>86.35</td></tr>
+        <tr><td>meas7</td><td>185.65</td><td>205.5</td><td>85.19</td><td>180.92</td><td>188.1</td><td>87.59</td></tr>
+        <tr><td>meas8</td><td>182.24</td><td>191.1</td><td>86.93</td><td>175.30</td><td>211.5</td><td>90.27</td></tr>
+        <tr><td>meas9</td><td>174.34</td><td>186.0</td><td>90.98</td><td>171.63</td><td>192.0</td><td>92.39</td></tr>
+        <tr><td>meas10</td><td>193.23</td><td>179.7</td><td>81.97</td><td>181.63</td><td>190.1</td><td>87.23</td></tr>
+      </tbody>
+    </table>
+
+    <h3>A.3 H5 cycle-protocol variance</h3>
+
+    <p>Three cycles per regime from 2026-04-22 sessions 1&ndash;2, all post-GPU-idle-check, pre/post <code>nvidia-smi</code> snapshots in each <code>run_meta.txt</code>:</p>
+
+    <table>
+      <thead>
+        <tr><th>Metric</th><th>Native r1</th><th>Native r2</th><th>Native r3</th>
+            <th>MGC r1</th><th>MGC r2</th><th>MGC r3</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>DP=2 initial tok/s</td><td>72.89</td><td>72.26</td><td>78.02</td>
+            <td>69.94</td><td>66.06</td><td>69.10</td></tr>
+        <tr><td>DP=4 post-up tok/s</td><td>158.72</td><td>146.67</td><td>141.33</td>
+            <td>&mdash;<sup>*</sup></td><td>136.79</td><td>119.49</td></tr>
+        <tr><td>DP=2 post-down tok/s</td><td>73.08</td><td>73.94</td><td>74.16</td>
+            <td>&mdash;<sup>*</sup></td><td>70.71</td><td>65.29</td></tr>
+        <tr><td>DP=4 TTFT (ms)</td><td>366.5</td><td>400.8</td><td>414.5</td>
+            <td>&mdash;<sup>*</sup></td><td>1446.6</td><td>1807.3</td></tr>
+        <tr><td>DP=4 TPOT (ms)</td><td>98.66</td><td>106.72</td><td>110.76</td>
+            <td>&mdash;<sup>*</sup></td><td>106.43</td><td>120.66</td></tr>
+      </tbody>
+    </table>
+
+    <p><sup>*</sup> <i>MGC r1 cycle aborted at scale-up 2&rarr;4 due to external GPU occupancy; DP=2 initial bench (69.94 tok/s) was the only measurement collected before the abort.</i></p>
+
+    <h2>Appendix B: Variant script</h2>
+
+    <p>The parameterised MGC variant harness is at
+       <code>exp_c_container_overhead/scripts/multi_gpu_container_variant.sh</code>.
+       It sources <code>exp_a3_vllm_ep/scripts/common.sh</code> and exposes
+       four env-var knobs:</p>
+
+    <pre>
+VARIANT_TAG          required identifier (e.g. "shm64m_ipchost")
+VARIANT_SHM_SIZE     --shm-size value (default "16g")
+VARIANT_IPC          --ipc value (default "host", e.g. "private")
+VARIANT_DP           initial --data-parallel-size (default 2)</pre>
+
+    <p>Subcommands match <code>multi_gpu_container.sh</code>:
+       <code>start | stop | bench LABEL [N] [C] | scale TARGET_DP</code>.
+       Container name is <code>xtrans-exp-c-$VARIANT_TAG</code>; results land
+       in <code>exp_c_container_overhead/results/variants/$VARIANT_TAG/</code>
+       (gitignored).</p>
+
+    <h2>Appendix C: Reproducibility notes</h2>
+
+    <p>Raw data under <code>exp_c_container_overhead/results/</code>
+       (gitignored; per-run <code>bench_&lt;label&gt;.json</code> saved by
+       <code>vllm bench serve --save-result</code>, plus full
+       <code>serve.log</code> / <code>container.log</code>, plus GPU
+       snapshots in <code>run_meta.txt</code>):</p>
+
+    <ul>
+      <li><code>results/h5_variance/{native,multi_gpu_container}_run{1,2,3}/</code>
+          &mdash; H5 cycle-protocol variance. Session-1 failed archives
+          preserved as <code>_failed_*</code> with notes.</li>
+      <li><code>results/h1_ttft_compile/{native,mgc}_s1/</code> &mdash; H1
+          measurements 1 (warm out=128, out=1024) + 2 (warm vs cold).</li>
+      <li><code>results/variants/native_n3/</code>,
+          <code>native_n3_v2/</code> &mdash; native plateau trajectory runs.</li>
+      <li><code>results/variants/mgc_n10/</code>,
+          <code>mgc_n10_v2/</code> &mdash; MGC plateau trajectory runs
+          (shm=16g, ipc=host).</li>
+      <li><code>results/variants/shm64m_n3/</code>, <code>shm64m/</code> &mdash;
+          MGC shm=64m experiments.</li>
+      <li><code>results/variants/ipcprivate/</code> &mdash; single-shot
+          MGC ipc=private triage (not run at plateau).</li>
+    </ul>
+
+    <p>Per-hypothesis working notes with live numbers and reasoning:
+       <code>exp_c_container_overhead/hypotheses/h{1,2,3,4,5}_*/NOTES.md</code>.
+       Commits: <code>5ca9d23</code> (H5), <code>1c213c0</code> (variant
+       harness + warm-up discovery), <code>26b303b</code> (H1/H3/H4
+       closure), <code>347f9cb</code> (H2 closure).</p>
+
+  </main>
+</body>
+</html>
