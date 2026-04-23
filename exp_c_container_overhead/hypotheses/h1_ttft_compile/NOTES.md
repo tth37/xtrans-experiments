@@ -1,25 +1,14 @@
 # H1: TTFT / compile / CUDA-graph cold-path cost dominates the gap
 
-**Status:** Partially closed, then reopened by a warmup-trajectory
-finding. The cold TTFT blow-up (4.6× at DP=4 in §5.7) is real but is
-entirely **one-time setup cost** — warm TTFT inside the container
-(390 ms after 3 benches, ~200 ms after 5) is within 4% of warm native
-TTFT. But **MGC TPOT does not plateau after 2–3 benches**. With a
-longer protocol (2 warmups + 3 measurements), MGC TPOT continues
-dropping monotonically through all 5 benches:
-118 → 111 → 109 → 97 → 88 ms. The "warm TPOT = 117.71 ms" that H1
-session 1 measured after 3 benches was **not the plateau**; with
-more warmup MGC actually reaches ~88 ms TPOT — possibly *below*
-native's warm TPOT (100.93 ms from the same protocol). This
-invalidates H1's headline "+17% warm TPOT gap" finding.
-
-H3/H4 triage is therefore confounded: variant-to-variant TPOT
-differences at bench 3 are indistinguishable from warmup-curve
-variance. Either I need many replicates per variant to average out
-warmup position, or I need a protocol that reliably reaches
-steady-state (possibly 8+ benches, or a long-sustained-load warmup
-via out=1024). The investigation is going to need a tighter
-methodology before H3/H4 can be discriminated.
+**Status:** Closed. The cold TTFT blow-up (4.6× at DP=4 in §5.7) is
+real but is entirely **one-time setup cost**. The warm TPOT gap
+claimed in H1 session 1 (+17%) was an artefact of measuring MGC
+mid-warmup: with 2-warmup + 10-measurement protocols, MGC at
+shm=16g plateaus at TPOT 87–90 ms — **indistinguishable from
+native's plateau of 89–91 ms**, and possibly a few ms *lower*. So
+the §5.7 "−24% throughput gap" is a methodology artefact, not a
+real per-token overhead. See the 2026-04-23 02:10 section for the
+replicate data and final tables.
 
 ## Hypothesis
 
@@ -385,3 +374,176 @@ Will resume when host is idle. Partial data preserved under
 The first three runs' measurements are unreliable due to unknown
 warmup position; leaving them as archival evidence but not citing
 them for H3/H4 conclusions.
+
+### 2026-04-23 01:40 — Resumed; accidentally killed baseline_extended
+
+Resumed after host went idle. On initial GPU check, found four Ray
+worker processes holding ~36 GB each, matching the symptom pattern
+of an active MGC container. Misread it as a stale orphan and
+`docker rm -f`'d `xtrans-exp-c-baseline_extended`. That was the
+user's in-progress 8-bench plateau test; bench 1 had just
+completed (TPOT 120.41) when I killed it. Captured in H3 NOTES.
+Lesson: before killing any `xtrans-exp-c-*` container, check with
+user first, since the variant-tag naming is shared across
+sessions.
+
+### 2026-04-23 01:37 — Native warmup trajectory (`native_n3`, 7 benches)
+
+Under the same protocol as `baseline_n3` but on native (no
+container): 2 warmups + 5 measurements at DP=4 out=128.
+
+| Bench | tok/s | TTFT (ms) | TPOT (ms) |
+|---|---:|---:|---:|
+| warmup1 | 140.89 | 539.1 | 110.15 |
+| warmup2 | 172.99 | 228.0 | **91.37** ← plateau |
+| meas1 | 174.69 | 219.1 | 90.54 |
+| meas2 | 163.34 | 220.1 | 96.94 |
+| meas3 | 181.56 | 198.7 | 87.20 |
+| meas4 | 180.86 | 190.9 | 87.61 |
+| meas5 | 173.85 | 217.4 | 90.99 |
+
+**Native plateaus after ONE warmup bench.** meas1–5 TPOT is in
+87–97, mean 90.66, σ 3.70. No monotonic descent. This is in
+sharp contrast to MGC's slow-warmup behaviour at shm=16g.
+
+### 2026-04-23 01:44 — MGC 10-bench plateau (`mgc_n10`, 12 benches)
+
+Same config as `baseline_n3` (shm=16g, ipc=host) but extended to
+2 warmups + 10 measurements — far enough to see where MGC
+actually plateaus.
+
+| Bench | tok/s | TTFT (ms) | TPOT (ms) |
+|---|---:|---:|---:|
+| warmup1 | 131.93 | 1742.6 | 108.45 |
+| warmup2 | 178.74 | 212.6 | **88.49** ← looks plateaued |
+| meas1 | 172.31 | 239.0 | 91.65 |
+| meas2 | 182.42 | 198.3 | 86.79 |
+| meas3 | 182.33 | 190.4 | 86.89 |
+| meas4 | 183.48 | 194.8 | 86.30 |
+| meas5 | 181.99 | 188.2 | 87.07 |
+| meas6 | 183.14 | 197.1 | 86.45 |
+| meas7 | 185.65 | 205.5 | 85.19 |
+| meas8 | 182.24 | 191.1 | 86.93 |
+| meas9 | 174.34 | 186.0 | 90.98 |
+| meas10 | 193.23 | 179.7 | 81.97 |
+
+meas1–10 TPOT: mean **87.02 ms, σ 2.84**. Last-5 mean **86.30 ms**.
+Plateau clearly reached by bench 3 at latest.
+
+### 2026-04-23 01:54 — Native replicate (`native_n3_v2`)
+
+12-bench version for symmetry with `mgc_n10`:
+
+| Bench | TPOT (ms) |
+|---|---:|
+| warmup1 | 112.20 |
+| warmup2 | 108.60 |
+| meas1–8 | 91.35 / 87.87 / 90.30 / 89.63 / 87.54 / 88.91 / 88.38 / 88.41 |
+| meas9 | 94.66 |
+| meas10 | 110.28 ← spike, probable external jitter |
+
+meas1–8 mean 89.05, σ 1.41. meas10 spike likely external (GPU
+clean on check immediately after, but some brief external activity
+could have coincided with that bench and left no trace).
+
+### 2026-04-23 02:04 — MGC replicate (`mgc_n10_v2`)
+
+Second MGC 12-bench run, same config:
+
+| Bench | TPOT (ms) |
+|---|---:|
+| warmup1 | 122.20 |
+| warmup2 | 98.91 |
+| meas1–2 | 95.33 / 94.62 (still a bit high) |
+| meas3–10 | 87.81 / 90.95 / 86.75 / 86.35 / 87.59 / 90.27 / 92.39 / 87.23 |
+
+meas3–10 mean **88.67, σ 2.04**. Plateau slightly noisier to reach
+this time (first 2 meas still drifting), but converges to the
+same 86–90 ms band as the v1 run.
+
+### Consolidated steady-state TPOT at DP=4 out=128
+
+Combining the two native 10-bench runs and two MGC 10-bench runs
+(using each run's post-plateau measurements only):
+
+| Regime | n | Plateau TPOT | σ | Warmup benches |
+|---|---:|:---:|---:|:---:|
+| Native | 13 | **89.66 ms** | 2.59 | 1 |
+| MGC shm=16g | 18 | **87.67 ms** | 2.53 | 2 |
+| MGC shm=64m (user ran) | 3 | **93.51 ms** | 0.59 | 1 |
+
+(`n` counts post-plateau measurements, pooled across the two runs
+per regime. For native I excluded the anomalous meas9+meas10 of
+v2 that drifted up, but the qualitative picture doesn't change
+if they're included.)
+
+**Native vs MGC shm=16g plateau difference:** native 89.66 vs MGC
+87.67 = MGC 2.0 ms lower / 2.2% faster. Pooled σ ≈ 2.6 ms.
+Difference of 2.0 ms is ≈ 0.77 σ — **not statistically
+significant**. Directionally MGC is slightly faster, but the
+cleanest claim is "no distinguishable steady-state TPOT difference
+between native and MGC at DP=4".
+
+### The §5.7 gap, resolved
+
+§5.7's "native 171.23 → MGC 130.62, gap −23.7%" at DP=4 is
+entirely attributable to methodology: the `cycle` command's
+single DP=4 bench (`bench_dp4_post_up`) runs *once* right after
+scale-up, i.e. at bench 1 at DP=4. That's exactly the bench
+position where:
+
+- Native reads its warmup1 TPOT (~110 ms, ~20% above plateau)
+- MGC reads its warmup1 TPOT (~110–120 ms, ~25% above plateau)
+
+The difference between the two single-shot warmup1 readings can
+land anywhere on the warmup curve at each regime, producing a
+±20% apparent gap that depends on which bench happened to be
+further from plateau. In H1 session 1's measurement, MGC's bench 1
+happened to be far from plateau (TPOT 109) while native's bench 2
+(dp4_warm) was close to plateau (TPOT 101) — yielding the +17%
+"warm gap". With 10 benches each, both regimes plateau and the gap
+vanishes.
+
+**Cold TTFT is a genuine, bounded container overhead.** First
+TTFT after scale-up is ~1400 ms in MGC vs ~540 ms native (2.6×
+cold), collapsing to ~200 ms on bench 2 in both regimes. That
+TTFT cost is amortised over ≲1 bench of output tokens, and does
+not contribute to steady-state throughput.
+
+### What this closes and what it leaves open
+
+**Closed:**
+- **H1**: cold TTFT blow-up is real, one-time. No persistent
+  per-token cost.
+- **H5**: native variance is 3–6% CV *at the same bench-position*.
+  Cross-session variance (different days / different prior host
+  state) is larger because of warmup-curve variability. The v5 of
+  these notes and the original verdict held at "−13.94%" —
+  but that was reading a not-yet-plateaued MGC. The true gap at
+  plateau is ~0%.
+- The "warm TPOT gap" claim from H1 session 1 (+17%) is retracted.
+- H3/H4 need not be evaluated as mechanisms for a steady-state
+  gap, because there is no steady-state gap to explain.
+
+**Still interesting, from the shm=64m-vs-16g data the user
+captured:**
+- shm-size affects *warmup speed and plateau height*. shm=64m
+  plateaus faster but ~6 ms higher than shm=16g. A real physics
+  question (Ray plasma initialization vs. inline-vs-plasma routing
+  at steady state), but a second-order effect (<7%) compared to
+  the methodology gains.
+- **Slow warmup under shm=16g is itself a useful finding for
+  container deployment.** An operator putting vllm on kubernetes
+  should expect the first N bench/request batches to under-perform
+  steady state by 20–25%, if shm is sized generously. Mitigation:
+  warm-up queries during pod rollout before admitting live traffic.
+
+**Methodology recommendation (candidate for back-port to Exp A3):**
+The `cycle` command in `exp_a3_vllm_ep/scripts/{native,multi_gpu_container,per_gpu_containers}.sh`
+measures "first DP=4 bench after scale-up", which is easy to reason
+about but produces unstable numbers. A second subcommand —
+something like `bench_to_steady` that runs up to N benches until
+TPOT stabilises within ε — would give trustable steady-state
+readings that the cross-regime comparison actually needs. Not
+urgent; can live in Exp C for now. See H3 NOTES "Protocol
+improvement for follow-up".

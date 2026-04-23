@@ -1,12 +1,18 @@
 # H4: `--ipc=host` vs alternatives
 
-**Status:** Triage attempted; blocked on the same methodology problem
-as H3. See H1 NOTES ("Warmup trajectory discovery") and H3 NOTES for
-details. Single-shot `ipc=private` reading (TPOT 111.90 after 3
-benches) is within the warmup-trajectory band (baseline_n3 bench 3
-was 108.87) — can't distinguish real ipc effect from warmup-position
-noise. Variant archive preserved under `results/variants/ipcprivate/`
-as pre-methodology data.
+**Status:** Deferred. The whole question of a per-token container
+overhead was closed by H1 and H3 with the finding that MGC steady-
+state TPOT is indistinguishable from native (both ~88–91 ms at
+DP=4 shm=16g), once proper warmup is applied. There's no
+steady-state gap for `ipc=host` to be responsible for. The
+existing single-shot `ipcprivate` reading (TPOT 111.90 at bench 3)
+was taken before the plateau was reached, so it doesn't actually
+tell us whether `ipc=private` changes the plateau. Running a full
+10-bench `ipcprivate_n10` using the `multi_gpu_container_variant.sh`
+script (already in place) would resolve this cleanly, but given
+there's no gap to explain, the incremental value is low. Leaving
+the variant script in place for anyone who wants to finish the
+question.
 
 ## Hypothesis
 
