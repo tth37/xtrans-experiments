@@ -1,6 +1,19 @@
 # H2: NCCL init overhead in-container
 
-**Status:** Open, not yet measured.
+**Status:** Closed as minor. NCCL-group init duration during the
+scale-up 2→4 event is identical in both regimes (19 s each, measured
+from the 2026-04-23 native_n3 and mgc_n10 logs). H2's "container
+NCCL init is measurably longer" prediction is not supported. The
+14 s container overhead on scale-up wall-clock is in Ray's
+placement-group / actor-coordination / broadcast phase, not in
+NCCL communicator init proper.
+
+This doesn't rule out per-request first-forward NCCL costs
+contributing to the cold TTFT blow-up (~1400 ms MGC vs ~540 ms
+native on bench 1), but that can only be resolved with
+NCCL_DEBUG=INFO instrumentation, and the overall bounded nature
+of cold TTFT (bench 2 is within 4% of native) makes the
+incremental value of that measurement low.
 
 ## Hypothesis
 
@@ -43,4 +56,30 @@ per scale event, amplifying any init-phase cost.
 
 ## Status notes
 
-(empty)
+### 2026-04-23 02:10 — Triage from existing logs
+
+Extracted timings from `results/variants/native_n3/serve.log` and
+`results/variants/mgc_n10/container.log`. Both regimes ran the same
+2→4 scale-up during their 12-bench protocols. Phase breakdown:
+
+| Phase | Native | MGC | Δ |
+|---|---:|---:|---:|
+| Reconfig request → "Created standby communication groups" (NCCL init for new workers) | 19 s | 19 s | **0** |
+| Standby → "Transferred weights to new workers" | 2 s | 3 s | +1 |
+| Weights → "Switched to new setup" (broadcast, placement, actor sync) | 6 s | 19 s | **+13** |
+| **Total scale-up** | 27 s | 41 s | +14 s |
+
+So the NCCL-communicator init itself is unchanged between regimes —
+the 19-second "Created standby communication groups" wall-clock is
+fixed. The 14-second container penalty on scale-up is entirely in
+the post-NCCL phase, where Ray does its placement-group + actor +
+broadcast work. That's a Ray / container-boundary phenomenon, not
+an NCCL one.
+
+H2's H-specific claim about NCCL init is therefore falsified. The
+larger container scale-up time is real (consistent with §5.5.2's
+"+51%" Ray actor spawn finding in Exp A3), but it's mislabelled if
+called "NCCL init overhead." A more accurate label would be "Ray
+placement-group + actor-spawn overhead inside a container."
+
+H2 closed.
