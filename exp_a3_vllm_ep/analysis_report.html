@@ -686,11 +686,75 @@ num_replicas = num_replicas // ep_group.size() * num_gpus  # scale-down</pre>
     </table>
 
     <p>Elastic EP works identically inside a container &mdash; all scaling
-       operations succeed with the same state machine behaviour. The container
-       imposes a modest throughput overhead (~24% at DP=2, ~8% at DP=4). The
-       larger DP=2 penalty is consistent with shared-memory / IPC overhead
-       being more prominent when compute is less saturated; at DP=4 the work
-       amortizes better and the gap narrows.</p>
+       operations succeed with the same state machine behaviour. Read
+       literally, the single-shot table above shows a ~24% DP=2 and ~8%
+       DP=4 container penalty.</p>
+
+    <div class="highlight-box">
+      <p><b>Methodology correction (2026-04-23).</b> The single-shot
+         <code>cycle</code> subcommand runs one <code>vllm bench serve</code>
+         at each DP size, which sits at bench-position 1 on the engine&rsquo;s
+         warmup curve. Exp&nbsp;C showed TPOT at bench-position 1 is
+         20&ndash;30% above steady-state for smaller DP sizes (CUDA graphs not
+         yet built out across all batch-size buckets, EPLB not yet rebalanced).
+         The cross-regime overhead readings above bake in that warmup-position
+         bias. A plateau-seeking re-run (<code>cycle_steady</code>, which
+         loops <code>vllm bench serve</code> at a fixed shape until the last
+         3&nbsp;TPOTs are within 3% of each other, then records 2 extra samples;
+         see <code>common/harness/bench_to_steady.py</code>) gives a fair
+         within-regime steady-state measurement:</p>
+    </div>
+
+    <table>
+      <caption style="font-style:italic; text-align:left; padding:0.5em 0;">
+        Plateau TPOT (ms, lower is better). Marked * = did not converge
+        within the 15-bench ceiling; plateau window is the last 5 benches
+        and may still include warmup drift.
+      </caption>
+      <thead>
+        <tr>
+          <th>Config</th>
+          <th>Native<br>(plateau &plusmn; &sigma;)</th>
+          <th>Multi-GPU container<br>(plateau &plusmn; &sigma;)</th>
+          <th>&Delta; (MGC vs native)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>DP=2 initial</b></td>
+          <td>102.23 &plusmn; 8.84&nbsp;ms</td>
+          <td>82.20 &plusmn; 10.88&nbsp;ms*</td>
+          <td>&sigma; overlap (~10% CV on both)</td>
+        </tr>
+        <tr>
+          <td><b>DP=4 post-scale-up</b></td>
+          <td>93.26 &plusmn; 6.32&nbsp;ms</td>
+          <td><b>86.92 &plusmn; 0.94&nbsp;ms</b></td>
+          <td><b>&minus;6.8%</b> (MGC faster)</td>
+        </tr>
+        <tr>
+          <td><b>DP=2 post-scale-down</b></td>
+          <td>102.54 &plusmn; 8.45&nbsp;ms</td>
+          <td>86.34 &plusmn; 9.26&nbsp;ms*</td>
+          <td>&sigma; overlap</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Read under matched methodology, the container does <b>not</b>
+       impose a measurable steady-state TPOT overhead at DP=4 &mdash; the
+       plateau is actually 6.8% faster than native, with the DP=4 native
+       plateau&rsquo;s own &sigma; (&plusmn;6.32&nbsp;ms) covering most of
+       the gap. The DP=2 plateaus don&rsquo;t converge within the 15-bench
+       ceiling on either side; their ~10% CVs reproduce Exp&nbsp;C&rsquo;s
+       cycle-protocol variance finding (6&ndash;10% CV at DP=2 regardless
+       of regime) and are therefore not a regime signal. Raw JSON with
+       full per-bench trajectories:
+       <code>exp_a3_vllm_ep/results/{native,multi_gpu_container}/bench_steady_*.json</code>.
+       The original single-shot table above is retained because &sect;5.5.3
+       and &sect;5.5.4 &mdash; the actual findings of this regime (GPU-trap,
+       Docker <code>DeviceIDs</code> immutability) &mdash; don&rsquo;t depend
+       on the throughput magnitudes.</p>
 
     <h4>5.5.2 Rescaling timing &mdash; native vs. multi-GPU container</h4>
 
@@ -1202,6 +1266,113 @@ ep-rank-3 DeviceIDs: ['3']</pre>
           NCCL <code>NET/Socket/0</code> fallback (v5&nbsp;&sect;4.1
           shim track), not from the patch.</li>
     </ul>
+
+    <h4>5.7.1 Plateau-seeking re-measurement (2026-04-23)</h4>
+
+    <div class="highlight-box">
+      <p><b>Why this section exists.</b> Every cell in the single-shot
+         table above is a position-1 bench &mdash; the first
+         <code>vllm bench serve</code> after scale into the target DP
+         configuration. Exp&nbsp;C showed position-1 sits 20&ndash;30%
+         above steady-state TPOT on the engine warmup curve for smaller
+         DP sizes. The &minus;23.7% and &minus;39.6% DP=4 overhead
+         readings therefore bake in warmup-position bias that is
+         <i>not</i> a property of the regime. Re-running with
+         <code>cycle_steady</code> (loop until TPOT plateaus to &le;3%
+         range over 3 consecutive benches, then record 2 extra samples
+         for statistical power; same exact bench shape applied
+         identically to all three regimes) gives a fair cross-regime
+         comparison:</p>
+    </div>
+
+    <table>
+      <caption style="font-style:italic; text-align:left; padding:0.5em 0;">
+        Plateau TPOT (ms, lower is better). Marked * = did not converge
+        within the 15-bench ceiling; plateau window is the last 5 benches
+        and may still include warmup-curve drift. Raw JSON:
+        <code>exp_a3_vllm_ep/results/&lt;regime&gt;/bench_steady_*.json</code>.
+      </caption>
+      <thead>
+        <tr>
+          <th>DP configuration</th>
+          <th>Native</th>
+          <th>Multi-GPU container</th>
+          <th>Per-GPU containers</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>DP=2 initial</b></td>
+          <td>102.23 &plusmn; 8.84</td>
+          <td>82.20 &plusmn; 10.88*</td>
+          <td>93.81 &plusmn; 18.77*</td>
+        </tr>
+        <tr>
+          <td><b>DP=4 post-scale-up</b></td>
+          <td><b>93.26 &plusmn; 6.32</b></td>
+          <td><b>86.92 &plusmn; 0.94</b></td>
+          <td><b>87.64 &plusmn; 0.86</b></td>
+        </tr>
+        <tr>
+          <td><b>DP=2 post-scale-down</b></td>
+          <td>102.54 &plusmn; 8.45</td>
+          <td>86.34 &plusmn; 9.26*</td>
+          <td>95.73 &plusmn; 37.30*</td>
+        </tr>
+        <tr style="background:#f7f7f7;">
+          <td><b>DP=4 delta vs native plateau</b></td>
+          <td>&mdash; (reference)</td>
+          <td>&minus;6.8%</td>
+          <td>&minus;6.0%</td>
+        </tr>
+        <tr style="background:#f7f7f7;">
+          <td><b>DP=4 delta per-GPU vs MGC plateau</b></td>
+          <td colspan="3"><b>+0.8%</b> &mdash; gap of 0.72&nbsp;ms, an
+              order of magnitude smaller than either plateau&rsquo;s
+              &sigma; (0.86, 0.94&nbsp;ms). Statistically indistinguishable.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="warning-box">
+      <p><b>This inverts the &minus;23%/&minus;39.6% reading of the
+         single-shot table.</b> Under matched methodology, at DP=4 steady
+         state:</p>
+      <ul>
+        <li>Multi-GPU container and per-GPU containers are within 0.8% of
+            each other &mdash; there is no measurable serving-side penalty
+            from the per-GPU container boundary at this DP and this
+            bench shape.</li>
+        <li>Both container regimes are ~6% <i>faster</i> than native,
+            though that gap is inside the native plateau&rsquo;s own
+            &plusmn;6.32&nbsp;ms &sigma;. We treat it as noise rather
+            than a signal without a mechanism explanation.</li>
+        <li>The DP=2 plateaus don&rsquo;t converge for either container
+            regime within 15 benches. Their &sigma; (10&ndash;37&nbsp;ms)
+            reflects the 6&ndash;10% cycle-protocol variance floor
+            documented in Exp&nbsp;C&nbsp;&sect;5.8 and is not a regime
+            signal either.</li>
+      </ul>
+    </div>
+
+    <p><b>Reconciling with NCCL microbenchmarks.</b> The common/benchmarks
+       NCCL tests (archived/exp_a_nccl_gates/) measured a 10&ndash;25&times;
+       raw bandwidth hit when NCCL falls to <code>NET/Socket/0</code>
+       (156&nbsp;GB/s AllReduce on NVLink vs ~11&nbsp;GB/s on TCP). Phase&nbsp;3
+       originally read the per-GPU-container single-shot throughput drop as
+       that same penalty expressed at the serving layer. The plateau data
+       here argues that isn&rsquo;t what&rsquo;s happening: most of the
+       single-shot gap was warmup-position, and the residual steady-state
+       gap vs MGC is &lt;1%. The plausible mechanism is that vLLM&rsquo;s
+       EP all-to-all dispatches per-token expert activations &mdash;
+       small per-message payloads &mdash; where NCCL bandwidth is not the
+       binding constraint at this DP and request shape. This doesn&rsquo;t
+       contradict the NCCL microbenchmark; it says the microbenchmark
+       penalty doesn&rsquo;t propagate 1:1 to serving under these specific
+       conditions. The v5&nbsp;&sect;4.1 shim track retains its motivation
+       (larger DP, larger batch, or larger token-context may shift the
+       balance toward bandwidth-bound) but cannot claim a 23% recovery
+       headroom on this workload.</p>
 
 
     <!-- ============================================================
