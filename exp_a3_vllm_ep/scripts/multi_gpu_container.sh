@@ -106,6 +106,14 @@ bench() {
     vllm_bench "$label" "localhost:$VLLM_PORT" "$num_prompts" "$concurrency" "$RESULTS_DIR"
 }
 
+# ─── Subcommand: bench_steady ─────────────────────────────────────────
+bench_steady() {
+    local label=${1:-unknown} num_prompts=${2:-32} concurrency=${3:-16}
+    local input_len=${4:-128} output_len=${5:-128}
+    bench_to_steady "$label" "localhost:$VLLM_PORT" "$RESULTS_DIR" \
+        "$num_prompts" "$concurrency" "$input_len" "$output_len"
+}
+
 # ─── Subcommand: scale ────────────────────────────────────────────────
 scale() {
     local new_dp=${1:?target DP size required}
@@ -154,27 +162,51 @@ cycle() {
     log "Cycle complete. Results in $RESULTS_DIR/"
 }
 
+# ─── Subcommand: cycle_steady ─────────────────────────────────────────
+# Same 2->4->2 structure but each bench is plateau-seeking. Recommended
+# protocol for cross-regime throughput comparison (see Exp C report).
+cycle_steady() {
+    state "pre_cycle"
+    bench_steady dp2_initial 16 8 || log "WARN: dp2_initial did not converge"
+    scale 4
+    sleep 3
+    state "post_scale_up"
+    bench_steady dp4_post_up 32 16 || log "WARN: dp4_post_up did not converge"
+    scale 2
+    sleep 3
+    state "post_scale_down"
+    bench_steady dp2_post_down 16 8 || log "WARN: dp2_post_down did not converge"
+    state "post_cycle"
+    log "cycle_steady complete. Plateau summaries in $RESULTS_DIR/bench_steady_*.json"
+}
+
 # ─── Dispatch ─────────────────────────────────────────────────────────
 cmd=${1:-}; shift || true
 case "$cmd" in
-    start)  start ;;
-    stop)   stop ;;
-    bench)  bench "$@" ;;
-    scale)  scale "$@" ;;
-    state)  state "$@" ;;
-    cycle)  cycle ;;
+    start)          start ;;
+    stop)           stop ;;
+    bench)          bench "$@" ;;
+    bench_steady)   bench_steady "$@" ;;
+    scale)          scale "$@" ;;
+    state)          state "$@" ;;
+    cycle)          cycle ;;
+    cycle_steady)   cycle_steady ;;
     *)
         cat <<'EOF' >&2
-usage: multi_gpu_container.sh {start|stop|bench LABEL [N] [C]|scale TARGET_DP|state [TAG]|cycle}
+usage: multi_gpu_container.sh {start|stop|bench LABEL [N] [C]|bench_steady LABEL [N] [C] [IN] [OUT]|scale TARGET_DP|state [TAG]|cycle|cycle_steady}
 
 subcommands:
-    start                   launch container + start vllm serve inside
-    stop                    save container log, remove container
-    bench LABEL [N] [C]     run vllm bench from host
-    scale TARGET_DP         POST /scale_elastic_ep
-    state [TAG]             docker inspect DeviceIDs + host nvidia-smi snapshot
-                            -- the "orchestrator trap" observation
-    cycle                   full DP=2 → 4 → 2 reference cycle with benchmarks
+    start                               launch container + start vllm serve inside
+    stop                                save container log, remove container
+    bench LABEL [N] [C]                 run `vllm bench serve` single-shot
+    bench_steady LABEL [N] [C] [IN] [OUT]
+                                        loop `vllm bench serve` until TPOT plateaus
+    scale TARGET_DP                     POST /scale_elastic_ep
+    state [TAG]                         docker inspect DeviceIDs + host nvidia-smi snapshot
+                                        -- the "orchestrator trap" observation
+    cycle                               full DP=2 → 4 → 2 cycle with single-shot benches
+    cycle_steady                        full DP=2 → 4 → 2 cycle with plateau benches
+                                        (recommended for cross-regime comparison)
 
 prerequisites:
     * image `xtrans-vllm-ep:v0.19.0` built (see Dockerfile.base)

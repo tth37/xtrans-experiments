@@ -229,6 +229,14 @@ bench() {
     vllm_bench "$label" "localhost:$VLLM_PORT" "$num_prompts" "$concurrency" "$RESULTS_DIR"
 }
 
+# ─── Subcommand: bench_steady ─────────────────────────────────────────
+bench_steady() {
+    local label=${1:-unknown} num_prompts=${2:-32} concurrency=${3:-16}
+    local input_len=${4:-128} output_len=${5:-128}
+    bench_to_steady "$label" "localhost:$VLLM_PORT" "$RESULTS_DIR" \
+        "$num_prompts" "$concurrency" "$input_len" "$output_len"
+}
+
 # ─── Subcommand: scale ────────────────────────────────────────────────
 # Use with the default 2->4->2 cycle: scale up from DP=2 first, which
 # grows per-GPU expert count via EPLB (building redundancy), then scale
@@ -307,19 +315,43 @@ cycle() {
     log "Cycle complete. Results in $RESULTS_DIR/"
 }
 
+# ─── Subcommand: cycle_steady ─────────────────────────────────────────
+# Same 2->4->2 structure but each bench is plateau-seeking. Recommended
+# protocol for cross-regime throughput comparison (see Exp C report).
+# In this regime NCCL falls to NET/Socket/0 between containers so the
+# plateau value is legitimately different from native / multi-GPU
+# container — the fair-measurement protocol still applies.
+cycle_steady() {
+    state "pre_cycle"
+    bench_steady dp2_initial 16 8 || log "WARN: dp2_initial did not converge"
+    scale 4
+    sleep 3
+    state "post_scale_up"
+    bench_steady dp4_post_up 32 16 || log "WARN: dp4_post_up did not converge"
+    scale 2
+    sleep 3
+    state "post_scale_down"
+    bench_steady dp2_post_down 16 8 || log "WARN: dp2_post_down did not converge"
+    state "post_cycle"
+    nccl_grep > /dev/null 2>&1 || true
+    log "cycle_steady complete. Plateau summaries in $RESULTS_DIR/bench_steady_*.json"
+}
+
 # ─── Dispatch ─────────────────────────────────────────────────────────
 cmd=${1:-}; shift || true
 case "$cmd" in
-    up)         up ;;
-    down)       down ;;
-    bench)      bench "$@" ;;
-    scale)      scale "$@" ;;
-    state)      state "$@" ;;
-    cycle)      cycle ;;
-    nccl-grep)  nccl_grep ;;
+    up)             up ;;
+    down)           down ;;
+    bench)          bench "$@" ;;
+    bench_steady)   bench_steady "$@" ;;
+    scale)          scale "$@" ;;
+    state)          state "$@" ;;
+    cycle)          cycle ;;
+    cycle_steady)   cycle_steady ;;
+    nccl-grep)      nccl_grep ;;
     *)
         cat <<'EOF' >&2
-usage: per_gpu_containers.sh {up|down|bench LABEL [N] [C]|scale TARGET_DP|state [TAG]|cycle|nccl-grep}
+usage: per_gpu_containers.sh {up|down|bench LABEL [N] [C]|bench_steady LABEL [N] [C] [IN] [OUT]|scale TARGET_DP|state [TAG]|cycle|cycle_steady|nccl-grep}
 
 subcommands:
     up                      bridge network + 4 per-GPU containers +
@@ -329,15 +361,19 @@ subcommands:
                             auto-builds from Dockerfile.per_gpu_containers
                             on first run.
     down                    save per-container logs, stop containers
-    bench LABEL [N] [C]     vllm bench from host
+    bench LABEL [N] [C]     `vllm bench serve` single-shot from host
+    bench_steady LABEL [N] [C] [IN] [OUT]
+                            loop `vllm bench serve` until TPOT plateaus
     scale TARGET_DP         POST /scale_elastic_ep. Use with the
                             default 2->4->2 pattern (scale up from
                             DP=2 first, then back down); cold-DP=N>2
                             scale-down hits vLLM's EPLB invariant.
     state [TAG]             per-container DeviceIDs + host nvidia-smi
-    cycle                   full DP=2 → 4 → 2 reference cycle with benchmarks
+    cycle                   full DP=2 → 4 → 2 cycle with single-shot benches
                             (matches native.sh / multi_gpu_container.sh
                             cycle semantics). Assumes PER_GPU_DP=2 default.
+    cycle_steady            full DP=2 → 4 → 2 cycle with plateau benches
+                            (recommended for cross-regime comparison)
     nccl-grep               extract NCCL transport selection from
                             vllm-serve log (the NET/Socket/0 headline)
 

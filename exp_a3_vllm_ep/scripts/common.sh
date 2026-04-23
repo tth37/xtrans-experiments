@@ -18,6 +18,9 @@
 #   wait_for_ready URL [T]       poll URL until HTTP 200, timeout T seconds
 #   vllm_bench LABEL HOST:PORT NUM_PROMPTS CONCURRENCY OUT_DIR
 #                                run `vllm bench serve` with --dataset-name random
+#   bench_to_steady LABEL HOST:PORT OUT_DIR [N] [C] [IN] [OUT]
+#                                loop vllm bench serve until TPOT plateaus
+#                                (see common/harness/bench_to_steady.py)
 #   trigger_scale URL NEW_DP     POST /scale_elastic_ep, print elapsed
 #   gpu_snapshot                 nvidia-smi brief table
 #   gpu_processes                nvidia-smi compute apps
@@ -150,6 +153,52 @@ vllm_bench() {
         --result-dir "$out_dir" \
         --result-filename "bench_${label}.json" \
         2>&1 | tee "$out_dir/bench_${label}.log"
+}
+
+# ─── Plateau-seeking bench (cross-regime fair measurement) ─────────────
+# Motivation: a single `vllm bench serve` after scale-up sits at bench
+# position 1, which is 20–30% above steady-state TPOT on the warm-up curve.
+# Cross-regime comparisons with single-shot readings carry huge latent
+# variance that depends on pre-run host state. Exp C found that the
+# "−24% MGC vs native" gap in §5.7 was almost entirely this artefact;
+# the plateau comparison is indistinguishable (0.77σ).
+#
+# This helper loops `vllm bench serve` at the same shape until TPOT
+# plateaus, then reports plateau mean/σ over a stable window. Output:
+# per-bench JSON + a summary `bench_steady_<label>.json` in OUT_DIR.
+#
+# Usage: bench_to_steady LABEL HOST:PORT OUT_DIR [N=32] [C=16] [IN=128] [OUT=128]
+#                                          [MAX=15] [EPS_PCT=3] [EXTRA=2]
+bench_to_steady() {
+    local label=$1 hostport=$2 out_dir=$3
+    local n_prompts=${4:-32} concurrency=${5:-16}
+    local input_len=${6:-128} output_len=${7:-128}
+    local max_benches=${8:-15} eps_pct=${9:-3} extra_samples=${10:-2}
+    local host port
+    host=${hostport%:*}
+    port=${hostport#*:}
+    mkdir -p "$out_dir"
+
+    ensure_venv
+    log "bench_to_steady[$label]: n=$n_prompts c=$concurrency in=$input_len out=$output_len max=$max_benches eps=${eps_pct}%"
+    python3 "$PROJECT_ROOT/common/harness/bench_to_steady.py" \
+        --label "$label" \
+        --out-dir "$out_dir" \
+        --host "$host" \
+        --port "$port" \
+        --served-model-name "$SERVED_MODEL_NAME" \
+        --tokenizer-path "$MODEL_SNAPSHOT" \
+        --num-prompts "$n_prompts" \
+        --max-concurrency "$concurrency" \
+        --random-input-len "$input_len" \
+        --random-output-len "$output_len" \
+        --max-benches "$max_benches" \
+        --eps-pct "$eps_pct" \
+        --extra-samples "$extra_samples" \
+        2>&1 | tee "$out_dir/bench_steady_${label}.log"
+    # Exit status 2 from the helper = "ran but did not converge"; preserve it
+    # so cycle_steady can flag non-converged segments.
+    return "${PIPESTATUS[0]}"
 }
 
 # ─── /scale_elastic_ep driver ─────────────────────────────────────────

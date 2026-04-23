@@ -12,10 +12,14 @@
 # Usage:
 #   ./scripts/native.sh start          # bring up Ray + vllm serve
 #   ./scripts/native.sh bench LABEL NP C
-#                                      # run vllm bench serve
+#                                      # run vllm bench serve (single-shot)
+#   ./scripts/native.sh bench_steady LABEL NP C [IN] [OUT]
+#                                      # loop `vllm bench serve` until TPOT
+#                                      # plateaus (cross-regime-fair)
 #   ./scripts/native.sh scale NEW_DP   # trigger /scale_elastic_ep
 #   ./scripts/native.sh state          # snapshot GPU + serving state
-#   ./scripts/native.sh cycle          # full 2->4->2 reference cycle
+#   ./scripts/native.sh cycle          # full 2->4->2 reference cycle (single-shot benches)
+#   ./scripts/native.sh cycle_steady   # full 2->4->2 cycle with plateau benches
 #   ./scripts/native.sh stop           # shut everything down
 
 set -euo pipefail
@@ -104,6 +108,16 @@ bench() {
     vllm_bench "$label" "localhost:$VLLM_PORT" "$num_prompts" "$concurrency" "$RESULTS_DIR"
 }
 
+# ─── Subcommand: bench_steady ─────────────────────────────────────────
+# Loop `vllm bench serve` until TPOT plateaus. Usage matches `bench` plus
+# optional input-len / output-len.
+bench_steady() {
+    local label=${1:-unknown} num_prompts=${2:-32} concurrency=${3:-16}
+    local input_len=${4:-128} output_len=${5:-128}
+    bench_to_steady "$label" "localhost:$VLLM_PORT" "$RESULTS_DIR" \
+        "$num_prompts" "$concurrency" "$input_len" "$output_len"
+}
+
 # ─── Subcommand: scale ────────────────────────────────────────────────
 scale() {
     local new_dp=${1:?target DP size required}
@@ -146,27 +160,54 @@ cycle() {
     log "Cycle complete. Results in $RESULTS_DIR/"
 }
 
+# ─── Subcommand: cycle_steady ─────────────────────────────────────────
+# Same 2->4->2 structure as `cycle`, but each bench is plateau-seeking.
+# This is the recommended protocol for cross-regime throughput comparison;
+# single-shot `cycle` readings include warm-up state and are not
+# comparable across regimes without further adjustment.
+cycle_steady() {
+    state "pre_cycle"
+    bench_steady dp2_initial 16 8 || log "WARN: dp2_initial did not converge"
+    scale 4
+    sleep 3
+    state "post_scale_up"
+    bench_steady dp4_post_up 32 16 || log "WARN: dp4_post_up did not converge"
+    scale 2
+    sleep 3
+    state "post_scale_down"
+    bench_steady dp2_post_down 16 8 || log "WARN: dp2_post_down did not converge"
+    state "post_cycle"
+    log "cycle_steady complete. Plateau summaries in $RESULTS_DIR/bench_steady_*.json"
+}
+
 # ─── Dispatch ─────────────────────────────────────────────────────────
 cmd=${1:-}; shift || true
 case "$cmd" in
-    start)  start ;;
-    stop)   stop ;;
-    bench)  bench "$@" ;;
-    scale)  scale "$@" ;;
-    state)  state "$@" ;;
-    cycle)  cycle ;;
+    start)          start ;;
+    stop)           stop ;;
+    bench)          bench "$@" ;;
+    bench_steady)   bench_steady "$@" ;;
+    scale)          scale "$@" ;;
+    state)          state "$@" ;;
+    cycle)          cycle ;;
+    cycle_steady)   cycle_steady ;;
     *)
         cat <<'EOF' >&2
-usage: native.sh {start|stop|bench LABEL [N] [C]|scale TARGET_DP|state [TAG]|cycle}
+usage: native.sh {start|stop|bench LABEL [N] [C]|bench_steady LABEL [N] [C] [IN] [OUT]|scale TARGET_DP|state [TAG]|cycle|cycle_steady}
 
 subcommands:
-    start                   bring up Ray head + vllm serve at DP=2
-    stop                    stop serve and Ray
-    bench LABEL [N] [C]     run `vllm bench serve --dataset-name random`
-                            (defaults: N=32 prompts, C=16 concurrency)
-    scale TARGET_DP         POST /scale_elastic_ep
-    state [TAG]             snapshot GPU + scaling state
-    cycle                   full DP=2 → 4 → 2 reference cycle with benchmarks
+    start                               bring up Ray head + vllm serve at DP=2
+    stop                                stop serve and Ray
+    bench LABEL [N] [C]                 run `vllm bench serve --dataset-name random`
+                                        single-shot (defaults: N=32, C=16)
+    bench_steady LABEL [N] [C] [IN] [OUT]
+                                        loop `vllm bench serve` until TPOT plateaus
+                                        (defaults: N=32, C=16, IN=128, OUT=128)
+    scale TARGET_DP                     POST /scale_elastic_ep
+    state [TAG]                         snapshot GPU + scaling state
+    cycle                               full DP=2 → 4 → 2 cycle with single-shot benches
+    cycle_steady                        full DP=2 → 4 → 2 cycle with plateau benches
+                                        (recommended for cross-regime comparison)
 
 prerequisites:
     * `uv pip install vllm "ray[default]"` into PROJECT_ROOT/.venv
