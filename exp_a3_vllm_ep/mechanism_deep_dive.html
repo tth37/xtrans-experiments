@@ -784,6 +784,94 @@ if rank_mapping is not None and len(rank_mapping) == ep_group.size():
          survive the next scale-down.</p>
     </div>
 
+    <p><b>Restated per-rank: the formula preserves
+       <code>per_gpu</code>.</b> Dividing both sides of
+       <code>num_replicas_new = num_replicas_old // old_ep * new_ep</code>
+       by <code>new_ep</code> gives
+       <code>per_gpu_new = num_replicas_old / old_ep = per_gpu_old</code>.
+       Every downstream buffer in vLLM
+       (<code>expert_weights</code>, <code>physical_to_logical_map</code>,
+       <code>expert_load_window</code>, the shape assertions in
+       <code>rebalance_execute.py</code>) is sized against
+       <code>per_gpu</code>, so the invariant is not a performance
+       choice &mdash; it is what keeps every rank's buffers a valid
+       shape after scale. <code>switch_and_prepare</code>
+       (<span class="src">elastic_ep_execute.py</span>) is what makes
+       the new <code>num_physical_experts</code> visible: on scale-up
+       it <code>F.pad</code>s <code>expert_load_pass</code> and
+       <code>expert_load_window</code> from the old to the new
+       <code>num_local &times; ep_size</code> and mutates
+       <code>parallel_config.eplb_config.num_redundant_experts</code>
+       in place; on scale-down it slices the same buffers down
+       symmetrically.</p>
+
+    <h4>Scenario: 2 &rarr; 4 &rarr; 2 cycle at R=0 (the validated cycle)</h4>
+
+    <p>With Qwen3-30B-A3B (128 logical experts), all three container
+       regimes run this cycle at <code>num_redundant_experts=0</code>:</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>State</th>
+          <th>num_log</th>
+          <th>num_redundant</th>
+          <th>num_phy</th>
+          <th>ep_size</th>
+          <th>per_gpu</th>
+          <th>Mechanism note</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>cold DP=2, R=0</td>
+          <td>128</td>
+          <td>0</td>
+          <td>128</td>
+          <td>2</td>
+          <td>64</td>
+          <td>Each of 2 GPUs holds 64 of the 128 logical experts, one
+              copy each.</td>
+        </tr>
+        <tr>
+          <td>scale-up to DP=4</td>
+          <td>128</td>
+          <td><b>128</b></td>
+          <td><b>256</b></td>
+          <td>4</td>
+          <td>64</td>
+          <td><code>switch_and_prepare</code> sets
+              <code>num_physical = 64 &times; 4 = 256</code> and pads
+              per-rank buffers; <code>rearrange()</code> populates the
+              256 slots by bin-packing logical experts, each GPU still
+              holding 64. <b>Scale-up conjures 128 redundant copies</b>
+              to preserve <code>per_gpu = 64</code>.</td>
+        </tr>
+        <tr>
+          <td>scale-down to DP=2</td>
+          <td>128</td>
+          <td>0</td>
+          <td>128</td>
+          <td>2</td>
+          <td>64</td>
+          <td>Formula: <code>256 // 4 &times; 2 = 128</code>.
+              <b>Scale-down consumes exactly the 128 copies scale-up
+              built.</b> Back to the start state.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>The cycle is symmetric and closes cleanly with no operator-supplied
+       redundancy. Scale-up <i>conjures</i> redundancy to hold
+       <code>per_gpu</code> stable; scale-down <i>consumes</i> exactly
+       what scale-up built. This is why the 2&rarr;4&rarr;2 cycle works
+       at <code>R=0</code> across all three container regimes, and why
+       it is the pattern the cross-regime comparison in
+       <code>analysis_report.html</code> uses. A cold DP=4 start with
+       <code>R=0</code> (<code>num_phy = 128</code>,
+       <code>per_gpu = 32</code>) has no redundancy for a subsequent
+       scale-down to consume &mdash; hence the &sect;6.4 crash.</p>
+
     <h3>6.5 Expert weight movement during rebalance</h3>
 
     <p>The data movement is done by
