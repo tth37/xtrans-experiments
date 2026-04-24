@@ -71,8 +71,9 @@ results land in `results/<regime>/` (gitignored).
 ### Subcommands
 
 Same subcommand surface across regimes (`start`/`up` and `stop`/`down` are
-aliases). `cycle` runs the full DP=2 → 4 → 2 stable-bench cycle. `bench`
-runs a DP=4-only stable bench for saturation investigations.
+aliases). `cycle` runs the full DP=2 → 4 → 2 robust ShareGPT bench cycle.
+`bench` runs the same robust ShareGPT method at DP=4 only for saturation
+investigations.
 
 ```bash
 # Native
@@ -95,14 +96,17 @@ python 3_per_gpu_containers.py nccl-grep # extract NET/Socket/0 evidence
 python 3_per_gpu_containers.py down
 ```
 
-The harness treats the first bench sample as warmup by default
-(`A3_BENCH_DISCARD_FIRST=1`) and excludes it from convergence and summary
-statistics. After warmup, it repeats `vllm bench serve` until the last 3 TPOTs
-are within 5% of each other, then records 1 extra sample for the final summary.
-Output per bench point is `results/<regime>/bench_<label>.json`.
-Saturation experiments can be selected without code edits via `A3_BENCH_*`
-environment variables, including `A3_BENCH_DATASET`,
-`A3_BENCH_DATASET_PATH`, `A3_BENCH_RANDOM_OUTPUT_LEN`,
+The default benchmark is ShareGPT, not vLLM's synthetic random dataset. Both
+`cycle` and `bench` use `--dataset-name sharegpt` with
+`exp_a3_vllm_ep/data/ShareGPT_V3_unfiltered_cleaned_split.json` unless
+`A3_BENCH_DATASET_PATH` points elsewhere. The harness treats the first bench
+sample as warmup by default (`A3_BENCH_DISCARD_FIRST=1`) and excludes it from
+convergence and summary statistics. After warmup, it repeats `vllm bench serve`
+until the last 3 TPOTs are within 5% of each other, then records 1 extra sample
+for the final summary. Output per bench point is
+`results/<regime>/bench_<label>.json`. Saturation experiments can be selected
+without code edits via `A3_BENCH_*` environment variables, including
+`A3_BENCH_DATASET_PATH`, `A3_BENCH_OUTPUT_LEN`,
 `A3_BENCH_MAX_CONCURRENCY`, `A3_BENCH_REQUEST_RATE`,
 `A3_BENCH_DISCARD_FIRST`, and `A3_BENCH_EXTRA_ARGS`.
 
@@ -122,7 +126,7 @@ curl http://localhost:8000/is_scaling_elastic_ep
 
 ## Results at a glance
 
-Stable-bench TPOT at DP=4 post-scale-up (ms, lower is better; full table in
+Historical random-128/128 stable-bench TPOT at DP=4 post-scale-up (ms, lower is better; full table in
 `analysis_report.html` §5.1):
 
 | Regime | Stable TPOT |

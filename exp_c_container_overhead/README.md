@@ -34,7 +34,6 @@ Default shape:
 export A3_SINGLE_LABEL=dp4_direct_sharegpt_c32
 export A3_SINGLE_NUM_PROMPTS=96
 export A3_SINGLE_CONCURRENCY=32
-export A3_BENCH_DATASET=sharegpt
 export A3_BENCH_DATASET_PATH=exp_a3_vllm_ep/data/ShareGPT_V3_unfiltered_cleaned_split.json
 export A3_BENCH_NUM_PROMPTS=96
 export A3_BENCH_MAX_CONCURRENCY=32

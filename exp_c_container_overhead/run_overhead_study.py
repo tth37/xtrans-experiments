@@ -75,7 +75,6 @@ def bench_env(pair: int, regime: str) -> dict[str, str]:
         "A3_SINGLE_LABEL": f"{LABEL}_p{pair}_{regime}",
         "A3_SINGLE_NUM_PROMPTS": "96",
         "A3_SINGLE_CONCURRENCY": "32",
-        "A3_BENCH_DATASET": "sharegpt",
         "A3_BENCH_DATASET_PATH": str(SHAREGPT_PATH),
         "A3_BENCH_NUM_PROMPTS": "96",
         "A3_BENCH_MAX_CONCURRENCY": "32",

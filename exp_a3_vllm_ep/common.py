@@ -33,6 +33,7 @@ VLLM_IMAGE = os.environ.get("VLLM_IMAGE", "xtrans-vllm-ep:v0.19.0")
 VLLM_IMAGE_PATCHED = os.environ.get("VLLM_IMAGE_PATCHED", "xtrans-vllm-ep-patched:v0.19.0")
 RAY_PORT = int(os.environ.get("RAY_PORT", "26379"))
 VLLM_PORT = int(os.environ.get("VLLM_PORT", "8000"))
+DEFAULT_SHAREGPT_PATH = EXP_DIR / "data" / "ShareGPT_V3_unfiltered_cleaned_split.json"
 
 LivenessCheck = Callable[[], bool]
 DiagCallback = Callable[[], None]
@@ -44,8 +45,6 @@ class BenchConfig:
     dataset_path: str | None
     num_prompts: int
     max_concurrency: int | None
-    random_input_len: int
-    random_output_len: int
     request_rate: str | None
     seed: int
     max_benches: int
@@ -60,14 +59,12 @@ class BenchConfig:
         request_rate = os.environ.get("A3_BENCH_REQUEST_RATE")
         concurrency_env = os.environ.get("A3_BENCH_MAX_CONCURRENCY")
         return cls(
-            dataset_name=os.environ.get("A3_BENCH_DATASET", "random"),
-            dataset_path=os.environ.get("A3_BENCH_DATASET_PATH") or None,
+            dataset_name="sharegpt",
+            dataset_path=os.environ.get("A3_BENCH_DATASET_PATH") or str(DEFAULT_SHAREGPT_PATH),
             num_prompts=int(os.environ.get("A3_BENCH_NUM_PROMPTS", str(num_prompts))),
             max_concurrency=(
                 int(concurrency_env) if concurrency_env else max_concurrency
             ),
-            random_input_len=int(os.environ.get("A3_BENCH_RANDOM_INPUT_LEN", "128")),
-            random_output_len=int(os.environ.get("A3_BENCH_RANDOM_OUTPUT_LEN", "128")),
             request_rate=request_rate,
             seed=int(os.environ.get("A3_BENCH_SEED", "0")),
             max_benches=int(os.environ.get("A3_BENCH_MAX_BENCHES", "8")),
@@ -336,16 +333,13 @@ def _bench_cmd(label_i: str, out_dir: Path, host: str, port: int, cfg: BenchConf
         "--result-filename",
         f"bench_{label_i}.json",
     ]
-    if cfg.dataset_path:
-        cmd += ["--dataset-path", cfg.dataset_path]
-    if cfg.dataset_name == "random":
-        cmd += [
-            "--random-input-len",
-            str(cfg.random_input_len),
-            "--random-output-len",
-            str(cfg.random_output_len),
-        ]
-    elif "A3_BENCH_OUTPUT_LEN" in os.environ:
+    if not cfg.dataset_path:
+        raise SystemExit("ShareGPT benchmark requires A3_BENCH_DATASET_PATH")
+    dataset_path = Path(cfg.dataset_path)
+    if not dataset_path.exists():
+        raise SystemExit(f"ShareGPT dataset not found at {dataset_path}; download ShareGPT_V3_unfiltered_cleaned_split.json or set A3_BENCH_DATASET_PATH")
+    cmd += ["--dataset-path", str(dataset_path)]
+    if "A3_BENCH_OUTPUT_LEN" in os.environ:
         cmd += ["--output-len", os.environ["A3_BENCH_OUTPUT_LEN"]]
     if cfg.request_rate:
         cmd += ["--request-rate", cfg.request_rate]
@@ -423,7 +417,7 @@ def _bench(label: str, host: str, port: int, out_dir: Path, cfg: BenchConfig) ->
     stable_idx = 1
     benches_post_convergence = 0
 
-    log(f"bench[{label}]: dataset={cfg.dataset_name} n={cfg.num_prompts} c={cfg.max_concurrency} in={cfg.random_input_len} out={cfg.random_output_len} max={cfg.max_benches} discard_first={cfg.discard_first} eps={cfg.eps_pct}%")
+    log(f"bench[{label}]: dataset={cfg.dataset_name} path={cfg.dataset_path} n={cfg.num_prompts} c={cfg.max_concurrency} max={cfg.max_benches} discard_first={cfg.discard_first} eps={cfg.eps_pct}%")
     for i in range(1, cfg.max_benches + 1):
         label_i = f"{label}_b{i}"
         json_path = run_one_bench(label_i, out_dir, host, port, cfg)
@@ -479,8 +473,6 @@ def _bench(label: str, host: str, port: int, out_dir: Path, cfg: BenchConfig) ->
             "num_prompts": cfg.num_prompts,
             "max_concurrency": cfg.max_concurrency,
             "request_rate": cfg.request_rate,
-            "random_input_len": cfg.random_input_len,
-            "random_output_len": cfg.random_output_len,
         },
         "stable_params": {
             "warmup_min": cfg.warmup_min,

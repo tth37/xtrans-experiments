@@ -149,12 +149,13 @@
 
     <div class="highlight-box">
       <p><b>Result.</b> Live rescaling works in all three regimes on a
-         <code>2&rarr;4&rarr;2</code> cycle. At the baseline random-128/128 DP=4 stable bench, MGC and PGC
-         differ by only <b>1.3%</b> TPOT. Under a DP=4 ShareGPT saturation
-         bench (<code>--dataset-name sharegpt --num-prompts 96 --max-concurrency 32</code>),
-         the transport effect becomes visible: MGC reaches 225.44&nbsp;tok/s
-         at 88.53&nbsp;ms TPOT while PGC reaches 209.36&nbsp;tok/s
-         at 96.21&nbsp;ms TPOT. The two
+         <code>2&rarr;4&rarr;2</code> cycle. The benchmark default is now a robust ShareGPT bench: bench&nbsp;1 is
+         discarded as warmup, convergence is checked on the measured warm
+         window, and both <code>cycle</code> and direct <code>bench</code> use
+         <code>--dataset-name sharegpt</code>. Under that method, native and MGC
+         are statistically tied, while the PGC transport effect is visible:
+         MGC reaches 212.42&nbsp;tok/s at 91.98&nbsp;ms TPOT and PGC reaches
+         199.20&nbsp;tok/s at 102.46&nbsp;ms TPOT. The two
          container boundaries still have distinct <i>structural</i>
          consequences: multi-GPU container traps the orchestrator view
          (<code>HostConfig.DeviceRequests.DeviceIDs</code> immutable at
@@ -412,30 +413,37 @@ GPU3    SYS     SYS     PIX      X      NUMA 1</pre>
 
     <h3>4.3 Measurement methodology: stable benches</h3>
 
-    <p>Each bench-point in the cycle is a stable bench run
-       (<code>common.py</code>, invoked by each
-       regime&rsquo;s <code>cycle</code> subcommand): loop
-       <code>vllm bench serve</code> at a fixed shape until the last 3
-       TPOTs are within 3% of each other (max&minus;min range), then
-       record 2 extra samples for statistical power. Defaults:
-       <code>warmup_min=2, window=3, eps_pct=3%, max_benches=15,
-       extra_samples=2</code>. A run that fails to converge within 15
-       benches is flagged and its stable window is reported as the last
-       5 benches (with the caveat that warmup-curve drift may still be
-       present). The same shape is applied identically to all three
-       regimes, so cross-regime comparison is valid by construction.</p>
+    <p>Each bench-point in the cycle is a robust ShareGPT bench run
+       (<code>common.py</code>, invoked by each regime&rsquo;s <code>cycle</code>
+       subcommand). The harness always uses <code>vllm bench serve</code> with
+       <code>--dataset-name sharegpt</code>; the synthetic random dataset is no
+       longer part of the active harness. The default dataset path is
+       <code>exp_a3_vllm_ep/data/ShareGPT_V3_unfiltered_cleaned_split.json</code>,
+       overrideable with <code>A3_BENCH_DATASET_PATH</code>.</p>
+
+    <p>The first bench sample is treated as warmup
+       (<code>A3_BENCH_DISCARD_FIRST=1</code>) and is excluded from both convergence
+       checks and summary statistics. After that, the harness loops until the
+       last 3 measured TPOT values are within 5% of each other
+       (max&minus;min range), then records 1 extra sample. Defaults:
+       <code>warmup_min=2, discard_first=1, window=3, eps_pct=5%,
+       max_benches=8, extra_samples=1</code>. If a run does not converge, it is
+       flagged and the last measured warm window is reported, never the
+       discarded cold sample.</p>
 
     <p>Bench shapes per DP size:</p>
 
     <ul>
-      <li>DP=2: <code>--num-prompts 16 --max-concurrency 8 --random-input-len 128 --random-output-len 128</code></li>
-      <li>DP=4: <code>--num-prompts 32 --max-concurrency 16 --random-input-len 128 --random-output-len 128</code></li>
+      <li>DP=2 cycle points: <code>--dataset-name sharegpt --num-prompts 16 --max-concurrency 8</code></li>
+      <li>DP=4 cycle point: <code>--dataset-name sharegpt --num-prompts 32 --max-concurrency 16</code></li>
+      <li>DP=4 saturation / direct <code>bench</code>: <code>--dataset-name sharegpt --num-prompts 96 --max-concurrency 32</code></li>
     </ul>
 
-    <p>The DP=4 shape is 2&times; the DP=2 shape in both request count
+    <p>The DP=4 cycle shape is 2&times; the DP=2 cycle shape in both request count
        and concurrency, keeping per-engine load constant across the cycle
        (<code>concurrency / dp</code> = 4 requests-in-flight per DP engine
-       throughout).</p>
+       throughout). The direct DP=4 <code>bench</code> shape intentionally raises
+       concurrency to reveal transport effects.</p>
 
     <p>Required vLLM flags for elastic EP (same in all three regimes):</p>
 
@@ -469,7 +477,7 @@ GPU3    SYS     SYS     PIX      X      NUMA 1</pre>
       <caption style="font-style:italic; text-align:left; padding:0.5em 0;">
         Stable-bench throughput, TTFT, and TPOT, shown as
         <code>mean&nbsp;&plusmn;&nbsp;&sigma;</code> over the measured stable window.
-        For ShareGPT saturation rows, bench&nbsp;1 is an explicit warmup sample
+        The default benchmark is ShareGPT; bench&nbsp;1 is an explicit warmup sample
         and is excluded from convergence and summary statistics
         (<code>A3_BENCH_DISCARD_FIRST=1</code>). Raw JSON:
         <code>results/&lt;regime&gt;/bench_&lt;label&gt;.json</code>.
@@ -499,21 +507,22 @@ GPU3    SYS     SYS     PIX      X      NUMA 1</pre>
       </tbody>
     </table>
 
-    <p>The original random-128/128 cycle remains useful for exercising the
-       2&nbsp;&rarr;&nbsp;4&nbsp;&rarr;&nbsp;2 elastic path, but it is too synthetic to
+    <p>The historical random-128/128 cycle remains in the table for comparison, but
+       it is no longer the default benchmark because it is too synthetic to
        expose the transport penalty: MGC and PGC differed by only 1.3% TPOT at
-       DP=4. The ShareGPT DP=4 saturation rerun is the more robust performance
-       comparison. It explicitly discards the first bench sample, then
-       summarizes the measured warm window. Under that method, native and MGC
-       are statistically indistinguishable, so the apparent MGC container
-       overhead was a benchmark-method artifact. PGC remains slower than MGC,
-       consistent with its forced <code>NET/Socket/0</code> NCCL path.</p>
+       DP=4. Both future <code>cycle</code> runs and direct <code>bench</code> runs now use
+       the robust ShareGPT method by default. It explicitly discards the first
+       bench sample, then summarizes the measured warm window. Under that
+       method, native and MGC are statistically indistinguishable, so the
+       apparent MGC container overhead was a benchmark-method artifact. PGC
+       remains slower than MGC, consistent with its forced
+       <code>NET/Socket/0</code> NCCL path.</p>
 
     <div style="border-left:4px solid #999; padding-left:1em; margin:1em 0; background:#f9f9f9;">
       <b>Benchmark robustness update.</b> Exp C reopened the Native/MGC gap and
       found that cold ShareGPT samples can dominate TTFT and TPOT, especially
-      during native Ray/vLLM startup. Exp A3 now uses
-      <code>A3_BENCH_DISCARD_FIRST=1</code> by default, excludes discarded
+      during native Ray/vLLM startup. Exp A3 now uses ShareGPT by default with
+      <code>A3_BENCH_DISCARD_FIRST=1</code>, excludes discarded
       samples from convergence checks and summaries, and reports the measured
       warm window. With this correction, the Native/MGC gap disappears while
       the MGC/PGC transport gap remains visible.
@@ -864,9 +873,10 @@ node ep-rank-0, possible to fit 1 DP ranks.</pre>
           2&times; DP=2 initial tok/s under load-matched bench shapes
           for the two container regimes, consistent with near-linear scaling.</li>
       <li><b>The benchmark strategy determines whether the transport penalty is visible.</b>
-          Baseline random-128/128 DP=4 shows only a +1.3% PGC-vs-MGC TPOT gap,
-          but DP=4 ShareGPT saturation exposes a repeatable serving penalty:
-          PGC is +8.7% TPOT and &minus;7.1% throughput versus MGC.</li>
+          The historical random-128/128 DP=4 shape showed only a +1.3% PGC-vs-MGC TPOT gap,
+          but the robust ShareGPT default exposes the serving penalty:
+          PGC is +11.4% TPOT and &minus;6.2% throughput versus MGC in the
+          fresh DP=4 saturation rerun.</li>
       <li><b>Multi-GPU container &mdash; orchestrator trap is real and
           permanent.</b> Scale-down releases GPU memory on the host
           (GPU&nbsp;2&ndash;3 drop to 4&nbsp;MiB within ~10&nbsp;s) but
