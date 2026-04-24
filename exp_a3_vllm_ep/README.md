@@ -95,14 +95,16 @@ python 3_per_gpu_containers.py nccl-grep # extract NET/Socket/0 evidence
 python 3_per_gpu_containers.py down
 ```
 
-The harness loops `vllm bench serve` at each bench point until the last 3 TPOTs
-are within 3% of each other, then records 2 extra samples for statistical
-power. Output per bench point is
-`results/<regime>/bench_<label>.json`. Saturation experiments can be
-selected without code edits via `A3_BENCH_*` environment variables, including
-`A3_BENCH_DATASET`, `A3_BENCH_DATASET_PATH`, `A3_BENCH_RANDOM_OUTPUT_LEN`,
-`A3_BENCH_MAX_CONCURRENCY`, `A3_BENCH_REQUEST_RATE`, and
-`A3_BENCH_EXTRA_ARGS`.
+The harness treats the first bench sample as warmup by default
+(`A3_BENCH_DISCARD_FIRST=1`) and excludes it from convergence and summary
+statistics. After warmup, it repeats `vllm bench serve` until the last 3 TPOTs
+are within 5% of each other, then records 1 extra sample for the final summary.
+Output per bench point is `results/<regime>/bench_<label>.json`.
+Saturation experiments can be selected without code edits via `A3_BENCH_*`
+environment variables, including `A3_BENCH_DATASET`,
+`A3_BENCH_DATASET_PATH`, `A3_BENCH_RANDOM_OUTPUT_LEN`,
+`A3_BENCH_MAX_CONCURRENCY`, `A3_BENCH_REQUEST_RATE`,
+`A3_BENCH_DISCARD_FIRST`, and `A3_BENCH_EXTRA_ARGS`.
 
 The `wait_for_ready` helper aborts fast if the backing process dies and
 dumps diagnostics instead of polling to timeout. Hard prerequisite: all 4

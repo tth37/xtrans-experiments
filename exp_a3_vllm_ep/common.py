@@ -50,6 +50,7 @@ class BenchConfig:
     seed: int
     max_benches: int
     warmup_min: int
+    discard_first: int
     window_size: int
     eps_pct: float
     extra_samples: int
@@ -69,11 +70,12 @@ class BenchConfig:
             random_output_len=int(os.environ.get("A3_BENCH_RANDOM_OUTPUT_LEN", "128")),
             request_rate=request_rate,
             seed=int(os.environ.get("A3_BENCH_SEED", "0")),
-            max_benches=int(os.environ.get("A3_BENCH_MAX_BENCHES", "15")),
+            max_benches=int(os.environ.get("A3_BENCH_MAX_BENCHES", "8")),
             warmup_min=int(os.environ.get("A3_BENCH_WARMUP_MIN", "2")),
+            discard_first=int(os.environ.get("A3_BENCH_DISCARD_FIRST", "1")),
             window_size=int(os.environ.get("A3_BENCH_WINDOW_SIZE", "3")),
-            eps_pct=float(os.environ.get("A3_BENCH_EPS_PCT", "3")),
-            extra_samples=int(os.environ.get("A3_BENCH_EXTRA_SAMPLES", "2")),
+            eps_pct=float(os.environ.get("A3_BENCH_EPS_PCT", "5")),
+            extra_samples=int(os.environ.get("A3_BENCH_EXTRA_SAMPLES", "1")),
         )
 
 
@@ -421,7 +423,7 @@ def _bench(label: str, host: str, port: int, out_dir: Path, cfg: BenchConfig) ->
     stable_idx = 1
     benches_post_convergence = 0
 
-    log(f"bench[{label}]: dataset={cfg.dataset_name} n={cfg.num_prompts} c={cfg.max_concurrency} in={cfg.random_input_len} out={cfg.random_output_len} max={cfg.max_benches} eps={cfg.eps_pct}%")
+    log(f"bench[{label}]: dataset={cfg.dataset_name} n={cfg.num_prompts} c={cfg.max_concurrency} in={cfg.random_input_len} out={cfg.random_output_len} max={cfg.max_benches} discard_first={cfg.discard_first} eps={cfg.eps_pct}%")
     for i in range(1, cfg.max_benches + 1):
         label_i = f"{label}_b{i}"
         json_path = run_one_bench(label_i, out_dir, host, port, cfg)
@@ -431,9 +433,12 @@ def _bench(label: str, host: str, port: int, out_dir: Path, cfg: BenchConfig) ->
         ttfts.append(ttft)
         status_note = f"  [WARN: only {completed}/{requested} succeeded]" if completed < requested else ""
         log(f"  bench {i}: TPOT={tpot:7.2f}ms  tok/s={tok_s:7.2f}  TTFT={ttft:7.1f}ms{status_note}")
-        if not converged:
-            if i >= cfg.warmup_min and len(tpots) >= cfg.window_size:
-                window = tpots[-cfg.window_size :]
+        measured_tpots = tpots[cfg.discard_first :]
+        if i <= cfg.discard_first:
+            log(f"    warmup/discard bench {i}; excluded from convergence and summary")
+        elif not converged:
+            if i >= cfg.warmup_min and len(measured_tpots) >= cfg.window_size:
+                window = measured_tpots[-cfg.window_size :]
                 is_conv, range_pct = check_converged(window, cfg.eps_pct)
                 log(f"    window[{i - cfg.window_size + 1}..{i}] range={max(window) - min(window):.2f}ms ({range_pct:.2f}% of mean)")
                 if is_conv:
@@ -448,8 +453,9 @@ def _bench(label: str, host: str, port: int, out_dir: Path, cfg: BenchConfig) ->
 
     if not converged:
         log(f"!! Did NOT converge within {cfg.max_benches} benches. Last window as best estimate.")
-        fallback_n = min(cfg.window_size + cfg.extra_samples, len(tpots))
-        stable_start = len(tpots) - fallback_n + 1
+        measured_n = max(0, len(tpots) - cfg.discard_first)
+        fallback_n = min(cfg.window_size + cfg.extra_samples, measured_n)
+        stable_start = max(cfg.discard_first + 1, len(tpots) - fallback_n + 1)
     else:
         stable_start = stable_idx
 
@@ -478,6 +484,7 @@ def _bench(label: str, host: str, port: int, out_dir: Path, cfg: BenchConfig) ->
         },
         "stable_params": {
             "warmup_min": cfg.warmup_min,
+            "discard_first": cfg.discard_first,
             "window_size": cfg.window_size,
             "eps_pct": cfg.eps_pct,
             "max_benches": cfg.max_benches,

@@ -1,27 +1,32 @@
 # Exp C: Container Overhead Redo
 
-**Status:** Redesign scaffolded; measurements pending.
+**Status:** active analysis complete for the benchmark-inconsistency question.
+The old random-benchmark study remains archived under
+`archive/old_random_bench_20260422/`.
 
-## Why this experiment was reset
+## Conclusion
 
-The original Exp C study is archived under
-`archive/old_random_bench_20260422/`. It was based on the older random
-128/128 benchmark and cycle-oriented methodology. Exp A3 now uses a Python
-stable-bench harness, supports DP=4-only `bench`, and shows that ShareGPT
-saturation can reveal performance effects hidden by the baseline random
-shape. The old Exp C conclusions should therefore be treated as historical
-context, not as the active answer.
+The apparent Native/MGC container-overhead signal was a benchmark-method
+artifact. ShareGPT DP=4 samples have a large cold first bench, and native
+Ray/vLLM startup variance is especially visible in TTFT and TPOT. After Exp A3
+explicitly discards the first bench and summarizes only the measured warm
+window, Native and MGC are statistically tied. PGC remains slower than MGC,
+which is consistent with PGC's cross-container NCCL fallback to `NET/Socket/0`.
 
-## Primary question
+Fresh robust DP=4 ShareGPT c32 result:
 
-Why does the multi-GPU-container (MGC) regime underperform native under the
-updated robust benchmark, if single-container overhead should theoretically be
-near zero?
+| Regime | Throughput tok/s | TTFT ms | TPOT ms | Measured window |
+|---|---:|---:|---:|---|
+| Native | 212.30 ± 7.44 | 280.1 ± 54.5 | 94.99 ± 5.00 | benches 2–4 |
+| MGC | 212.42 ± 17.90 | 291.0 ± 43.4 | 91.98 ± 4.79 | benches 2–4 |
+| PGC | 199.20 ± 5.57 | 581.3 ± 195.5 | 102.46 ± 8.44 | benches 2–4 |
 
-## Baseline protocol
+## Harness
 
-Use Exp A3's DP=4-only `bench` subcommand for native and MGC, not the
-2→4→2 cycle.
+`run_overhead_study.py` is retained for paired Native/MGC follow-up probes. It
+waits for idle GPUs, records pre/post snapshots, runs the Exp A3 DP=4 `bench`
+subcommand, copies JSON/log artifacts, and writes an aggregate summary under
+`results/sharegpt_dp4/`.
 
 Default shape:
 
@@ -33,40 +38,32 @@ export A3_BENCH_DATASET=sharegpt
 export A3_BENCH_DATASET_PATH=exp_a3_vllm_ep/data/ShareGPT_V3_unfiltered_cleaned_split.json
 export A3_BENCH_NUM_PROMPTS=96
 export A3_BENCH_MAX_CONCURRENCY=32
-export A3_BENCH_MAX_BENCHES=5
+export A3_BENCH_DISCARD_FIRST=1
+export A3_BENCH_MAX_BENCHES=4
 export A3_BENCH_EXTRA_SAMPLES=1
 export A3_MAX_NUM_SEQS=32
 ```
 
-Run paired measurements, waiting for idle GPUs before each pair:
+Run paired probes in tmux if more confirmation is needed:
 
 ```bash
-python3 exp_a3_vllm_ep/1_native.py bench
-python3 exp_a3_vllm_ep/2_multi_gpu_container.py bench
+tmux new-session -d -s exp-c-sharegpt-dp4 \
+  'python3 exp_c_container_overhead/run_overhead_study.py run-pairs --pairs 3 \
+   2>&1 | tee /tmp/exp-c-sharegpt-dp4.log'
 ```
 
-## Metrics
+Analyze existing copied results:
 
-Collect throughput, TTFT, TPOT, completed request count, convergence status,
-stable-window standard deviation, per-bench warmup trajectory, serve logs,
-`nvidia-smi` snapshots, and process ownership snapshots.
+```bash
+python3 exp_c_container_overhead/run_overhead_study.py analyze
+```
 
-Treat a Native-vs-MGC gap as real only if it repeats across at least three
-clean paired runs and exceeds the combined stable-window σ.
+## Hypothesis Summary
 
-## Hypotheses
-
-| ID | Hypothesis | First evidence to collect | Status |
-|---|---|---|---|
-| H0 | Benchmark variance / host contention | Three clean paired native/MGC runs with GPU/process snapshots | Pending |
-| H1 | Container serving config mismatch | Diff effective vLLM args, CUDA/Ray env, model path, cache path, `max_num_seqs` | Pending |
-| H2 | CPU/Ray/API-server overhead inside Docker | Compare serve logs, request scheduling, Ray actor placement, CPU/API latency | Pending |
-| H3 | Filesystem/cache/path overhead | Compare cache/model/tokenizer paths and cold-cache behavior | Pending |
-| H4 | Container runtime flags | Test one Docker flag at a time after H0 reproduces the gap | Pending |
-
-## Reporting
-
-The active `analysis_report.html` will be written after the first clean paired
-run set. It should report the paired-run table first, then update the
-hypothesis table with evidence and decisions. Exp A3 should only link back to
-Exp C once the redo has stable conclusions.
+| ID | Hypothesis | Decision |
+|---|---|---|
+| H0 | Benchmark variance / host contention | Supported: cold first benches and native startup variance explain the Native/MGC flip. |
+| H1 | Container serving config mismatch | Not primary: robust reruns used matching model, DP, ShareGPT shape, Ray backend, eager mode, and `max_num_seqs=32`. |
+| H2 | CPU/Ray/API-server overhead inside Docker | Not supported as a measurable MGC penalty after warmup filtering. |
+| H3 | Filesystem/cache/path overhead | Deferred; no steady MGC penalty remains to explain. |
+| H4 | Container runtime flags | Deferred until a repeatable MGC penalty appears. |

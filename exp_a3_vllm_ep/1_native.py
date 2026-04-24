@@ -31,6 +31,7 @@ def start() -> None:
     a3.ensure_venv()
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     a3.require_gpus_free()
+    a3.run(["ray", "stop", "--force"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     a3.log(f"Starting dedicated Ray head at 127.0.0.1:{a3.RAY_PORT}")
     with (RESULTS_DIR / "ray_head.log").open("w") as logf:
         a3.run([
@@ -67,6 +68,7 @@ vllm serve {a3.MODEL_SNAPSHOT} \
 
 
 def stop() -> None:
+    a3.ensure_venv()
     a3.log("Stopping vllm serve tmux session")
     a3.tmux_kill(SERVE_SESSION)
     time.sleep(3)

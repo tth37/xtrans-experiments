@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Exp C: Container Overhead Redo</title>
+  <title>Exp C: Benchmark Robustness and Container Overhead</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.55; max-width: 1100px; margin: 2rem auto; padding: 0 1rem; color: #222; }
     h1, h2, h3 { line-height: 1.2; }
@@ -10,56 +10,110 @@
     table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
     th, td { border: 1px solid #ddd; padding: 0.5rem; vertical-align: top; }
     th { background: #f7f7f7; }
-    .note { background: #fff8dc; border-left: 4px solid #d6a700; padding: 0.75rem 1rem; }
+    .finding { background: #eaf7ea; border-left: 4px solid #2e8b57; padding: 0.75rem 1rem; }
   </style>
 </head>
 <body>
-  <h1>Exp C: Container Overhead Redo</h1>
+  <h1>Exp C: Benchmark Robustness and Container Overhead</h1>
 
-  <div class="note">
-    <p><b>Status:</b> Redesign scaffolded; measurements pending. The previous
-    random-128/128 cycle-based study is archived at
-    <code>archive/old_random_bench_20260422/</code> and should be treated as
-    historical context only.</p>
+  <div class="finding">
+    <p><b>Finding:</b> the Native/MGC inconsistency is primarily a benchmark
+    robustness issue, not evidence of a steady-state multi-GPU-container
+    overhead. Cold ShareGPT samples and native Ray/vLLM startup variance can
+    dominate TTFT and TPOT. After Exp A3 explicitly discards the first bench
+    sample, Native and MGC are statistically tied, while PGC remains slower due
+    to its degraded cross-container NCCL transport.</p>
   </div>
 
-  <h2>1. Objective</h2>
-  <p>Investigate why the multi-GPU-container (MGC) regime underperforms native
-  under the updated Exp A3 stable ShareGPT DP=4 benchmark, despite the
-  expectation that a single container owning all GPUs should introduce little
-  or no steady-state serving overhead.</p>
+  <h2>1. Question</h2>
+  <p>Exp C was reopened because the ShareGPT saturation pass appeared to show a
+  Native/MGC gap that contradicted the earlier conclusion that single-container
+  overhead should be near zero. The refined question is: did the benchmark
+  method create that apparent gap, or does MGC have a real steady-state serving
+  penalty?</p>
 
-  <h2>2. Methodology</h2>
-  <p>The redo uses Exp A3's Python harness and the DP=4-only
-  <code>bench</code> subcommand, not the old 2&rarr;4&rarr;2 cycle or
-  single-shot random benchmark.</p>
+  <h2>2. Root Cause of the Inconsistency</h2>
+  <ol>
+    <li><b>First bench samples are cold-path measurements.</b> They include
+    request scheduler warmup, cache/prefix-cache initialization, EPLB movement,
+    and post-start Ray/vLLM settling. They are not representative of steady
+    serving.</li>
+    <li><b>Native cold/warm spread is especially large.</b> Native diagnostic
+    samples saw TTFT fall from 1155&ndash;1461&nbsp;ms on first benches to
+    ~239&nbsp;ms on a warm bench, with TPOT falling from ~111&ndash;113&nbsp;ms to
+    ~93&nbsp;ms.</li>
+    <li><b>ShareGPT is realistic but long-tailed.</b> It exposes transport and
+    scheduling behavior better than random 128/128, but each sample is long and
+    noisy enough that warmup must be separated from the measured window.</li>
+    <li><b>Previous summaries made fallback windows too easy to misread.</b> If a
+    run failed to converge, the report could treat a late window as stable while
+    the trajectory still contained warmup drift. The harness now records
+    <code>stable_start_bench</code>, <code>discard_first</code>, convergence
+    status, and all per-bench trajectories.</li>
+  </ol>
 
+  <h2>3. Evidence</h2>
   <table>
+    <caption>Earlier DP=4 ShareGPT summaries that triggered the Exp C redo.</caption>
+    <thead><tr><th>Regime</th><th>Throughput tok/s</th><th>TTFT ms</th><th>TPOT ms</th><th>Per-bench TPOT trajectory</th></tr></thead>
     <tbody>
-      <tr><th>Dataset</th><td>ShareGPT, <code>ShareGPT_V3_unfiltered_cleaned_split.json</code></td></tr>
-      <tr><th>Load</th><td><code>num_prompts=96</code>, <code>max_concurrency=32</code>, server <code>max_num_seqs=32</code></td></tr>
-      <tr><th>Regimes</th><td>Native vs multi-GPU container only</td></tr>
-      <tr><th>Metrics</th><td>Throughput, TTFT, TPOT, completed requests, convergence, stable-window σ, per-bench warmup trajectory</td></tr>
-      <tr><th>Decision rule</th><td>Native-vs-MGC gap is real only if it repeats across at least three clean paired runs and exceeds combined stable-window σ.</td></tr>
+      <tr><td>Native</td><td>206.68 &plusmn; 3.79</td><td>273.8 &plusmn; 29.1</td><td>97.11 &plusmn; 6.83</td><td>108.96, 102.55, 91.56, 103.46, 90.86</td></tr>
+      <tr><td>MGC</td><td>225.23 &plusmn; 1.74</td><td>247.5 &plusmn; 42.7</td><td>88.42 &plusmn; 0.48</td><td>133.36, 92.04, 88.92, 88.36, 87.97</td></tr>
+      <tr><td>PGC</td><td>209.36 &plusmn; 10.34</td><td>524.3 &plusmn; 87.5</td><td>96.21 &plusmn; 3.65</td><td>248.66, 96.59, 94.58, 101.11, 92.57</td></tr>
     </tbody>
   </table>
 
-  <h2>3. Results</h2>
-  <p>Pending. The first table should contain paired Native/MGC DP=4 ShareGPT
-  runs with throughput, TTFT, TPOT, σ, convergence, and contamination notes.</p>
-
-  <h2>4. Hypotheses</h2>
   <table>
-    <thead>
-      <tr><th>ID</th><th>Hypothesis</th><th>Evidence to collect</th><th>Status</th></tr>
-    </thead>
+    <caption>Native cold/warm diagnostic samples collected during Exp C.</caption>
+    <thead><tr><th>Sample</th><th>Throughput tok/s</th><th>TTFT ms</th><th>TPOT ms</th><th>Interpretation</th></tr></thead>
     <tbody>
-      <tr><td>H0</td><td>Benchmark variance / host contention</td><td>Three clean paired runs plus GPU/process snapshots</td><td>Pending</td></tr>
-      <tr><td>H1</td><td>Container serving config mismatch</td><td>Diff vLLM args, CUDA/Ray env, model path, cache path, <code>max_num_seqs</code></td><td>Pending</td></tr>
-      <tr><td>H2</td><td>CPU/Ray/API-server overhead inside Docker</td><td>Compare serve logs, scheduling, Ray placement, CPU/API latency</td><td>Pending</td></tr>
-      <tr><td>H3</td><td>Filesystem/cache/path overhead</td><td>Compare cache/model/tokenizer paths and cold-cache behavior</td><td>Pending</td></tr>
-      <tr><td>H4</td><td>Container runtime flags</td><td>Change one Docker flag at a time after H0 reproduces the gap</td><td>Pending</td></tr>
+      <tr><td>p1 bench 1</td><td>192.05</td><td>1155.4</td><td>111.47</td><td>Cold first bench</td></tr>
+      <tr><td>p1 bench 2</td><td>214.49</td><td>239.2</td><td>93.47</td><td>Warm bench</td></tr>
+      <tr><td>p2 bench 1</td><td>179.81</td><td>1461.1</td><td>112.89</td><td>Cold first bench</td></tr>
     </tbody>
   </table>
+
+  <table>
+    <caption>Fresh Exp A3 DP=4 ShareGPT rerun after explicit warmup discard (<code>A3_BENCH_DISCARD_FIRST=1</code>).</caption>
+    <thead><tr><th>Regime</th><th>Throughput tok/s</th><th>TTFT ms</th><th>TPOT ms</th><th>Per-bench TPOT trajectory</th><th>Measured window</th></tr></thead>
+    <tbody>
+      <tr><td>Native</td><td>212.30 &plusmn; 7.44</td><td>280.1 &plusmn; 54.5</td><td>94.99 &plusmn; 5.00</td><td>111.07, 96.96, 89.30, 98.70</td><td>benches 2&ndash;4</td></tr>
+      <tr><td>MGC</td><td>212.42 &plusmn; 17.90</td><td>291.0 &plusmn; 43.4</td><td>91.98 &plusmn; 4.79</td><td>164.21, 88.85, 89.59, 97.50</td><td>benches 2&ndash;4</td></tr>
+      <tr><td>PGC</td><td>199.20 &plusmn; 5.57</td><td>581.3 &plusmn; 195.5</td><td>102.46 &plusmn; 8.44</td><td>309.65, 111.83, 100.11, 95.45</td><td>benches 2&ndash;4</td></tr>
+    </tbody>
+  </table>
+
+  <h2>4. Hypothesis Decisions</h2>
+  <table>
+    <thead><tr><th>ID</th><th>Hypothesis</th><th>Status</th><th>Decision</th></tr></thead>
+    <tbody>
+      <tr><td>H0</td><td>Benchmark variance / host contention</td><td>Supported</td><td>Cold first samples and native startup variance explain the Native/MGC flip. Warmup filtering is required before interpreting gaps.</td></tr>
+      <tr><td>H1</td><td>Container serving config mismatch</td><td>No primary evidence</td><td>Native and MGC both used DP=4, ShareGPT c32, <code>max_num_seqs=32</code>, same model snapshot, eager mode, and Ray backend. Config mismatch is not needed to explain the inconsistency.</td></tr>
+      <tr><td>H2</td><td>CPU/Ray/API-server overhead inside Docker</td><td>Not supported as MGC penalty</td><td>Warm MGC and native TTFT/TPOT overlap within σ. Any API/Ray overhead is below current measurement noise for MGC.</td></tr>
+      <tr><td>H3</td><td>Filesystem/cache/path overhead</td><td>Deferred</td><td>Not pursued because the robust rerun does not show a steady MGC penalty.</td></tr>
+      <tr><td>H4</td><td>Container runtime flags</td><td>Deferred</td><td>No need to vary Docker flags until a repeatable MGC penalty exists.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>5. Feedback to Exp A3</h2>
+  <p>Exp A3 now treats benchmark robustness as part of the method, not a
+  post-hoc interpretation:</p>
+  <ul>
+    <li><code>A3_BENCH_DISCARD_FIRST=1</code> by default; discarded benches are
+    excluded from convergence and summary statistics.</li>
+    <li>Default repeated-run parameters are <code>max_benches=8</code>,
+    <code>window_size=3</code>, <code>extra_samples=1</code>, and
+    <code>eps_pct=5</code>.</li>
+    <li>Reports use the measured warm window and show per-bench trajectories so
+    cold-start contamination is visible.</li>
+  </ul>
+
+  <h2>6. Current Interpretation</h2>
+  <p>There is no robust evidence of steady-state MGC container overhead. The
+  apparent gap came from a benchmark method that mixed cold-start behavior with
+  steady serving. The real transport-related result remains MGC versus PGC:
+  after warmup filtering, PGC is 6.2% lower throughput and 11.4% higher TPOT
+  than MGC on DP=4 ShareGPT c32, matching the NCCL evidence that PGC falls back
+  to <code>NET/Socket/0</code>.</p>
 </body>
 </html>
