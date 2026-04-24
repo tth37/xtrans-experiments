@@ -108,7 +108,7 @@ for the final summary. Output per bench point is
 without code edits via `A3_BENCH_*` environment variables, including
 `A3_BENCH_DATASET_PATH`, `A3_BENCH_OUTPUT_LEN`,
 `A3_BENCH_MAX_CONCURRENCY`, `A3_BENCH_REQUEST_RATE`,
-`A3_BENCH_DISCARD_FIRST`, and `A3_BENCH_EXTRA_ARGS`.
+`A3_BENCH_DISCARD_FIRST`, and `A3_BENCH_EXTRA_ARGS`. The serve launch default is `A3_GPU_MEMORY_UTILIZATION=0.85` to leave enough headroom for elastic scale-up actor initialization; override it only when measuring a deliberate memory-utilization variant.
 
 The `wait_for_ready` helper aborts fast if the backing process dies and
 dumps diagnostics instead of polling to timeout. Hard prerequisite: all 4

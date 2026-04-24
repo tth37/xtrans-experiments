@@ -154,8 +154,10 @@
          window, and both <code>cycle</code> and direct <code>bench</code> use
          <code>--dataset-name sharegpt</code>. Under that method, native and MGC
          are statistically tied, while the PGC transport effect is visible:
-         MGC reaches 212.42&nbsp;tok/s at 91.98&nbsp;ms TPOT and PGC reaches
-         199.20&nbsp;tok/s at 102.46&nbsp;ms TPOT. The two
+         in the full cycle, DP=4 throughput reaches 93.43&nbsp;tok/s native,
+         87.42&nbsp;tok/s MGC, and 85.74&nbsp;tok/s PGC. Scale-up takes
+         63.21&nbsp;s native, 76.41&nbsp;s MGC, and 79.99&nbsp;s PGC; scale-down
+         takes 35.49&nbsp;s, 24.96&nbsp;s, and 21.13&nbsp;s respectively. The two
          container boundaries still have distinct <i>structural</i>
          consequences: multi-GPU container traps the orchestrator view
          (<code>HostConfig.DeviceRequests.DeviceIDs</code> immutable at
@@ -427,7 +429,10 @@ GPU3    SYS     SYS     PIX      X      NUMA 1</pre>
        last 3 measured TPOT values are within 5% of each other
        (max&minus;min range), then records 1 extra sample. Defaults:
        <code>warmup_min=2, discard_first=1, window=3, eps_pct=5%,
-       max_benches=8, extra_samples=1</code>. If a run does not converge, it is
+       max_benches=8, extra_samples=1</code>. The full-cycle rerun in
+       &sect;5 uses <code>max_benches=4</code> for a bounded clean pass and
+       <code>A3_GPU_MEMORY_UTILIZATION=0.85</code> so new DP actors have enough
+       initialization headroom during scale-up. If a run does not converge, it is
        flagged and the last measured warm window is reported, never the
        discarded cold sample.</p>
 
@@ -471,120 +476,98 @@ GPU3    SYS     SYS     PIX      X      NUMA 1</pre>
        friction). Raw data lives under
        <code>exp_a3_vllm_ep/results/{native,multi_gpu_container,per_gpu_containers}/</code>.</p>
 
-    <h3>5.1 Steady-state throughput</h3>
+    <h3>5.1 Full-cycle ShareGPT throughput and latency</h3>
 
     <table>
       <caption style="font-style:italic; text-align:left; padding:0.5em 0;">
-        Stable-bench throughput, TTFT, and TPOT, shown as
-        <code>mean&nbsp;&plusmn;&nbsp;&sigma;</code> over the measured stable window.
-        The default benchmark is ShareGPT; bench&nbsp;1 is an explicit warmup sample
-        and is excluded from convergence and summary statistics
-        (<code>A3_BENCH_DISCARD_FIRST=1</code>). Raw JSON:
+        Robust ShareGPT <code>2&rarr;4&rarr;2</code> cycle benchmark. Values are
+        <code>mean&nbsp;&plusmn;&nbsp;&sigma;</code> over the measured warm window after
+        discarding bench&nbsp;1 (<code>A3_BENCH_DISCARD_FIRST=1</code>). The cycle
+        used <code>A3_BENCH_MAX_BENCHES=4</code>, <code>A3_BENCH_EPS_PCT=5</code>,
+        and <code>A3_GPU_MEMORY_UTILIZATION=0.85</code>. Raw JSON:
+        <code>results/&lt;regime&gt;/cycle_summary.json</code> and
         <code>results/&lt;regime&gt;/bench_&lt;label&gt;.json</code>.
       </caption>
       <thead>
         <tr>
-          <th>Workload</th>
           <th>Regime</th>
+          <th>Phase</th>
           <th>DP</th>
+          <th>Prompts / Concurrency</th>
           <th>Throughput (tok/s)</th>
           <th>TTFT (ms)</th>
           <th>TPOT (ms)</th>
+          <th>Converged?</th>
         </tr>
       </thead>
       <tbody>
-        <tr><td>random 128/128 cycle</td><td>native</td><td>2</td><td>74.53 &plusmn; 2.99</td><td>219.5 &plusmn; 2.3</td><td>106.51 &plusmn; 4.23</td></tr>
-        <tr><td>random 128/128 cycle</td><td>native</td><td>4</td><td>158.60 &plusmn; 10.78</td><td>236.8 &plusmn; 40.4</td><td>100.07 &plusmn; 6.76*</td></tr>
-        <tr><td>random 128/128 cycle</td><td>MGC</td><td>2</td><td>72.97 &plusmn; 0.42</td><td>259.3 &plusmn; 82.6</td><td>108.37 &plusmn; 0.59</td></tr>
-        <tr><td>random 128/128 cycle</td><td>MGC</td><td>4</td><td>140.41 &plusmn; 4.76</td><td>484.4 &plusmn; 385.9</td><td>110.96 &plusmn; 2.50</td></tr>
-        <tr><td>random 128/128 cycle</td><td>PGC</td><td>2</td><td>70.29 &plusmn; 1.12</td><td>275.1 &plusmn; 103.4</td><td>112.48 &plusmn; 1.06</td></tr>
-        <tr><td>random 128/128 cycle</td><td>PGC</td><td>4</td><td>138.48 &plusmn; 8.12</td><td>506.0 &plusmn; 207.2</td><td>112.35 &plusmn; 5.33</td></tr>
-        <tr style="background:#eef7ff;"><td>ShareGPT c32 robust</td><td>native</td><td>4</td><td>212.30 &plusmn; 7.44</td><td>280.1 &plusmn; 54.5</td><td>94.99 &plusmn; 5.00*</td></tr>
-        <tr style="background:#eef7ff;"><td>ShareGPT c32 robust</td><td>MGC</td><td>4</td><td>212.42 &plusmn; 17.90</td><td>291.0 &plusmn; 43.4</td><td>91.98 &plusmn; 4.79*</td></tr>
-        <tr style="background:#eef7ff;"><td>ShareGPT c32 robust</td><td>PGC</td><td>4</td><td>199.20 &plusmn; 5.57</td><td>581.3 &plusmn; 195.5</td><td>102.46 &plusmn; 8.44*</td></tr>
-        <tr style="background:#f7f7f7;"><td><b>ShareGPT MGC vs native</b></td><td colspan="2">&mdash;</td><td colspan="3">MGC throughput is effectively tied with native (+0.1%); MGC TPOT is 3.2% lower, inside the combined stable-window &sigma;.</td></tr>
-        <tr style="background:#f7f7f7;"><td><b>ShareGPT PGC vs MGC</b></td><td colspan="2">&mdash;</td><td colspan="3"><b>PGC is slower:</b> -6.2% throughput and +11.4% TPOT versus MGC. Unlike Native/MGC, this aligns with the NCCL transport degradation in &sect;5.5.</td></tr>
+        <tr><td>native</td><td>initial</td><td>2</td><td>16 / 8</td><td>47.63 &plusmn; 4.84</td><td>204.8 &plusmn; 19.7</td><td>101.62 &plusmn; 6.35</td><td>no</td></tr>
+        <tr><td>native</td><td>post scale-up</td><td>4</td><td>32 / 16</td><td>93.43 &plusmn; 8.08</td><td>210.1 &plusmn; 7.9</td><td>93.16 &plusmn; 3.19</td><td>no</td></tr>
+        <tr><td>native</td><td>post scale-down</td><td>2</td><td>16 / 8</td><td>47.15 &plusmn; 3.53</td><td>210.3 &plusmn; 38.6</td><td>99.97 &plusmn; 6.87</td><td>no</td></tr>
+        <tr><td>MGC</td><td>initial</td><td>2</td><td>16 / 8</td><td>47.79 &plusmn; 2.10</td><td>413.0 &plusmn; 172.0</td><td>96.24 &plusmn; 4.22</td><td>no</td></tr>
+        <tr><td>MGC</td><td>post scale-up</td><td>4</td><td>32 / 16</td><td>87.42 &plusmn; 6.97</td><td>344.9 &plusmn; 107.0</td><td>101.69 &plusmn; 11.49</td><td>no</td></tr>
+        <tr><td>MGC</td><td>post scale-down</td><td>2</td><td>16 / 8</td><td>44.44 &plusmn; 0.48</td><td>247.4 &plusmn; 39.2</td><td>106.81 &plusmn; 2.78</td><td>yes</td></tr>
+        <tr><td>PGC</td><td>initial</td><td>2</td><td>16 / 8</td><td>47.53 &plusmn; 3.33</td><td>332.3 &plusmn; 195.5</td><td>102.32 &plusmn; 4.55</td><td>no</td></tr>
+        <tr><td>PGC</td><td>post scale-up</td><td>4</td><td>32 / 16</td><td>85.74 &plusmn; 5.26</td><td>434.8 &plusmn; 82.5</td><td>102.99 &plusmn; 0.97</td><td>yes</td></tr>
+        <tr><td>PGC</td><td>post scale-down</td><td>2</td><td>16 / 8</td><td>42.32 &plusmn; 3.25</td><td>234.6 &plusmn; 1.8</td><td>110.76 &plusmn; 0.81</td><td>yes</td></tr>
       </tbody>
     </table>
 
-    <p>The historical random-128/128 cycle remains in the table for comparison, but
-       it is no longer the default benchmark because it is too synthetic to
-       expose the transport penalty: MGC and PGC differed by only 1.3% TPOT at
-       DP=4. Both future <code>cycle</code> runs and direct <code>bench</code> runs now use
-       the robust ShareGPT method by default. It explicitly discards the first
-       bench sample, then summarizes the measured warm window. Under that
-       method, native and MGC are statistically indistinguishable, so the
-       apparent MGC container overhead was a benchmark-method artifact. PGC
-       remains slower than MGC, consistent with its forced
-       <code>NET/Socket/0</code> NCCL path.</p>
-
-    <div style="border-left:4px solid #999; padding-left:1em; margin:1em 0; background:#f9f9f9;">
-      <b>Benchmark robustness update.</b> Exp C reopened the Native/MGC gap and
-      found that cold ShareGPT samples can dominate TTFT and TPOT, especially
-      during native Ray/vLLM startup. Exp A3 now uses ShareGPT by default with
-      <code>A3_BENCH_DISCARD_FIRST=1</code>, excludes discarded
-      samples from convergence checks and summaries, and reports the measured
-      warm window. With this correction, the Native/MGC gap disappears while
-      the MGC/PGC transport gap remains visible.
-    </div>
+    <p>The DP=4 cycle point keeps per-engine load constant relative to DP=2
+       (<code>concurrency / dp = 4</code>). Throughput nearly doubles from DP=2
+       to DP=4 for native (47.63&nbsp;&rarr;&nbsp;93.43&nbsp;tok/s). MGC and PGC also
+       scale up, but land slightly below native at DP=4 under this clean
+       full-cycle pass. PGC remains the slowest containerized regime at DP=4:
+       85.74&nbsp;tok/s and 102.99&nbsp;ms TPOT versus MGC's 87.42&nbsp;tok/s and
+       101.69&nbsp;ms TPOT.</p>
 
     <h3>5.2 Scale-operation duration</h3>
 
     <table>
+      <caption style="font-style:italic; text-align:left; padding:0.5em 0;">
+        Scale timings captured by the Python harness around
+        <code>/scale_elastic_ep</code>. The values are written into
+        <code>cycle_summary.json</code> as <code>scale_events</code>.
+      </caption>
       <thead>
         <tr>
-          <th>Operation</th>
-          <th>Native</th>
-          <th>Multi-GPU container</th>
-          <th>Per-GPU containers</th>
+          <th>Regime</th>
+          <th>Scale-up 2&rarr;4</th>
+          <th>Scale-down 4&rarr;2</th>
+          <th>HTTP status</th>
         </tr>
       </thead>
       <tbody>
-        <tr>
-          <td>Cold startup &rarr; <code>/health</code> ready</td>
-          <td>~70&nbsp;s</td>
-          <td>~110&nbsp;s</td>
-          <td>~92&nbsp;s (with <code>--data-parallel-size-local 1</code>)</td>
-        </tr>
-        <tr>
-          <td><b>Scale-up</b> 2&rarr;4 (HTTP 200)</td>
-          <td>25.81&nbsp;s (r1) / 22.97&nbsp;s (r2)</td>
-          <td>39.18&nbsp;s</td>
-          <td>Observed during <code>cycle</code> &mdash; similar
-              magnitude (~25&ndash;40&nbsp;s)</td>
-        </tr>
-        <tr>
-          <td><b>Scale-down</b> 4&rarr;2 (HTTP 200)</td>
-          <td>4.05&nbsp;s (r1) / 9.64&nbsp;s (r2)</td>
-          <td>4.65&nbsp;s</td>
-          <td>Observed during <code>cycle</code> (~4&ndash;5&nbsp;s)</td>
-        </tr>
-        <tr>
-          <td>GPU memory reclamation after scale-down</td>
-          <td>~10&nbsp;s (GPUs 2,3 drop to 4&nbsp;MiB)</td>
-          <td>~10&nbsp;s (same as native)</td>
-          <td>~10&nbsp;s (at the vLLM-process level; container itself
-              persists until <code>docker stop</code>)</td>
-        </tr>
+        <tr><td>native</td><td>63.21&nbsp;s</td><td>35.49&nbsp;s</td><td>200 / 200</td></tr>
+        <tr><td>MGC</td><td>76.41&nbsp;s</td><td>24.96&nbsp;s</td><td>200 / 200</td></tr>
+        <tr><td>PGC</td><td>79.99&nbsp;s</td><td>21.13&nbsp;s</td><td>200 / 200</td></tr>
       </tbody>
     </table>
 
-    <p>Container overhead on scale-up (MGC +51% vs native) is consistent
-       with Ray actor startup being slower inside a container &mdash; each
-       <code>DPMoEEngineCoreActor</code> spawn imports Python and imports
-       vLLM modules from a container filesystem rather than the host page
-       cache. Scale-down is barely affected (MGC +15%) because it does
-       not spawn actors, only tears them down. Per-GPU-containers
-       scale-up/down timings track the MGC regime within the harness
-       latency budget &mdash; the extra container boundaries do not
-       add a detectable step.</p>
+    <figure style="margin:1em 0;">
+      <figcaption style="font-style:italic; margin-bottom:0.5em;">Scale duration, seconds (longer bars are slower).</figcaption>
+      <div style="font-family:monospace; line-height:1.8;">
+        <div>native up&nbsp;&nbsp; <span style="display:inline-block;background:#6aaed6;width:158px;height:12px;"></span> 63.21s</div>
+        <div>MGC up&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="display:inline-block;background:#6aaed6;width:191px;height:12px;"></span> 76.41s</div>
+        <div>PGC up&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span style="display:inline-block;background:#6aaed6;width:200px;height:12px;"></span> 79.99s</div>
+        <div>native down <span style="display:inline-block;background:#8fd175;width:89px;height:12px;"></span> 35.49s</div>
+        <div>MGC down&nbsp;&nbsp;&nbsp; <span style="display:inline-block;background:#8fd175;width:62px;height:12px;"></span> 24.96s</div>
+        <div>PGC down&nbsp;&nbsp;&nbsp; <span style="display:inline-block;background:#8fd175;width:53px;height:12px;"></span> 21.13s</div>
+      </div>
+    </figure>
+
+    <p>Scale-up is slower than scale-down in all regimes because it creates and
+       initializes new DP actors. MGC and PGC scale-up are about 21&ndash;27%
+       slower than native in this run, while scale-down is faster for the
+       containerized regimes. Because scale timings are now structured in
+       <code>cycle_summary.json</code>, future runs can compare this directly
+       instead of scraping individual <code>scale_to_dp*.log</code> files.</p>
 
     <p><b>GPU memory reclamation.</b> Within ~10&nbsp;s of scale-down
-       4&rarr;2, GPU 2 and GPU 3 drop from ~35&nbsp;GB used to 4&nbsp;MiB
-       (idle) in all three regimes. The freed GPUs are
-       <i>physically</i> reclaimable by the OS. Whether they are
-       <i>administratively</i> reclaimable depends on the orchestrator
-       view &mdash; which is a regime-specific question, treated in
+       4&rarr;2, GPU 2 and GPU 3 drop from ~35&nbsp;GB used to idle in all
+       three regimes. The freed GPUs are <i>physically</i> reclaimable by the
+       OS. Whether they are <i>administratively</i> reclaimable depends on the
+       orchestrator view &mdash; which is a regime-specific question, treated in
        &sect;5.4.</p>
 
     <h3>5.3 Service-interruption window during scale</h3>
@@ -873,10 +856,10 @@ node ep-rank-0, possible to fit 1 DP ranks.</pre>
           2&times; DP=2 initial tok/s under load-matched bench shapes
           for the two container regimes, consistent with near-linear scaling.</li>
       <li><b>The benchmark strategy determines whether the transport penalty is visible.</b>
-          The historical random-128/128 DP=4 shape showed only a +1.3% PGC-vs-MGC TPOT gap,
-          but the robust ShareGPT default exposes the serving penalty:
-          PGC is +11.4% TPOT and &minus;6.2% throughput versus MGC in the
-          fresh DP=4 saturation rerun.</li>
+          The robust ShareGPT cycle is now the default. At the DP=4 cycle point,
+          native reaches 93.43 tok/s, MGC reaches 87.42 tok/s, and PGC
+          reaches 85.74 tok/s; scale timings are recorded directly in
+          <code>cycle_summary.json</code>.</li>
       <li><b>Multi-GPU container &mdash; orchestrator trap is real and
           permanent.</b> Scale-down releases GPU memory on the host
           (GPU&nbsp;2&ndash;3 drop to 4&nbsp;MiB within ~10&nbsp;s) but

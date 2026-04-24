@@ -46,7 +46,7 @@ def start() -> None:
  --all2all-backend allgather_reducescatter \
  --max-model-len 2048 \
  --max-num-seqs {os.environ.get("A3_MAX_NUM_SEQS", "16")} \
- --gpu-memory-utilization 0.90 \
+ --gpu-memory-utilization {os.environ.get("A3_GPU_MEMORY_UTILIZATION", "0.85")} \
  --enforce-eager \
  --trust-remote-code \
  {extra}"""
@@ -78,8 +78,8 @@ def stop() -> None:
     print(a3.gpu_snapshot(), file=sys.stderr)
 
 
-def scale(new_dp: int) -> None:
-    a3.trigger_scale(f"http://localhost:{a3.VLLM_PORT}", new_dp, RESULTS_DIR)
+def scale(new_dp: int) -> dict[str, object]:
+    return a3.trigger_scale(f"http://localhost:{a3.VLLM_PORT}", new_dp, RESULTS_DIR)
 
 
 def state(tag: str = "snapshot") -> None:

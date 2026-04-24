@@ -283,7 +283,7 @@ def write_state(path: Path, lines: Iterable[str]) -> None:
     print(text, end="")
 
 
-def trigger_scale(base_url: str, new_dp: int, results_dir: Path, drain_timeout: int = 60) -> None:
+def trigger_scale(base_url: str, new_dp: int, results_dir: Path, drain_timeout: int = 60) -> dict[str, object]:
     results_dir.mkdir(parents=True, exist_ok=True)
     start = time.time_ns()
     log(f"Scale to DP={new_dp} (drain_timeout={drain_timeout}s)")
@@ -300,8 +300,18 @@ def trigger_scale(base_url: str, new_dp: int, results_dir: Path, drain_timeout: 
     print(body)
     print(f"ELAPSED_MS={elapsed_ms}")
     print(f"HTTP_CODE={code or 'unknown'}")
+    record = {
+        "target_dp": new_dp,
+        "drain_timeout_s": drain_timeout,
+        "elapsed_ms": elapsed_ms,
+        "elapsed_s": elapsed_ms / 1000.0,
+        "http_code": code or "unknown",
+        "response_body": body,
+        "log_path": str(log_path),
+    }
     if code != 200:
         raise SystemExit(1)
+    return record
 
 
 def _bench_cmd(label_i: str, out_dir: Path, host: str, port: int, cfg: BenchConfig) -> list[str]:
@@ -515,29 +525,57 @@ def run_single_bench(label: str, results_dir: Path, num_prompts: int, concurrenc
     if not bench(label, "localhost", VLLM_PORT, results_dir, BenchConfig.for_cycle(num_prompts, concurrency)):
         log(f"WARN: {label} did not converge")
 
-def run_bench_cycle(regime_name: str, results_dir: Path, scale_fn: Callable[[int], None], state_fn: Callable[[str], None], after_cycle: Callable[[], None] | None = None) -> None:
+
+def load_bench_summary(results_dir: Path, label: str) -> dict[str, object]:
+    path = results_dir / f"bench_{label}.json"
+    return json.loads(path.read_text())
+
+
+def write_cycle_summary(regime_name: str, results_dir: Path, labels: list[str], scale_events: list[dict[str, object]]) -> None:
+    benches = {label: load_bench_summary(results_dir, label) for label in labels}
+    summary = {
+        "regime": regime_name,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "cycle": "2->4->2",
+        "scale_events": scale_events,
+        "bench_labels": labels,
+        "benches": benches,
+    }
+    path = results_dir / "cycle_summary.json"
+    path.write_text(json.dumps(summary, indent=2) + "\n")
+    log(f"cycle summary written: {path}")
+
+
+def run_bench_cycle(regime_name: str, results_dir: Path, scale_fn: Callable[[int], dict[str, object]], state_fn: Callable[[str], None], after_cycle: Callable[[], None] | None = None) -> None:
     label_suffix = os.environ.get("A3_BENCH_LABEL_SUFFIX", "")
 
     def label(base: str) -> str:
         return f"{base}_{label_suffix}" if label_suffix else base
 
+    scale_events: list[dict[str, object]] = []
+    bench_labels: list[str] = []
+
     state_fn(label("pre_cycle"))
     dp2_initial = label("dp2_initial")
+    bench_labels.append(dp2_initial)
     if not bench(dp2_initial, "localhost", VLLM_PORT, results_dir, BenchConfig.for_cycle(16, 8)):
         log(f"WARN: {dp2_initial} did not converge")
-    scale_fn(4)
+    scale_events.append({"operation": "scale_up", "from_dp": 2, **scale_fn(4)})
     time.sleep(3)
     state_fn(label("post_scale_up"))
     dp4_post_up = label("dp4_post_up")
+    bench_labels.append(dp4_post_up)
     if not bench(dp4_post_up, "localhost", VLLM_PORT, results_dir, BenchConfig.for_cycle(32, 16)):
         log(f"WARN: {dp4_post_up} did not converge")
-    scale_fn(2)
+    scale_events.append({"operation": "scale_down", "from_dp": 4, **scale_fn(2)})
     time.sleep(3)
     state_fn(label("post_scale_down"))
     dp2_post_down = label("dp2_post_down")
+    bench_labels.append(dp2_post_down)
     if not bench(dp2_post_down, "localhost", VLLM_PORT, results_dir, BenchConfig.for_cycle(16, 8)):
         log(f"WARN: {dp2_post_down} did not converge")
     state_fn(label("post_cycle"))
+    write_cycle_summary(regime_name, results_dir, bench_labels, scale_events)
     if after_cycle is not None:
         after_cycle()
     log(f"cycle complete for {regime_name}. Stable summaries in {results_dir}/bench_*.json")
