@@ -41,18 +41,18 @@ tmux new-session -d -s model-download \
         > /tmp/qwen3-moe-download.log 2>&1; echo "EXIT_CODE=$?" >> /tmp/qwen3-moe-download.log'
 ```
 
-## Three regimes (unified harness)
+## Three regimes (unified Python harness)
 
-All three regimes share `scripts/common.sh` (venv activation,
-`vllm bench serve` invocation, `/scale_elastic_ep` driver, `nvidia-smi` /
-container-state snapshots). Each has the same subcommand surface; results
-land in `results/<regime>/` (gitignored).
+All three regimes share `common.py` (venv activation, `vllm bench serve`
+plateau orchestration, `/scale_elastic_ep` driver, `nvidia-smi` /
+container-state snapshots). Each has the same reduced subcommand surface;
+results land in `results/<regime>/` (gitignored).
 
 | Regime | Entry point | Process topology | GPU visibility |
 |---|---|---|---|
-| Native | `scripts/native.sh` | Bare-metal Python + Ray on host | All 4 GPUs visible to every actor |
-| Multi-GPU container (MGC) | `scripts/multi_gpu_container.sh` | Single Docker container | `--gpus '"device=0,1,2,3"'` — cgroup-pinned for the container's lifetime |
-| Per-GPU containers (PGC) | `scripts/per_gpu_containers.sh` | 4 containers (`ep-rank-0…3`) on Docker bridge network; Ray head in `ep-rank-0` | One GPU per container (`--gpus '"device=N"'`) |
+| Native | `1_native.py` | Bare-metal Python + Ray on host | All 4 GPUs visible to every actor |
+| Multi-GPU container (MGC) | `2_multi_gpu_container.py` | Single Docker container | `--gpus '"device=0,1,2,3"'` — cgroup-pinned for the container's lifetime |
+| Per-GPU containers (PGC) | `3_per_gpu_containers.py` | 4 containers (`ep-rank-0…3`) on Docker bridge network; Ray head in `ep-rank-0` | One GPU per container (`--gpus '"device=N"'`) |
 
 ### Docker images
 
@@ -61,7 +61,7 @@ land in `results/<regime>/` (gitignored).
   requires it). Used by MGC directly.
 - **Patched** `xtrans-vllm-ep-patched:v0.19.0` — `Dockerfile.per_gpu_containers`
   layers one local vLLM patch on top of the base image. Used by per-GPU
-  containers. Auto-built on first `per_gpu_containers.sh up` invocation.
+  containers. Auto-built on first `3_per_gpu_containers.py up` invocation.
   - `patches/0001_placement_group_early_exit.patch` — two-line outer-loop
     break in `RayDPClient.make_dp_placement_groups`. Load-bearing for cold
     DP=2 in a 4-Ray-node cluster; mirrors the pattern already present in
@@ -70,35 +70,37 @@ land in `results/<regime>/` (gitignored).
 
 ### Subcommands
 
-Same subcommand surface across regimes (`start`/`up` and `stop`/`down`
-differ by regime but cycle subcommands are uniform):
+Same subcommand surface across regimes (`start`/`up` and `stop`/`down` are
+aliases). `cycle` is the only benchmark cycle and always uses plateau-seeking
+benches. The legacy single-shot `bench`, `bench_steady`, and `cycle_steady`
+surfaces were removed.
 
 ```bash
 # Native
-./scripts/native.sh start                 # Ray head + vllm serve at DP=2
-./scripts/native.sh cycle                 # single-shot bench DP=2 → 4 → 2
-./scripts/native.sh cycle_steady          # plateau-seeking bench DP=2 → 4 → 2  (recommended)
-./scripts/native.sh stop
+python 1_native.py start                 # Ray head + vllm serve at DP=2
+python 1_native.py cycle                 # plateau bench DP=2 → 4 → 2
+python 1_native.py stop
 
 # Multi-GPU container
-./scripts/multi_gpu_container.sh start
-./scripts/multi_gpu_container.sh cycle_steady
-./scripts/multi_gpu_container.sh stop
+python 2_multi_gpu_container.py start
+python 2_multi_gpu_container.py cycle
+python 2_multi_gpu_container.py stop
 
 # Per-GPU containers
-./scripts/per_gpu_containers.sh up        # bridge net + 4 containers + Ray cluster + vllm serve
-./scripts/per_gpu_containers.sh cycle_steady
-./scripts/per_gpu_containers.sh nccl-grep # extract NET/Socket/0 evidence
-./scripts/per_gpu_containers.sh down
+python 3_per_gpu_containers.py up        # bridge net + 4 containers + Ray cluster + vllm serve
+python 3_per_gpu_containers.py cycle
+python 3_per_gpu_containers.py nccl-grep # extract NET/Socket/0 evidence
+python 3_per_gpu_containers.py down
 ```
 
-`cycle_steady` runs plateau-seeking benches via
-`common/harness/bench_to_steady.py`: at each DP point, it loops `vllm bench
-serve` at a fixed shape until the last 3 TPOTs are within 3% of each other,
-then records 2 extra samples for statistical power. Output per DP point:
-`results/<regime>/bench_steady_<label>.json`. This is the cross-regime-fair
-comparison used in the analysis report; the older single-shot `cycle`
-subcommand is retained for backward compatibility.
+`cycle` loops `vllm bench serve` at each DP point until the last 3 TPOTs
+are within 3% of each other, then records 2 extra samples for statistical
+power. Output per DP point stays
+`results/<regime>/bench_steady_<label>.json`. Saturation experiments can be
+selected without code edits via `A3_BENCH_*` environment variables, including
+`A3_BENCH_DATASET`, `A3_BENCH_DATASET_PATH`, `A3_BENCH_RANDOM_OUTPUT_LEN`,
+`A3_BENCH_MAX_CONCURRENCY`, `A3_BENCH_REQUEST_RATE`, and
+`A3_BENCH_EXTRA_ARGS`.
 
 The `wait_for_ready` helper aborts fast if the backing process dies and
 dumps diagnostics instead of polling to timeout. Hard prerequisite: all 4

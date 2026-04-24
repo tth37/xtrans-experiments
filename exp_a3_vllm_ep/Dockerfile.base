@@ -8,4 +8,4 @@ RUN pip install --no-cache-dir \
 
 # vllm-openai's default entrypoint is `python3 -m vllm.entrypoints.openai.api_server`
 # but we override to allow starting Ray head explicitly if needed.
-# (multi_gpu_container.sh overrides entrypoint to /bin/bash -c "vllm serve ...")
+# (2_multi_gpu_container.py overrides entrypoint to /bin/bash -c "vllm serve ...")

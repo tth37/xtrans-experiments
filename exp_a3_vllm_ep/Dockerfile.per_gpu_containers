@@ -8,8 +8,8 @@
 # patches/*.patch for per-patch commentary.
 #
 # Resulting image is tagged xtrans-vllm-ep-patched:v0.19.0 by the
-# ensure_patched_image helper in scripts/common.sh (auto-built by
-# per_gpu_containers.sh on first use).
+# ensure_patched_image helper in common.py (auto-built by
+# 3_per_gpu_containers.py on first use).
 
 FROM xtrans-vllm-ep:v0.19.0
 
