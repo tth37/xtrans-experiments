@@ -44,7 +44,7 @@ tmux new-session -d -s model-download \
 ## Three regimes (unified Python harness)
 
 All three regimes share `common.py` (venv activation, `vllm bench serve`
-plateau orchestration, `/scale_elastic_ep` driver, `nvidia-smi` /
+stable-bench orchestration, `/scale_elastic_ep` driver, `nvidia-smi` /
 container-state snapshots). Each has the same reduced subcommand surface;
 results land in `results/<regime>/` (gitignored).
 
@@ -71,32 +71,34 @@ results land in `results/<regime>/` (gitignored).
 ### Subcommands
 
 Same subcommand surface across regimes (`start`/`up` and `stop`/`down` are
-aliases). `cycle` is the only benchmark cycle and always uses plateau-seeking
-benches. The legacy single-shot `bench`, `bench_steady`, and `cycle_steady`
-surfaces were removed.
+aliases). `cycle` runs the full DP=2 → 4 → 2 stable-bench cycle. `bench`
+runs a DP=4-only stable bench for saturation investigations.
 
 ```bash
 # Native
 python 1_native.py start                 # Ray head + vllm serve at DP=2
-python 1_native.py cycle                 # plateau bench DP=2 → 4 → 2
+python 1_native.py cycle                 # stable bench DP=2 → 4 → 2
+python 1_native.py bench                 # DP=4-only stable bench
 python 1_native.py stop
 
 # Multi-GPU container
 python 2_multi_gpu_container.py start
 python 2_multi_gpu_container.py cycle
+python 2_multi_gpu_container.py bench
 python 2_multi_gpu_container.py stop
 
 # Per-GPU containers
 python 3_per_gpu_containers.py up        # bridge net + 4 containers + Ray cluster + vllm serve
 python 3_per_gpu_containers.py cycle
+python 3_per_gpu_containers.py bench
 python 3_per_gpu_containers.py nccl-grep # extract NET/Socket/0 evidence
 python 3_per_gpu_containers.py down
 ```
 
-`cycle` loops `vllm bench serve` at each DP point until the last 3 TPOTs
+The harness loops `vllm bench serve` at each bench point until the last 3 TPOTs
 are within 3% of each other, then records 2 extra samples for statistical
-power. Output per DP point stays
-`results/<regime>/bench_steady_<label>.json`. Saturation experiments can be
+power. Output per bench point is
+`results/<regime>/bench_<label>.json`. Saturation experiments can be
 selected without code edits via `A3_BENCH_*` environment variables, including
 `A3_BENCH_DATASET`, `A3_BENCH_DATASET_PATH`, `A3_BENCH_RANDOM_OUTPUT_LEN`,
 `A3_BENCH_MAX_CONCURRENCY`, `A3_BENCH_REQUEST_RATE`, and
@@ -118,18 +120,18 @@ curl http://localhost:8000/is_scaling_elastic_ep
 
 ## Results at a glance
 
-Plateau TPOT at DP=4 post-scale-up (ms, lower is better; full table in
+Stable-bench TPOT at DP=4 post-scale-up (ms, lower is better; full table in
 `analysis_report.html` §5.1):
 
-| Regime | Plateau TPOT |
+| Regime | Stable TPOT |
 |---|---|
 | Native | 93.26 ± 6.32 ms |
 | Multi-GPU container | **86.92 ± 0.94 ms** |
 | Per-GPU containers | **87.64 ± 0.86 ms** |
 
-MGC and PGC are within 0.8% at DP=4 steady state — statistically
-indistinguishable. Both nominally ~6% faster than native, but that gap
-sits inside native's own ±6.32 ms σ. The main *structural* differences
+MGC and PGC are within ~1% at the baseline random-128/128 DP=4 stable bench,
+but a DP=4 ShareGPT saturation bench exposes a visible PGC penalty: about
++8.7% TPOT and −7.1% throughput versus MGC. The main *structural* differences
 between the regimes are the orchestrator GPU-allocation view (MGC's
 `DeviceIDs` immutable at `[0,1,2,3]` for the container's lifetime vs.
 per-GPU containers cleanly releasing GPUs on container stop) and the

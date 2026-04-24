@@ -25,6 +25,7 @@ venv/
 !**/results/**/analysis.md
 **/logs/
 **/traces/
+**/data/
 *.csv
 *.json.gz
 

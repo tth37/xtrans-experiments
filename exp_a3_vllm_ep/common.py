@@ -392,9 +392,9 @@ def check_converged(window: list[float], eps_pct: float) -> tuple[bool, float]:
     return range_pct <= eps_pct, range_pct
 
 
-def bench_to_steady(label: str, host: str, port: int, out_dir: Path, cfg: BenchConfig) -> bool:
+def bench(label: str, host: str, port: int, out_dir: Path, cfg: BenchConfig) -> bool:
     out_dir.mkdir(parents=True, exist_ok=True)
-    log_file = out_dir / f"bench_steady_{label}.log"
+    log_file = out_dir / f"bench_{label}.log"
     old_stderr = sys.stderr
     with log_file.open("w") as lf:
         class Tee:
@@ -408,20 +408,20 @@ def bench_to_steady(label: str, host: str, port: int, out_dir: Path, cfg: BenchC
                 lf.flush()
         sys.stderr = Tee()  # type: ignore[assignment]
         try:
-            return _bench_to_steady(label, host, port, out_dir, cfg)
+            return _bench(label, host, port, out_dir, cfg)
         finally:
             sys.stderr = old_stderr
 
 
-def _bench_to_steady(label: str, host: str, port: int, out_dir: Path, cfg: BenchConfig) -> bool:
+def _bench(label: str, host: str, port: int, out_dir: Path, cfg: BenchConfig) -> bool:
     tpots: list[float] = []
     tok_s_list: list[float] = []
     ttfts: list[float] = []
     converged = False
-    plateau_idx = 1
+    stable_idx = 1
     benches_post_convergence = 0
 
-    log(f"bench_to_steady[{label}]: dataset={cfg.dataset_name} n={cfg.num_prompts} c={cfg.max_concurrency} in={cfg.random_input_len} out={cfg.random_output_len} max={cfg.max_benches} eps={cfg.eps_pct}%")
+    log(f"bench[{label}]: dataset={cfg.dataset_name} n={cfg.num_prompts} c={cfg.max_concurrency} in={cfg.random_input_len} out={cfg.random_output_len} max={cfg.max_benches} eps={cfg.eps_pct}%")
     for i in range(1, cfg.max_benches + 1):
         label_i = f"{label}_b{i}"
         json_path = run_one_bench(label_i, out_dir, host, port, cfg)
@@ -438,8 +438,8 @@ def _bench_to_steady(label: str, host: str, port: int, out_dir: Path, cfg: Bench
                 log(f"    window[{i - cfg.window_size + 1}..{i}] range={max(window) - min(window):.2f}ms ({range_pct:.2f}% of mean)")
                 if is_conv:
                     converged = True
-                    plateau_idx = i - cfg.window_size + 1
-                    log(f"    *** CONVERGED at bench {i}; plateau window starts at bench {plateau_idx} ***")
+                    stable_idx = i - cfg.window_size + 1
+                    log(f"    *** CONVERGED at bench {i}; stable window starts at bench {stable_idx} ***")
         else:
             benches_post_convergence += 1
             if benches_post_convergence >= cfg.extra_samples:
@@ -449,22 +449,22 @@ def _bench_to_steady(label: str, host: str, port: int, out_dir: Path, cfg: Bench
     if not converged:
         log(f"!! Did NOT converge within {cfg.max_benches} benches. Last window as best estimate.")
         fallback_n = min(cfg.window_size + cfg.extra_samples, len(tpots))
-        plateau_start = len(tpots) - fallback_n + 1
+        stable_start = len(tpots) - fallback_n + 1
     else:
-        plateau_start = plateau_idx
+        stable_start = stable_idx
 
-    plateau_tpots = tpots[plateau_start - 1 :]
-    plateau_tok_s = tok_s_list[plateau_start - 1 :]
-    plateau_ttfts = ttfts[plateau_start - 1 :]
+    stable_tpots = tpots[stable_start - 1 :]
+    stable_tok_s = tok_s_list[stable_start - 1 :]
+    stable_ttfts = ttfts[stable_start - 1 :]
 
     def stats(xs: list[float]) -> tuple[float, float]:
         if not xs:
             return 0.0, 0.0
         return statistics.mean(xs), statistics.stdev(xs) if len(xs) > 1 else 0.0
 
-    tpot_mean, tpot_std = stats(plateau_tpots)
-    tok_s_mean, tok_s_std = stats(plateau_tok_s)
-    ttft_mean, ttft_std = stats(plateau_ttfts)
+    tpot_mean, tpot_std = stats(stable_tpots)
+    tok_s_mean, tok_s_std = stats(stable_tok_s)
+    ttft_mean, ttft_std = stats(stable_ttfts)
     summary = {
         "label": label,
         "bench_shape": {
@@ -476,7 +476,7 @@ def _bench_to_steady(label: str, host: str, port: int, out_dir: Path, cfg: Bench
             "random_input_len": cfg.random_input_len,
             "random_output_len": cfg.random_output_len,
         },
-        "plateau_params": {
+        "stable_params": {
             "warmup_min": cfg.warmup_min,
             "window_size": cfg.window_size,
             "eps_pct": cfg.eps_pct,
@@ -484,48 +484,61 @@ def _bench_to_steady(label: str, host: str, port: int, out_dir: Path, cfg: Bench
             "extra_samples": cfg.extra_samples,
         },
         "converged": converged,
-        "plateau_start_bench": plateau_start,
+        "stable_start_bench": stable_start,
         "total_benches": len(tpots),
-        "plateau_n": len(plateau_tpots),
-        "plateau_mean_tpot_ms": tpot_mean,
-        "plateau_stdev_tpot_ms": tpot_std,
-        "plateau_mean_output_throughput": tok_s_mean,
-        "plateau_stdev_output_throughput": tok_s_std,
-        "plateau_mean_ttft_ms": ttft_mean,
-        "plateau_stdev_ttft_ms": ttft_std,
+        "stable_n": len(stable_tpots),
+        "stable_mean_tpot_ms": tpot_mean,
+        "stable_stdev_tpot_ms": tpot_std,
+        "stable_mean_output_throughput": tok_s_mean,
+        "stable_stdev_output_throughput": tok_s_std,
+        "stable_mean_ttft_ms": ttft_mean,
+        "stable_stdev_ttft_ms": ttft_std,
         "per_bench_tpot_ms": tpots,
         "per_bench_output_throughput": tok_s_list,
         "per_bench_ttft_ms": ttfts,
     }
-    summary_path = out_dir / f"bench_steady_{label}.json"
+    summary_path = out_dir / f"bench_{label}.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n")
     log("")
     log(f"=== SUMMARY for label='{label}' ===")
     log(f"  converged:        {converged}")
     log(f"  total_benches:    {len(tpots)}")
-    log(f"  plateau window:   bench {plateau_start}..{len(tpots)} (n={len(plateau_tpots)})")
-    log(f"  plateau TPOT:     {tpot_mean:7.2f} ms (σ {tpot_std:.2f})")
-    log(f"  plateau tok/s:    {tok_s_mean:7.2f}    (σ {tok_s_std:.2f})")
-    log(f"  plateau TTFT:     {ttft_mean:7.1f} ms (σ {ttft_std:.1f})")
+    log(f"  stable window:   bench {stable_start}..{len(tpots)} (n={len(stable_tpots)})")
+    log(f"  stable TPOT:     {tpot_mean:7.2f} ms (σ {tpot_std:.2f})")
+    log(f"  stable tok/s:    {tok_s_mean:7.2f}    (σ {tok_s_std:.2f})")
+    log(f"  stable TTFT:     {ttft_mean:7.1f} ms (σ {ttft_std:.1f})")
     log(f"  summary written:  {summary_path}")
     return converged
 
 
-def run_plateau_cycle(regime_name: str, results_dir: Path, scale_fn: Callable[[int], None], state_fn: Callable[[str], None], after_cycle: Callable[[], None] | None = None) -> None:
-    state_fn("pre_cycle")
-    if not bench_to_steady("dp2_initial", "localhost", VLLM_PORT, results_dir, BenchConfig.for_cycle(16, 8)):
-        log("WARN: dp2_initial did not converge")
+
+def run_single_bench(label: str, results_dir: Path, num_prompts: int, concurrency: int) -> None:
+    if not bench(label, "localhost", VLLM_PORT, results_dir, BenchConfig.for_cycle(num_prompts, concurrency)):
+        log(f"WARN: {label} did not converge")
+
+def run_bench_cycle(regime_name: str, results_dir: Path, scale_fn: Callable[[int], None], state_fn: Callable[[str], None], after_cycle: Callable[[], None] | None = None) -> None:
+    label_suffix = os.environ.get("A3_BENCH_LABEL_SUFFIX", "")
+
+    def label(base: str) -> str:
+        return f"{base}_{label_suffix}" if label_suffix else base
+
+    state_fn(label("pre_cycle"))
+    dp2_initial = label("dp2_initial")
+    if not bench(dp2_initial, "localhost", VLLM_PORT, results_dir, BenchConfig.for_cycle(16, 8)):
+        log(f"WARN: {dp2_initial} did not converge")
     scale_fn(4)
     time.sleep(3)
-    state_fn("post_scale_up")
-    if not bench_to_steady("dp4_post_up", "localhost", VLLM_PORT, results_dir, BenchConfig.for_cycle(32, 16)):
-        log("WARN: dp4_post_up did not converge")
+    state_fn(label("post_scale_up"))
+    dp4_post_up = label("dp4_post_up")
+    if not bench(dp4_post_up, "localhost", VLLM_PORT, results_dir, BenchConfig.for_cycle(32, 16)):
+        log(f"WARN: {dp4_post_up} did not converge")
     scale_fn(2)
     time.sleep(3)
-    state_fn("post_scale_down")
-    if not bench_to_steady("dp2_post_down", "localhost", VLLM_PORT, results_dir, BenchConfig.for_cycle(16, 8)):
-        log("WARN: dp2_post_down did not converge")
-    state_fn("post_cycle")
+    state_fn(label("post_scale_down"))
+    dp2_post_down = label("dp2_post_down")
+    if not bench(dp2_post_down, "localhost", VLLM_PORT, results_dir, BenchConfig.for_cycle(16, 8)):
+        log(f"WARN: {dp2_post_down} did not converge")
+    state_fn(label("post_cycle"))
     if after_cycle is not None:
         after_cycle()
-    log(f"cycle complete for {regime_name}. Plateau summaries in {results_dir}/bench_steady_*.json")
+    log(f"cycle complete for {regime_name}. Stable summaries in {results_dir}/bench_*.json")

@@ -38,14 +38,14 @@ def start() -> None:
  --served-model-name {a3.SERVED_MODEL_NAME} \
  --host 0.0.0.0 --port 8000 \
  --tensor-parallel-size 1 \
- --data-parallel-size 2 \
+ --data-parallel-size {os.environ.get("A3_START_DP", "2")} \
  --data-parallel-backend ray \
  --enable-expert-parallel \
  --enable-elastic-ep \
  --enable-eplb \
  --all2all-backend allgather_reducescatter \
  --max-model-len 2048 \
- --max-num-seqs 16 \
+ --max-num-seqs {os.environ.get("A3_MAX_NUM_SEQS", "16")} \
  --gpu-memory-utilization 0.90 \
  --enforce-eager \
  --trust-remote-code \
@@ -53,7 +53,7 @@ def start() -> None:
     a3.log(f"Launching container {CONTAINER_NAME}")
     a3.run([
         "docker", "run", "-d", "--name", CONTAINER_NAME,
-        "--gpus", "device=0,1,2,3",
+        "--gpus", '"device=0,1,2,3"',
         "--ipc=host",
         "--shm-size", "16g",
         "-v", f"{a3.MODEL_HOST}:{MODEL_MOUNT_IN_CTN}:ro",
@@ -99,14 +99,27 @@ def cycle() -> None:
         start()
         started_here = True
     try:
-        a3.run_plateau_cycle("multi_gpu_container", RESULTS_DIR, scale, state)
+        a3.run_bench_cycle("multi_gpu_container", RESULTS_DIR, scale, state)
+    finally:
+        if started_here:
+            stop()
+
+
+def bench_dp4() -> None:
+    started_here = False
+    if not a3.http_get_ok(f"http://localhost:{a3.VLLM_PORT}/health"):
+        os.environ["A3_START_DP"] = "4"
+        start()
+        started_here = True
+    try:
+        a3.run_single_bench(os.environ.get("A3_SINGLE_LABEL", "dp4_direct"), RESULTS_DIR, int(os.environ.get("A3_SINGLE_NUM_PROMPTS", "128")), int(os.environ.get("A3_SINGLE_CONCURRENCY", "32")))
     finally:
         if started_here:
             stop()
 
 
 def usage() -> None:
-    print("usage: python 2_multi_gpu_container.py {start|up|stop|down|scale TARGET_DP|state [TAG]|cycle}", file=sys.stderr)
+    print("usage: python 2_multi_gpu_container.py {start|up|stop|down|scale TARGET_DP|state [TAG]|cycle|bench}", file=sys.stderr)
     raise SystemExit(1)
 
 
@@ -122,6 +135,8 @@ def main(argv: list[str]) -> None:
         state(args[0] if args else "snapshot")
     elif cmd == "cycle" and not args:
         cycle()
+    elif cmd == "bench" and not args:
+        bench_dp4()
     else:
         usage()
 

@@ -49,14 +49,14 @@ vllm serve {a3.MODEL_SNAPSHOT} \
   --served-model-name {a3.SERVED_MODEL_NAME} \
   --host 0.0.0.0 --port {a3.VLLM_PORT} \
   --tensor-parallel-size 1 \
-  --data-parallel-size 2 \
+  --data-parallel-size {os.environ.get("A3_START_DP", "2")} \
   --data-parallel-backend ray \
   --enable-expert-parallel \
   --enable-elastic-ep \
   --enable-eplb \
   --all2all-backend allgather_reducescatter \
   --max-model-len 2048 \
-  --max-num-seqs 16 \
+  --max-num-seqs {os.environ.get("A3_MAX_NUM_SEQS", "16")} \
   --gpu-memory-utilization 0.90 \
   --enforce-eager \
   --trust-remote-code \
@@ -96,14 +96,27 @@ def cycle() -> None:
         start()
         started_here = True
     try:
-        a3.run_plateau_cycle("native", RESULTS_DIR, scale, state)
+        a3.run_bench_cycle("native", RESULTS_DIR, scale, state)
+    finally:
+        if started_here:
+            stop()
+
+
+def bench() -> None:
+    started_here = False
+    if not a3.http_get_ok(f"http://localhost:{a3.VLLM_PORT}/health"):
+        os.environ["A3_START_DP"] = "4"
+        start()
+        started_here = True
+    try:
+        a3.run_single_bench(os.environ.get("A3_SINGLE_LABEL", "dp4_direct"), RESULTS_DIR, int(os.environ.get("A3_SINGLE_NUM_PROMPTS", "128")), int(os.environ.get("A3_SINGLE_CONCURRENCY", "32")))
     finally:
         if started_here:
             stop()
 
 
 def usage() -> None:
-    print("usage: python 1_native.py {start|up|stop|down|scale TARGET_DP|state [TAG]|cycle}", file=sys.stderr)
+    print("usage: python 1_native.py {start|up|stop|down|scale TARGET_DP|state [TAG]|cycle|bench}", file=sys.stderr)
     raise SystemExit(1)
 
 
@@ -119,6 +132,8 @@ def main(argv: list[str]) -> None:
         state(args[0] if args else "snapshot")
     elif cmd == "cycle" and not args:
         cycle()
+    elif cmd == "bench" and not args:
+        bench()
     else:
         usage()
 

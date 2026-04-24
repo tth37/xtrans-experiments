@@ -40,7 +40,7 @@ def launch_rank_container(rank: int, start_cmd: str, image: str) -> None:
         "--hostname", name,
         "--network", NETWORK,
         *ports,
-        "--gpus", f"device={rank}",
+        "--gpus", f'"device={rank}"',
         "--ipc=host",
         "--shm-size", "16g",
         "-v", f"{a3.MODEL_HOST}:{MODEL_MOUNT_IN_CTN}:ro",
@@ -99,7 +99,7 @@ def up() -> None:
             a3.log(f"4-GPU Ray cluster formed after {i * 2}s")
             break
     (RESULTS_DIR / "ray_status.txt").write_text(a3.output(["docker", "exec", "ep-rank-0", "ray", "status"]) + "\n")
-    dp_size = int(os.environ.get("PER_GPU_DP", "2"))
+    dp_size = int(os.environ.get("PER_GPU_DP", os.environ.get("A3_START_DP", "2")))
     extra = os.environ.get("EXTRA_SERVE_ARGS", "")
     a3.log(f"Launching vllm serve in ep-rank-0 at DP={dp_size} (extra={extra or 'none'})")
     serve = f"""
@@ -118,7 +118,7 @@ vllm serve {a3.MODEL_PATH_IN_CTN} \
   --enable-eplb \
   --all2all-backend allgather_reducescatter \
   --max-model-len 2048 \
-  --max-num-seqs 16 \
+  --max-num-seqs {os.environ.get("A3_MAX_NUM_SEQS", "16")} \
   --gpu-memory-utilization 0.90 \
   --enforce-eager \
   --trust-remote-code \
@@ -186,14 +186,31 @@ def cycle() -> None:
         except SystemExit:
             pass
     try:
-        a3.run_plateau_cycle("per_gpu_containers", RESULTS_DIR, scale, state, after)
+        a3.run_bench_cycle("per_gpu_containers", RESULTS_DIR, scale, state, after)
+    finally:
+        if started_here:
+            down()
+
+
+def bench_dp4() -> None:
+    started_here = False
+    if not a3.http_get_ok(f"http://localhost:{a3.VLLM_PORT}/health"):
+        os.environ["A3_START_DP"] = "4"
+        up()
+        started_here = True
+    try:
+        a3.run_single_bench(os.environ.get("A3_SINGLE_LABEL", "dp4_direct"), RESULTS_DIR, int(os.environ.get("A3_SINGLE_NUM_PROMPTS", "128")), int(os.environ.get("A3_SINGLE_CONCURRENCY", "32")))
+        try:
+            nccl_grep()
+        except SystemExit:
+            pass
     finally:
         if started_here:
             down()
 
 
 def usage() -> None:
-    print("usage: python 3_per_gpu_containers.py {start|up|stop|down|scale TARGET_DP|state [TAG]|cycle|nccl-grep}", file=sys.stderr)
+    print("usage: python 3_per_gpu_containers.py {start|up|stop|down|scale TARGET_DP|state [TAG]|cycle|bench|nccl-grep}", file=sys.stderr)
     raise SystemExit(1)
 
 
@@ -209,6 +226,8 @@ def main(argv: list[str]) -> None:
         state(args[0] if args else "snapshot")
     elif cmd == "cycle" and not args:
         cycle()
+    elif cmd == "bench" and not args:
+        bench_dp4()
     elif cmd == "nccl-grep" and not args:
         nccl_grep()
     else:
